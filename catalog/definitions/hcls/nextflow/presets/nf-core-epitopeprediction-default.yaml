@@ -1,0 +1,31 @@
+id: nf-core-epitopeprediction-default
+name: "nf-core/epitopeprediction (default)"
+description: |
+  Schema-driven preset for nf-core/epitopeprediction 2.3.0. Pins the pipeline
+  repo + revision; all run parameters (alleles, tools, peptide lengths) are
+  collected by the schema-driven form rendered from the pipeline's
+  assets/schema_input.json. No extra_profiles — vanilla schema form.
+vertical: hcls
+category: nextflow
+workload_group: genomics
+modality: form
+tools: [epitopeprediction]
+ready: true
+kind: preset
+tier: validated
+pipeline_repo: nf-core/epitopeprediction
+revision: "2.3.0"
+parameters:
+  - key: pipeline_repo
+    widget: text
+    default: "nf-core/epitopeprediction"
+  - key: revision
+    widget: text
+    default: "2.3.0"
+  - key: profile
+    widget: enum
+    options: [docker, singularity, apptainer, conda, none]
+    default: apptainer
+  - key: pipeline_params_json
+    widget: nextflow_schema
+    default: ""

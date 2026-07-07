@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-tenants-plugin
+  namespace: argocd
+  annotations:
+    # Wave 1: ConfigMap + token Secret must exist before the `clusters`
+    # ApplicationSet (wave 2) starts polling the plugin generator.
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL | squote }}
+    targetRevision: {{ .Values.targetRevision }}
+    path: core/fleet/manifests/argocd
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

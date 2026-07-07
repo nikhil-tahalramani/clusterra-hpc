@@ -1,0 +1,166 @@
+id: glyco-input-prep
+name: Glycoproteomics input prep (raw/.d → mzML + MGF)
+description: |
+  Step 1 of the `glyco-mapps-complete` chain. Converts Thermo .raw files
+  (ThermoRawFileParser 1.4.5) and Bruker .d/ directories (alphatims 1.0.8)
+  to mzML (for MetaMorpheus search) and MGF (for Casanovo de novo).
+
+  Both converters are Apache-2.0. ThermoRawFileParser is a published
+  biocontainer; alphatims has no upstream container so we pip-install
+  into a persistent EFS venv (mirrors the boltz/casanovo pattern).
+
+  License posture: MIT/Apache only. NO ProteoWizard msconvert (commercial
+  Bruker reader) — alphatims covers timsTOF .d natively and replaces
+  msconvert's Bruker path with an OSS-only one.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [ThermoRawFileParser, alphatims]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://quay.io/biocontainers/thermorawfileparser:1.4.5--ha8f3691_0
+  notes: |
+    BioContainers Quay image verified extant (May 2026). For Bruker .d/ we
+    layer alphatims into an EFS-cached venv off docker://python:3.11 —
+    ThermoRawFileParser container is mono-based and a pip install would
+    bloat it; we shell out to a second apptainer exec for .d inputs.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: input_dir
+    role: generic_path
+    required: true
+    description: |
+      Directory on /mnt/efs containing .raw files and/or .d/ acquisitions
+      (Bruker timsTOF). One file per acquisition; the step iterates over
+      all files in the directory.
+
+parameters:
+  - key: emit_mgf
+    widget: bool
+    default: true
+    description: |
+      Emit .mgf alongside .mzML for the Casanovo de novo step. When true,
+      ThermoRawFileParser is invoked with `-f mgf` after the mzML pass and
+      alphatims uses `export mgf`. Set false to skip if downstream is
+      DB-search-only.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-{{.ctx.step_id}}"
+  artifacts:
+    - key: mzml_dir
+      path: "{{.outputs.dir}}/mzml"
+      role: primary_output
+    - key: mgf_dir
+      path: "{{.outputs.dir}}/mgf"
+      role: generic
+    - key: log
+      path: "{{.outputs.dir}}/prep.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_DIR={{.inputs.input_dir | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  EMIT_MGF={{.params.emit_mgf}}
+
+  [ -d "$INPUT_DIR" ] || { echo "input_dir not a directory: $INPUT_DIR" >&2; exit 1; }
+  mkdir -p "$OUTPUT_DIR/mzml" "$OUTPUT_DIR/mgf"
+  LOG="$OUTPUT_DIR/prep.log"
+
+  # Cache the ThermoRawFileParser SIF on slurmd-local NVMe (TMPDIR) — re-extracting
+  # OCI→SIF on every run costs ~30s on EFS NFSv4. Mirrors boltz-2-affinity pattern.
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"
+  mkdir -p "$APPTAINER_CACHEDIR"
+
+  TRFP_IMAGE="docker://{{.runtime.image | replace "docker://" ""}}"
+
+  # Count input files for log clarity.
+  N_RAW=$(find "$INPUT_DIR" -maxdepth 2 -type f -iname '*.raw' | wc -l)
+  N_DOT_D=$(find "$INPUT_DIR" -maxdepth 1 -type d -iname '*.d' | wc -l)
+  echo "[prep] $N_RAW .raw files, $N_DOT_D .d/ directories under $INPUT_DIR" | tee -a "$LOG"
+
+  # ----------- Thermo .raw → mzML (+ optional MGF) -----------
+  if [ "$N_RAW" -gt 0 ]; then
+    echo "[prep] converting .raw via ThermoRawFileParser 1.4.5" | tee -a "$LOG"
+    # ThermoRawFileParser writes alongside the input by default; -o lets us
+    # redirect. -f 2 = indexedMzML; -f 0 = MGF. We do two passes (mzML then
+    # MGF) so each file gets both formats. Output basenames mirror input.
+    while IFS= read -r raw; do
+      base=$(basename "$raw" .raw)
+      apptainer exec "$TRFP_IMAGE" \
+        ThermoRawFileParser \
+          --input="$raw" \
+          --output="$OUTPUT_DIR/mzml/${base}.mzML" \
+          --format=2 \
+        2>&1 | tee -a "$LOG"
+      if [ "$EMIT_MGF" = "true" ]; then
+        apptainer exec "$TRFP_IMAGE" \
+          ThermoRawFileParser \
+            --input="$raw" \
+            --output="$OUTPUT_DIR/mgf/${base}.mgf" \
+            --format=0 \
+          2>&1 | tee -a "$LOG"
+      fi
+    done < <(find "$INPUT_DIR" -maxdepth 2 -type f -iname '*.raw')
+  fi
+
+  # ----------- Bruker .d/ → mzML (+ optional MGF) via alphatims -----------
+  if [ "$N_DOT_D" -gt 0 ]; then
+    echo "[prep] converting .d/ via alphatims 1.0.8" | tee -a "$LOG"
+    ALPHATIMS_VENV=/mnt/efs/_alphatims-venv/1.0.8
+    PYTHON_SIF=/mnt/efs/_apt-sifs/python-3.11.sif
+    mkdir -p "$(dirname "$PYTHON_SIF")"
+    [ -f "$PYTHON_SIF" ] || apptainer pull "$PYTHON_SIF" docker://python:3.11 2>&1 | tee -a "$LOG"
+
+    (
+      flock -x 9
+      if [ ! -x "$ALPHATIMS_VENV/bin/alphatims" ]; then
+        echo "[prep] provisioning alphatims==1.0.8 venv on EFS (one-time)" | tee -a "$LOG"
+        apptainer exec "$PYTHON_SIF" bash -c "
+          set -euo pipefail
+          python3.11 -m venv '$ALPHATIMS_VENV'
+          '$ALPHATIMS_VENV/bin/pip' install --quiet --upgrade pip
+          '$ALPHATIMS_VENV/bin/pip' install --quiet alphatims==1.0.8
+        " 2>&1 | tee -a "$LOG"
+      fi
+    ) 9>"$ALPHATIMS_VENV.lock"
+
+    while IFS= read -r d; do
+      base=$(basename "$d" .d)
+      apptainer exec "$PYTHON_SIF" \
+        "$ALPHATIMS_VENV/bin/alphatims" export mzml \
+          --output_directory "$OUTPUT_DIR/mzml" \
+          "$d" 2>&1 | tee -a "$LOG"
+      if [ "$EMIT_MGF" = "true" ]; then
+        apptainer exec "$PYTHON_SIF" \
+          "$ALPHATIMS_VENV/bin/alphatims" export mgf \
+            --output_directory "$OUTPUT_DIR/mgf" \
+            "$d" 2>&1 | tee -a "$LOG"
+      fi
+    done < <(find "$INPUT_DIR" -maxdepth 1 -type d -iname '*.d')
+  fi
+
+  # Sanity: at least one mzML must have been produced.
+  N_MZML=$(find "$OUTPUT_DIR/mzml" -maxdepth 1 -type f -name '*.mzML' | wc -l)
+  if [ "$N_MZML" -lt 1 ]; then
+    echo "[prep] FAILED: no .mzML produced — check $LOG" >&2
+    exit 1
+  fi
+
+  cat > "$OUTPUT_DIR/prep.json" <<EOF
+  { "n_raw_in": $N_RAW, "n_d_in": $N_DOT_D, "n_mzml_out": $N_MZML }
+  EOF
+
+  echo "[prep] OK: $N_MZML mzML written to $OUTPUT_DIR/mzml" | tee -a "$LOG"

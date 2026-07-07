@@ -1,0 +1,150 @@
+{{- if .Values.edgeAgent.enabled }}
+---
+# Runs with hostNetwork on the control-plane node for stable egress to central API.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clusterra-edge-agent
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: clusterra-edge-agent
+    app.kubernetes.io/component: edge-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: clusterra-edge-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clusterra-edge-agent
+    spec:
+      serviceAccountName: clusterra-edge-agent
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: agent
+        image: {{ required "imageDigests.edgeAgent must be set (envs/{env}/use1/images.yaml)" .Values.imageDigests.edgeAgent | quote }}
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: CLUSTERRA_CENTRAL_API_URL
+          value: {{ .Values.edgeAgent.centralApiUrl | quote }}
+        - name: CLUSTERRA_CLUSTER_ID
+          value: {{ .Values.clusterId | quote }}
+        - name: CLUSTERRA_POLL_INTERVAL
+          value: {{ .Values.edgeAgent.pollInterval | quote }}
+        - name: CLUSTERRA_NAMESPACE
+          value: "slurm"
+        - name: CLUSTERRA_GHOST_TIMEOUT_SECONDS
+          value: {{ .Values.ghostNodeTimeoutSeconds | quote }}
+        envFrom:
+        - secretRef:
+            name: clusterra-edge-agent
+            optional: true   # agent API key — not required for Phase 2 stub
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 200m
+            memory: 64Mi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 6001
+            host: 127.0.0.1
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        volumeMounts:
+        # /mnt/efs is RW: edge-agent's POST /internal/agent/git-credentials
+        # handler writes per-job credential bundles into
+        # /mnt/efs/clusterra-system/git-creds/<slot>.cred for the slurmd
+        # Prolog to pick up. Log streaming (the original reason for this
+        # mount) only reads from /mnt/efs/slurm-*.out so a wider RW mount
+        # doesn't change the log path's blast radius; the write surface is
+        # restricted to the credentials subdir by the handler's own
+        # filepath.Join, not by the mount mode.
+        - name: efs-scratch
+          mountPath: /mnt/efs
+          readOnly: false
+      volumes:
+      - name: efs-scratch
+        hostPath:
+          path: /mnt/efs
+          type: Directory
+{{- end }}
+---
+# RBAC: edge agent needs secrets (slurm key sync) and pods (capacity requests)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clusterra-edge-agent
+  namespace: slurm
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: clusterra-edge-agent
+  namespace: slurm
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "create", "delete", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: clusterra-edge-agent
+  namespace: slurm
+subjects:
+- kind: ServiceAccount
+  name: clusterra-edge-agent
+  namespace: slurm
+roleRef:
+  kind: Role
+  name: clusterra-edge-agent
+  apiGroup: rbac.authorization.k8s.io
+---
+# Cluster-scoped permissions:
+#   - Nodes: list (worker-node list reported to central; ghost-detector
+#     identifies stuck nodes), patch (GPU isolation taint AND the
+#     `karpenter.sh/do-not-disrupt` Node-level anchor annotation set by
+#     reconcileNodeAnchors per v1.2).
+#   - NodeClaims: list (central billing), delete (ghost-node reclamation;
+#     graceful scale-down no longer uses this — Karpenter `WhenEmpty`
+#     consolidation handles teardown once cap-pods + the anchor annotation
+#     are gone).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: clusterra-edge-agent
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "patch"]
+- apiGroups: ["karpenter.sh"]
+  resources: ["nodeclaims"]
+  verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: clusterra-edge-agent
+subjects:
+- kind: ServiceAccount
+  name: clusterra-edge-agent
+  namespace: slurm
+roleRef:
+  kind: ClusterRole
+  name: clusterra-edge-agent
+  apiGroup: rbac.authorization.k8s.io

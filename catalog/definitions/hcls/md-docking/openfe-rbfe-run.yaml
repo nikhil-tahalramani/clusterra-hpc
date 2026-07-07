@@ -1,0 +1,191 @@
+id: openfe-rbfe-run
+name: openfe — RBFE production MD (array fan-out)
+description: |
+  Stage 2 of a managed OpenFE RBFE campaign: run the per-edge alchemical free
+  energy MD as a Slurm array, ONE task per transformation JSON emitted by
+  `openfe-plan-network`. This is the GPU-heavy, spot-resilient core of the
+  campaign — the "1,000 GPU jobs" in a 12-λ × 30-edge × 3-repeat lead-opt run.
+
+  Each array task:
+    1. reads line $SLURM_ARRAY_TASK_ID of the upstream manifest.txt → one
+       transformation JSON (one edge × one leg);
+    2. runs `openfe quickrun <json> -d <workdir> -o result.json`;
+    3. with --resume, restarts from the last checkpoint after a spot eviction
+       (HREX checkpoints every iteration — eviction loses an iteration, not the
+       job).
+
+  The number of array tasks (edge_count) must match the plan step's
+  edge_count.txt. In a workflow this is carried automatically; standalone, read
+  edge_count.txt from the plan output and set the param.
+
+  Each task is billed/cost-stamped independently via slurmd admin_comment, so
+  per-edge AWS cost rolls up to a campaign total.
+
+  GOTCHAS (verified against OpenFE 1.11.1 — see runtime.notes):
+    • OpenMM platform defaults to CUDA in 1.7.0+; we export
+      OPENMM_DEFAULT_PLATFORM=CUDA explicitly so a misconfigured node fails loud
+      instead of silently falling back to the (100×-slower) CPU platform.
+    • Production length / λ-window count are baked into the transformation JSON
+      at PLAN time — they cannot be changed here. To run a fast smoke, re-plan
+      with a small production_ns, don't tweak this template.
+    • Charge-changing edges carry 22 λ-windows / 20 ns and take ~4× the wall of a
+      neutral edge — size --time for the worst edge in the network.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: form
+tools: [OpenFE, OpenMM, GROMACS]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: docker://mambaorg/micromamba:1.5.10
+  cache_dir: /mnt/efs/_openfe-env/v1.11.1-cu126
+  requirements: ["openfe=1.11.1", "cuda-version=12.6"]
+  notes: |
+    Shared micromamba env with openfe-plan-network / openfep / openfe-gather
+    (same cache_dir) — the env is materialized once per tenant by whichever
+    campaign step runs first.
+
+    quickrun writes per-ProtocolUnit subdirs (Setup/Sim/Analysis) plus a results
+    JSON named from the transformation key. We pass an explicit -o so gather can
+    glob results deterministically. --resume (1.10.0+) reuses the cached
+    ProtocolDAG and restarts from checkpoint.chk after preemption.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=24:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:l40s:1
+  #SBATCH --array=1-{{.params.edge_count}}
+
+inputs:
+  - key: network_dir
+    role: generic_path
+    required: true
+    description: |
+      The `network/` directory produced by openfe-plan-network (containing
+      transformations/). In a workflow this is the plan step's outputs.dir/network.
+  - key: manifest
+    role: generic_path
+    required: true
+    description: |
+      manifest.txt from openfe-plan-network — sorted list of transformation
+      JSONs, one per line. Array task N runs the JSON on line N.
+
+parameters:
+  - key: edge_count
+    label: Number of transformations (array size)
+    widget: number
+    default: 1
+    min: 1
+    max: 2000
+    description: |
+      Emits #SBATCH --array=1-N. MUST equal the plan step's edge_count.txt
+      (number of lines in manifest.txt). Too small = unrun edges; too large =
+      tasks that fail looking for a missing manifest line.
+  - key: resume
+    label: Resume from checkpoint
+    widget: bool
+    default: true
+    description: |
+      Pass --resume to quickrun so a spot-evicted task restarts from its last
+      HREX checkpoint instead of from zero. Leave on for spot; turn off to force
+      a clean rerun.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openfe-rbfe-{{.ctx.run_id}}"
+  artifacts:
+    - key: results
+      path: "{{.outputs.dir}}"
+      role: primary_output
+      description: Per-task result_<N>.json files; feed this dir to openfe-gather.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+    echo "FATAL: openfe-rbfe-run must run as a Slurm array job (SLURM_ARRAY_TASK_ID unset)" >&2
+    exit 1
+  fi
+
+  NETWORK_DIR={{.inputs.network_dir | quote}}
+  MANIFEST={{.inputs.manifest | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  ENV_PREFIX={{.runtime.cache_dir | quote}}
+  BASE_IMAGE="{{.runtime.base_image}}"
+
+  [ -r "$MANIFEST" ] || { echo "manifest not readable: $MANIFEST" >&2; exit 1; }
+
+  # Pick this task's transformation JSON = line SLURM_ARRAY_TASK_ID of manifest.
+  TX_JSON=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$MANIFEST")
+  if [ -z "$TX_JSON" ] || [ ! -r "$TX_JSON" ]; then
+    echo "FATAL: manifest line ${SLURM_ARRAY_TASK_ID} → '$TX_JSON' is empty or unreadable" >&2
+    echo "       (edge_count likely exceeds the number of planned transformations)" >&2
+    exit 1
+  fi
+  echo "[rbfe] task ${SLURM_ARRAY_TASK_ID}: $TX_JSON"
+
+  # MD workdir (GROMACS .xtc + HREX checkpoints, 100-500 GB) lives on NVMe.
+  # Only the small result JSON lands on EFS via -o below.
+  TASK_OUT="${TMPDIR}/result_${SLURM_ARRAY_TASK_ID}"
+  mkdir -p "$TASK_OUT"
+  RESULT_JSON="$OUTPUT_DIR/result_${SLURM_ARRAY_TASK_ID}.json"
+
+  # ── one-time shared env build (flock-guarded; shared with plan/gather) ──────
+  ENV_LOCK="${ENV_PREFIX}.lock"
+  ENV_READY="${ENV_PREFIX}/.ready"
+  mkdir -p "$(dirname "$ENV_PREFIX")"
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"; mkdir -p "$APPTAINER_CACHEDIR"
+  if [ ! -f "$ENV_READY" ]; then
+    (
+      flock -x 9
+      if [ ! -f "$ENV_READY" ]; then
+        echo "[rbfe] building openfe env at $ENV_PREFIX (one-time, ~5-10 min)"
+        apptainer exec --bind /mnt/efs:/mnt/efs --bind "$TMPDIR:$TMPDIR" \
+          "$BASE_IMAGE" bash -c "
+            set -euo pipefail
+            export MAMBA_ROOT_PREFIX=$TMPDIR/mamba; mkdir -p \$MAMBA_ROOT_PREFIX
+            micromamba create -y -p '$ENV_PREFIX' -c conda-forge openfe=1.11.1 'cuda-version=12.6'
+          "
+        touch "$ENV_READY"
+      fi
+    ) 9>"$ENV_LOCK"
+  fi
+
+  RESUME_ARG=()
+  if [ "{{.params.resume}}" = "true" ]; then
+    RESUME_ARG=(--resume)
+  fi
+
+  # Force the OpenMM platform so a node without a working CUDA context dies loud
+  # rather than silently dropping to the CPU platform.
+  export OPENMM_DEFAULT_PLATFORM=CUDA
+
+  # Lightweight GPU telemetry: sample VRAM + utilization every 30s into a CSV so
+  # we can right-size the GPU after the fact (peak VRAM tells us the smallest
+  # card that fits; util tells us how much headroom is left for packing). Runs
+  # on the host GPU via apptainer --nv; failures are non-fatal (empty log).
+  VRAM_LOG="$OUTPUT_DIR/gpu_telemetry_${SLURM_ARRAY_TASK_ID}.csv"
+  ( apptainer exec --nv "$BASE_IMAGE" bash -c \
+      'echo "timestamp,memory.used,memory.total,utilization.gpu"; \
+       while true; do nvidia-smi --query-gpu=timestamp,memory.used,memory.total,utilization.gpu \
+         --format=csv,noheader 2>/dev/null; sleep 30; done' > "$VRAM_LOG" 2>/dev/null ) &
+  VRAM_PID=$!
+
+  apptainer exec --nv \
+    --bind /mnt/efs:/mnt/efs \
+    --bind "$TMPDIR:$TMPDIR" \
+    --bind "$OUTPUT_DIR:$OUTPUT_DIR" \
+    "$BASE_IMAGE" \
+    micromamba run -p "$ENV_PREFIX" \
+      openfe quickrun "$TX_JSON" -d "$TASK_OUT" -o "$RESULT_JSON" "${RESUME_ARG[@]}"
+  RC=$?
+
+  kill "$VRAM_PID" 2>/dev/null || true
+  exit $RC

@@ -1,0 +1,93 @@
+id: aav-capsid-receptor-bench
+name: AAV capsid-receptor structural benchmark
+description: |
+  Curated AAV capsid+receptor complex set → OpenFold3 prediction (array
+  fanout) → DockQ + TM-score + ipTM vs the native cryo-EM crystal. Each
+  per-complex fold = 3× VP3 trimer + 1× receptor (4 chains total) because
+  the AAVR PKD2 binding interface is built by the 3-fold symmetry axis of
+  the capsid — a single VP3 monomer does not present the canonical
+  receptor pocket.
+
+  Headline metric is structural (per-chain TM-score vs crystal VP3 +
+  interface DockQ for the trimer-vs-receptor interface). Receptor binding
+  mode (interface orientation) follows the published Gradinaru
+  APPRAISE-AAV multi-stage workflow (Sci Adv 2023, PMC10115422); the
+  Rosetta refinement stage that workflow adds is NOT yet packaged here,
+  so DockQ on novel engineered capsids is reported as a hint rather than
+  a calibrated metric (verified on AAV2 reference complexes only).
+
+  Step ordering + handoffs:
+    1. fold     — openfold3-batch array (one task per PDB in the
+                  manifest). Reads
+                  /mnt/efs/bench/aav-capsid-receptor/of3-inputs/<PDB>.json
+                  (4 chains: 3× VP3 trimer + receptor, molecule_type 0,
+                  chain IDs A/B/C/D), writes
+                  step-fold/<PDB>/<PDB>_seed_42_sample_1_model.cif.
+                  L4 GPU pinned via param_overrides.gpu_type (OF3 0.4+
+                  rejects T4/sm_75 for bfloat16).
+    2. score    — aav-complex-metrics walks step-fold/ and the staged
+                  crystals/ dir, emits per-complex DockQ + TM + ipTM +
+                  pLDDT into outputs.json + per_complex.csv.
+
+  Bench fixtures must be pre-staged by aav-capsid-receptor-bench-prep
+  (not chained in — it's a one-time job per cluster, same convention as
+  tcr-pmhc-bench / drug-disco-bench-prep). Submit with:
+
+      curl -X POST $API/v1/clusters/$CID/jobs/submit \
+           -H "Cookie: $COOKIE" -H "Content-Type: application/json" \
+           -d '{"template_id": "aav-capsid-receptor-bench-prep",
+                "params": {"complex_count": 4}}'
+
+  Once prep completes, submit this workflow.
+
+  Wall-clock (n=4 reference set, verified on dev-demo clusde74,
+  May 28 2026): per-fold ~13 min on L4 GPU spot for VP3-only (533 aa),
+  ~13 min on L40S GPU spot for the 1693 aa trimer+receptor input. Total
+  workflow wall-clock ~25-45 min depending on array_concurrency and node
+  warm-up. Empirically: VP3 alone TM 0.984 vs 6IHB crystal $0.13/complex;
+  full trimer+receptor intra-trimer ipTM 0.65-0.68, each VP3 chain TM
+  0.984, ~$0.21/complex.
+
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [OpenFold3, DockQ]
+ready: true
+kind: workflow
+
+steps:
+  - step_id: fold
+    template_id: openfold3-batch
+    display_name: OpenFold3 fold (array — 3× VP3 trimer + receptor)
+    input_overrides:
+      manifest_csv: /mnt/efs/bench/aav-capsid-receptor/manifest.csv
+      input_dir:    /mnt/efs/bench/aav-capsid-receptor/of3-inputs
+    param_overrides:
+      # Default = 4 (the verified reference set: 6IHB, 6NZ0, 7UD4, 9J6Z).
+      # Extend when the prep catalog grows.
+      batch_count: 4
+      array_concurrency: 4
+      # 3 diffusion samples (memory-conservative for the ~1700-aa
+      # trimer+receptor input — 5 samples regularly OOMs on 24 GB GPUs).
+      num_diffusion_samples: 3
+      # L4 GPU pin: OpenFold3 0.4.0 requires Ampere or newer for bfloat16.
+      # T4 (sm_75) rejects the model with "Unsupported GPU and data type
+      # combination". L4 (sm_89) is the cheapest spot-friendly shape that
+      # both accepts bfloat16 and fits the ~1700 aa trimer+receptor input
+      # in 24 GB VRAM. For receptor-less capsid-only entries (e.g. 7UD4,
+      # 533 aa VP3) L4 is comfortable; for the full trimer+receptor input
+      # consider L40S (48 GB) — see workflow note for the per-complex
+      # wall-clock and cost numbers.
+      gpu_type: l4
+      mem_gb: 80
+      time_min: 90
+
+  - step_id: score
+    template_id: aav-complex-metrics
+    display_name: DockQ + TM-score + ipTM vs crystal
+    depends_on: [fold]
+    input_overrides:
+      predictions_dir: /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-fold
+      manifest_csv:    /mnt/efs/bench/aav-capsid-receptor/manifest.csv
+      crystals_dir:    /mnt/efs/bench/aav-capsid-receptor/crystals

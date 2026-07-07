@@ -1,0 +1,26 @@
+apiVersion: k8s.mariadb.com/v1alpha1
+kind: MariaDB
+metadata:
+  name: mariadb
+  # Do not hardcode namespace in the template; ArgoCD will render it into cluster-1
+spec:
+  rootPasswordSecretKeyRef:
+    name: mariadb-root
+    key: password
+    generate: true
+  username: slurm
+  database: slurm_acct_db
+  passwordSecretKeyRef:
+    name: mariadb-password
+    key: password
+    generate: true
+  storage:
+    size: 2Gi
+    storageClassName: "local-path"
+  myCnf: |
+    [mariadb]
+    bind-address=*
+    default_storage_engine=InnoDB
+    innodb_buffer_pool_size=1024M
+    innodb_lock_wait_timeout=900
+    max_allowed_packet=256M

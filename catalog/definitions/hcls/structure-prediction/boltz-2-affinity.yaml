@@ -1,0 +1,209 @@
+id: boltz-2-affinity
+name: Boltz-2 binding affinity prediction
+description: |
+  Boltz-2 binding affinity prediction for rescoring docking hits.
+  Unique capability: co-folds protein + ligand and predicts ΔG alongside
+  the complex structure — no competitor (RosettaFold, OpenFold3) offers
+  affinity prediction at this cost point.
+
+  Input is a directory of per-complex Boltz-2 YAML files (one per
+  protein-ligand pair). Each YAML follows the Boltz-2 sequences format:
+
+    version: 1
+    sequences:
+      - protein:
+          id: EGFR
+          sequence: MSEQ...
+      - ligand:
+          id: hit_001
+          smiles: "CCOc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCOCCO"
+
+  Invoked with --affinity to enable Boltz-2's affinity head.
+
+  Benchmark role (drug-disco-bench step 3): takes top-100 Uni-Dock hits
+  as a pre-staged batch directory, runs on a single L40S (g6e.xlarge,
+  48 GB VRAM) — ~50 min for 100 complexes at diffusion_samples=1.
+
+  Uses boltz==2.2.1 on PyPI (released late 2025). The --affinity flag
+  requires the Boltz-2 model weights (~5 GB), downloaded once to
+  /mnt/efs/_boltz2-cache and reused across all runs.
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [Boltz-2]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: python:3.11
+  requirements: ["boltz==2.2.1", "cuequivariance-torch", "cuequivariance-ops-torch-cu13"]
+  cache_dir: /mnt/efs/_boltz2-venv
+  entrypoint: boltz
+  notes: |
+    Full python:3.11 (not slim) — boltz 2 pulls triton, which JIT-compiles
+    CUDA kernels at runtime via gcc. Slim image has no gcc; inference dies
+    with "Failed to find C compiler" (same issue as boltz 1.0.0, job 1785).
+    See boltz.SMOKE.md for the full failure history.
+
+    Venv at /mnt/efs/_boltz2-venv is distinct from /mnt/efs/_boltz-venv
+    so boltz 1 and boltz 2 can coexist on the same cluster.
+    Weights at /mnt/efs/_boltz2-cache (~5 GB for the affinity model).
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=64G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:l40s:1
+inputs:
+  - key: input_dir
+    role: generic_path
+    required: false
+    default: /mnt/efs/bench/drug-disco/boltz2-batch
+    description: |
+      Directory of per-complex Boltz-2 YAML input files. Each file names one
+      protein-ligand pair. The benchmark fixture (100 EGFR inhibitors) lives
+      at the default path, staged by drug-disco-bench-prep.
+
+parameters:
+  - key: recycling_steps
+    label: Recycling steps
+    widget: number
+    default: 3
+    min: 1
+    max: 10
+  - key: diffusion_samples
+    label: Diffusion samples per complex
+    widget: number
+    default: 1
+    min: 1
+    max: 5
+  - key: use_msa_server
+    label: Use ColabFold MSA server
+    widget: bool
+    default: true
+    description: |
+      Boltz-2 requires MSAs for structure + affinity prediction. When true,
+      Boltz fetches MSAs from the public ColabFold MMseqs2 server (~30s per
+      unique protein chain; cached per-input). Set false only if you've
+      pre-staged MSAs alongside each input YAML via the `msa:` field, e.g.
+      via the local mmseqs2-gpu template (.a3m on EFS, referenced per
+      complex). Without either an MSA server or pre-staged MSAs, Boltz-2
+      will fail every input. MSA is cached per unique protein and reused
+      across all complexes sharing the same target.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/boltz2-affinity-{{.ctx.run_id}}"
+  artifacts:
+    - key: predictions
+      path: "{{.outputs.dir}}/predictions"
+      role: primary_output
+      description: |
+        Per-complex: predicted complex CIF + confidence JSON + affinity JSON
+        reporting predicted ΔG / Kd (in kcal/mol). Ranked by affinity score.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_DIR={{.inputs.input_dir | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  [ -d "$INPUT_DIR" ] || { echo "input_dir not a directory: $INPUT_DIR" >&2; exit 1; }
+
+  N_INPUTS=$(find "$INPUT_DIR" -maxdepth 1 -name '*.yaml' -o -name '*.yml' | wc -l)
+  [ "$N_INPUTS" -gt 0 ] || { echo "no .yaml inputs found under $INPUT_DIR" >&2; exit 1; }
+  echo "boltz-2-affinity: $N_INPUTS complex inputs -> $OUTPUT_DIR"
+  mkdir -p "$OUTPUT_DIR"
+
+  VENV_DIR=/mnt/efs/_boltz2-venv
+  WEIGHTS_CACHE=/mnt/efs/_boltz2-cache
+  # Pip cache on local NVMe ($TMPDIR), not EFS — EFS pip cache is owned by the
+  # user who first ran the script; inside apptainer the UID may differ and pip
+  # silently disables the cache (verified job 2173). TMPDIR is always writable.
+  export PIP_CACHE_DIR="${TMPDIR:-/tmp}/pip-cache-boltz"
+  mkdir -p "$PIP_CACHE_DIR" "$WEIGHTS_CACHE"
+
+  # Cache the python:3.11 SIF on slurmd-local NVMe via $TMPDIR (EFS NFSv4
+  # rejects apptainer's 0700 chmod). Pre-pull once per node so repeat
+  # invocations don't re-extract OCI → SIF (~30-60s saved per run).
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"
+  mkdir -p "$APPTAINER_CACHEDIR"
+  SIF_DIR=/mnt/efs/_apt-sifs
+  mkdir -p "$SIF_DIR"
+  PYTHON_SIF="$SIF_DIR/python-3.11.sif"
+  [ -f "$PYTHON_SIF" ] || apptainer pull "$PYTHON_SIF" docker://python:3.11 2>&1 | tail -3
+  IMAGE="$PYTHON_SIF"
+
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/boltz" ]; then
+      echo "provisioning boltz==2.2.1 venv on EFS (one-time, ~15-20 min cold)"
+      apptainer exec --nv "$IMAGE" bash -c "
+        set -euo pipefail
+        python3.11 -m venv --system-site-packages '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' boltz==2.2.1 cuequivariance-torch cuequivariance-ops-torch-cu13
+      "
+    fi
+
+    # Patch boltz 2.2.1 upstream bugs (idempotent — safe to re-run):
+    # Bug 1 (inferencev2.py): stage-1 data module always passes compute_affinity=False,
+    #   so featurizer skips profile_affinity → boltz2_conf.ckpt crashes at trunkv2.py:175.
+    # Bug 2 (featurizerv2.py): affinity.mw dereference not guarded → AttributeError on
+    #   non-affinity records.
+    INF="$VENV_DIR/lib/python3.11/site-packages/boltz/data/module/inferencev2.py"
+    FEAT="$VENV_DIR/lib/python3.11/site-packages/boltz/data/feature/featurizerv2.py"
+    if ! grep -qF "record.affinity is not None" "$INF" 2>/dev/null; then
+      sed -i 's/compute_affinity=self\.affinity,$/compute_affinity=self.affinity or (record.affinity is not None),/' "$INF"
+      echo "patch 1 applied (inferencev2.py)"
+    fi
+    if ! grep -qF "data.record.affinity is not None" "$FEAT" 2>/dev/null; then
+      sed -i 's/if compute_affinity:$/if compute_affinity and data.record.affinity is not None:/' "$FEAT"
+      echo "patch 2 applied (featurizerv2.py)"
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  # boltz 2.2.1 pulls torch 2.11.0+cu130; the ops package's libcue_ops.so
+  # dlopens libnvrtc.so.13 and libnvrtc-builtins.so.13.0 but can't find them
+  # without an explicit path. Both live in nvidia/cu13/lib alongside the venv.
+  # Also set APPTAINERENV_LD_LIBRARY_PATH so --nv doesn't shadow our path
+  # (torch.det() on large batches falls back to NVRTC JIT; job 2182 failed
+  # with 100 complexes when apptainer --nv dropped the user LD_LIBRARY_PATH).
+  NVRTC_DIR=$(find "$VENV_DIR" -name 'libnvrtc.so.13' 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null || echo "")
+  if [ -n "$NVRTC_DIR" ]; then
+    export LD_LIBRARY_PATH="$NVRTC_DIR:${LD_LIBRARY_PATH:-}"
+    export APPTAINERENV_LD_LIBRARY_PATH="$LD_LIBRARY_PATH"
+  fi
+
+  MSA_FLAG=()
+  {{- if .params.use_msa_server }}
+  MSA_FLAG=(--use_msa_server)
+  {{- end }}
+
+  cd /tmp
+  # K8s pods default /dev/shm to 64 MiB — Boltz-2's PyTorch DataLoader
+  # workers crash with `unable to allocate shared memory` after MSA fetch
+  # completes (verified job 2148 at 1h41m). Bind a per-job dir under TMPDIR
+  # (NVMe-backed, no size limit) as /dev/shm so torch IPC works.
+  SHM_DIR=$(mktemp -d -t boltz-shm-XXXXX)
+  trap 'rm -rf "$SHM_DIR"' EXIT
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind "$SHM_DIR:/dev/shm" \
+    "$IMAGE" \
+    "$VENV_DIR/bin/boltz" predict "$INPUT_DIR" \
+      --out_dir            "$OUTPUT_DIR" \
+      --cache              "$WEIGHTS_CACHE" \
+      "${MSA_FLAG[@]}" \
+      --recycling_steps    {{.params.recycling_steps}} \
+      --diffusion_samples  {{.params.diffusion_samples}} \
+      --model              boltz2 \
+      --accelerator        gpu \
+      --num_workers        0
+      # Affinity head is gated per-input by a
+      # `properties: [{affinity: {binder: <ligand_id>}}]` block inside each
+      # YAML in $INPUT_DIR — boltz CLI has no top-level --affinity flag
+      # (verified job 2125 --help dump). drug-disco-bench-prep writes that
+      # block; this template ignores it (CLI just reads the YAMLs).

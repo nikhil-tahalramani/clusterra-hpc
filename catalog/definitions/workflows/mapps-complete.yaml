@@ -1,0 +1,37 @@
+id: mapps-complete
+name: MAPPs Complete
+description: |
+  End-to-end MHC-associated peptide proteomics: Sarek fq2bam →
+  DeepSomatic → epitope prediction → Casanovo de novo sequencing.
+
+  Cross-step auto-discovery happens in the child templates (they walk up
+  to $WORKFLOW_DIR/step-N-<id>/), so the recipe just wires linear
+  `afterok` deps and trusts the children to find each other.
+
+  Casanovo intentionally takes an MGF separate from the genomics chain —
+  surfaced as its own form field.
+
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [Parabricks, DeepSomatic, MHCflurry, Casanovo]
+ready: true
+kind: workflow
+
+steps:
+  - step_id: fq2bam
+    template_id: parabricks-rna-fq2bam
+    display_name: Sarek + fq2bam
+  - step_id: deepsomatic
+    template_id: parabricks-deepsomatic
+    display_name: Parabricks DeepSomatic
+    depends_on: [fq2bam]
+  - step_id: epitopes
+    template_id: epitopeprediction
+    display_name: Epitope prediction
+    depends_on: [deepsomatic]
+  - step_id: casanovo
+    template_id: casanovo
+    display_name: Casanovo de novo
+    depends_on: [epitopes]

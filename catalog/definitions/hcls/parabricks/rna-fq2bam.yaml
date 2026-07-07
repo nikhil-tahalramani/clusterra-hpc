@@ -1,0 +1,96 @@
+id: parabricks-rna-fq2bam
+name: Parabricks RNA fq2bam (GPU STAR)
+description: |
+  GPU-accelerated RNA-seq alignment via NVIDIA Parabricks `pbrun rna_fq2bam`.
+  Drop-in STAR replacement — same STAR index, same SAM/BAM output semantics —
+  ~10–20× faster than CPU STAR on a single A10G.
+vertical: hcls
+category: alignment
+workload_group: genomics
+modality: form
+tools: [Parabricks, STAR]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: nvcr.io/nvidia/clara/clara-parabricks:4.6.0-1
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=12
+  #SBATCH --mem=64G
+  #SBATCH --time=1:30:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+  #SBATCH --requeue
+inputs:
+  - key: input_fq1
+    role: fastq_r1
+    required: true
+    description: Gzipped FASTQ for read 1.
+  - key: input_fq2
+    role: fastq_r2
+    required: true
+    description: Gzipped FASTQ for read 2 (paired with R1).
+  - key: reference_fasta
+    role: reference_fasta
+    required: false
+    default: /mnt/s3-refs/igenomes/Homo_sapiens/GATK/GRCh38/Sequence/WholeGenomeFasta/Homo_sapiens_assembly38.fasta
+  - key: star_index_dir
+    role: generic_path
+    required: false
+    default: /mnt/s3-refs/igenomes/Homo_sapiens/GATK/GRCh38/Sequence/STARIndex/
+    description: Pre-built STAR index directory matching the reference FASTA.
+
+parameters:
+  - key: read_group_id
+    widget: text
+    default: RG1
+    description: Slug for the BAM @RG ID field.
+  - key: sample
+    widget: text
+    default: sample
+    description: Sample name for the BAM @RG SM field.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/pbrun-rna-{{.ctx.run_id}}"
+  artifacts:
+    - key: bam
+      path: "{{.outputs.dir}}/aligned.bam"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  IN_FQ1={{.inputs.input_fq1 | quote}}
+  IN_FQ2={{.inputs.input_fq2 | quote}}
+  REF={{.inputs.reference_fasta | quote}}
+  STAR_DIR={{.inputs.star_index_dir | quote}}
+
+  for f in "$IN_FQ1" "$IN_FQ2" "$REF"; do
+    [ -r "$f" ] || { echo "input not readable: $f" >&2; exit 1; }
+  done
+  [ -d "$STAR_DIR" ] || { echo "STAR index dir missing: $STAR_DIR" >&2; exit 1; }
+  [ -r "$STAR_DIR/SAindex" ] || { echo "STAR_DIR has no SAindex: $STAR_DIR" >&2; exit 1; }
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  OUT_NAME="aligned.bam"
+
+  # pbrun rna_fq2bam takes RG as separate --read-group-* flags (unlike fq2bam
+  # which accepts inline @RG\t... in --in-fq).
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" \
+    "docker://{{.runtime.image}}" \
+    pbrun rna_fq2bam \
+      --ref               "$REF" \
+      --in-fq             "$IN_FQ1" "$IN_FQ2" \
+      --read-group-sm     {{.params.sample | quote}} \
+      --read-group-id-prefix {{.params.read_group_id | quote}} \
+      --read-group-lb     {{.params.sample | quote}} \
+      --read-group-pl     ILLUMINA \
+      --genome-lib-dir    "$STAR_DIR" \
+      --output-dir        "$OUTPUT_DIR" \
+      --out-bam           "$OUT_NAME" \
+      --tmp-dir           "$TMPDIR"

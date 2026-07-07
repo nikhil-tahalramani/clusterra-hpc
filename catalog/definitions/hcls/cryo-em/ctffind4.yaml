@@ -1,0 +1,284 @@
+id: ctffind4
+name: CTFFIND4 (CTF estimation, standalone)
+description: |
+  Standalone CTF estimation for cryo-EM micrographs using CTFFIND4 (Rohou &
+  Grigorieff 2015, HHMI Janelia / UMass Chan). Estimates per-micrograph
+  defocus and astigmatism from the power-spectrum Thon rings — the first
+  required step in SPA / tomography pipelines, run before particle picking.
+
+  Previously only reachable via the bundled RELION flow; this standalone
+  template lets you fan CTFFIND4 over an arbitrary micrograph directory
+  without spinning up the full RELION GUI / project tree.
+
+  Latest CPU stable: 4.1.14 (Jan 2025). The upstream static x86_64 binary
+  from grigoriefflab.umassmed.edu is cached on EFS at first run — same
+  pattern as the Sage proteomics template (`/mnt/efs/bin/ctffind-vX.Y.Z`).
+  No container, no apptainer pull, ~3s cold start.
+
+  CTFFIND5 (Elferich et al., GPU-accelerated successor with tilted-sample
+  + thickness estimation) is also available but ships as source-build only
+  on Janelia GitLab — kept off the conservative anchor; a separate
+  `ctffind5` GPU template can be added once we have a packaged binary.
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [CTFFIND4]
+ready: true
+kind: batch
+
+runtime:
+  kind: host_system
+  binary: /mnt/efs/bin/ctffind-v4.1.14
+  notes: |
+    CTFFIND4 is a single static x86_64 binary (verified May 27 2026 —
+    `file ctffind` → ELF 64-bit LSB executable, statically linked).
+    The script curls + extracts the upstream tarball
+    (https://grigoriefflab.umassmed.edu/sites/default/files/ctffind-4.1.14-linux64.tar.gz,
+    ~19 MB compressed → 52 MB binary) once per cluster, then reuses.
+    All worker shapes in us-east-1 us-west-2 are x86_64. No GPU; CPU only.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=8G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+inputs:
+  - key: micrograph
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Single .mrc micrograph to estimate CTF on. Empty = SMOKE_MODE
+      (downloads + version-prints the binary only; no estimation run).
+      For batch fan-out over many micrographs, submit one job per
+      micrograph or use `micrograph_dir`.
+  - key: micrograph_dir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Directory of .mrc micrographs. When set, the script iterates every
+      *.mrc in the directory and writes per-micrograph outputs into
+      `outputs.dir`. Overrides `micrograph` when both are set.
+
+parameters:
+  - key: pixel_size_a
+    label: Pixel size (Å)
+    widget: number
+    default: 1.0
+    min: 0.1
+    max: 10.0
+    description: Sampling rate of the micrograph in Angstroms per pixel.
+  - key: voltage_kv
+    label: Acceleration voltage (kV)
+    widget: number
+    default: 300
+    min: 80
+    max: 300
+    description: Microscope acceleration voltage. 300 kV typical for modern Krios.
+  - key: cs_mm
+    label: Spherical aberration Cs (mm)
+    widget: number
+    default: 2.7
+    min: 0.0
+    max: 5.0
+    description: Spherical aberration coefficient. 2.7 mm typical for Krios; 0.01 for Cs-corrected.
+  - key: amp_contrast
+    label: Amplitude contrast
+    widget: number
+    default: 0.07
+    min: 0.0
+    max: 0.5
+    description: Amplitude contrast fraction. 0.07 typical cryo (range 0.07-0.10).
+  - key: box_size
+    label: Power-spectrum box size (px)
+    widget: number
+    default: 512
+    min: 128
+    max: 2048
+    description: FFT box size in pixels. 512 typical; larger improves low-defocus precision.
+  - key: min_res_a
+    label: Min resolution (Å)
+    widget: number
+    default: 30.0
+    min: 5.0
+    max: 100.0
+    description: Lowest resolution to fit (Å). Suppresses ice-ring + carbon-edge noise below this.
+  - key: max_res_a
+    label: Max resolution (Å)
+    widget: number
+    default: 5.0
+    min: 2.0
+    max: 30.0
+    description: Highest resolution to fit (Å). Don't push below per-pixel Nyquist.
+  - key: min_defocus_a
+    label: Min defocus (Å)
+    widget: number
+    default: 5000.0
+    min: 0.0
+    max: 100000.0
+    description: Defocus search lower bound in Å (positive = underfocus).
+  - key: max_defocus_a
+    label: Max defocus (Å)
+    widget: number
+    default: 50000.0
+    min: 0.0
+    max: 100000.0
+    description: Defocus search upper bound in Å.
+  - key: defocus_step_a
+    label: Defocus search step (Å)
+    widget: number
+    default: 500.0
+    min: 10.0
+    max: 5000.0
+    description: Defocus search grid step in Å. 500 is upstream default.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/ctffind4-{{.ctx.run_id}}"
+  artifacts:
+    - key: results_txt
+      path: "{{.outputs.dir}}/results.txt"
+      role: primary_output
+      description: |
+        Per-micrograph CTFFIND4 results table. Columns: micrograph_name,
+        defocus_1 (Å), defocus_2 (Å), astigmatism_angle (deg), phase_shift
+        (rad), cross_correlation, max_resolution_fit_to (Å).
+    - key: log
+      path: "{{.outputs.dir}}/ctffind4.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  CTFFIND_VERSION="4.1.14"
+  CTFFIND_BIN="/mnt/efs/bin/ctffind-v${CTFFIND_VERSION}"
+  CTFFIND_URL="https://grigoriefflab.umassmed.edu/sites/default/files/ctffind-${CTFFIND_VERSION}-linux64.tar.gz"
+
+  MIC={{.inputs.micrograph | quote}}
+  MIC_DIR={{.inputs.micrograph_dir | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+
+  PIXEL={{.params.pixel_size_a}}
+  KV={{.params.voltage_kv}}
+  CS={{.params.cs_mm}}
+  AMP={{.params.amp_contrast}}
+  BOX={{.params.box_size}}
+  MIN_RES={{.params.min_res_a}}
+  MAX_RES={{.params.max_res_a}}
+  MIN_DF={{.params.min_defocus_a}}
+  MAX_DF={{.params.max_defocus_a}}
+  DF_STEP={{.params.defocus_step_a}}
+
+  mkdir -p "$OUTPUT_DIR" /mnt/efs/bin
+
+  # ---- Stage CTFFIND4 binary on EFS (once per cluster) ----
+  if [ ! -x "$CTFFIND_BIN" ]; then
+    echo "[ctffind4] staging v${CTFFIND_VERSION} from grigoriefflab.umassmed.edu..."
+    TMPTAR="${CTFFIND_BIN}.tar.gz.tmp.$$"
+    TMPDIR_X="${CTFFIND_BIN}.extract.$$"
+    mkdir -p "$TMPDIR_X"
+    curl -sSL --fail -o "$TMPTAR" "$CTFFIND_URL"
+    tar -xzf "$TMPTAR" -C "$TMPDIR_X"
+    mv "$TMPDIR_X/bin/ctffind" "$CTFFIND_BIN"
+    chmod +x "$CTFFIND_BIN"
+    rm -rf "$TMPTAR" "$TMPDIR_X"
+    echo "[ctffind4] binary staged at $CTFFIND_BIN"
+  else
+    echo "[ctffind4] using cached binary: $CTFFIND_BIN"
+  fi
+
+  # Version probe (binary prints version to stderr on bare exec then waits on stdin;
+  # feed it empty input so it exits cleanly).
+  echo "" | "$CTFFIND_BIN" --version 2>&1 | head -5 || true
+
+  # ---- SMOKE_MODE: no micrograph + no dir → stage-only ----
+  if [ -z "$MIC" ] && [ -z "$MIC_DIR" ]; then
+    echo "[ctffind4] SMOKE_MODE: binary staged + version-printed."
+    echo "[ctffind4] Provide 'micrograph' or 'micrograph_dir' for a real CTF estimation run."
+    echo "ok" > "$OUTPUT_DIR/results.txt"
+    exit 0
+  fi
+
+  # ---- Build the list of micrographs to process ----
+  MICS=()
+  if [ -n "$MIC_DIR" ]; then
+    [ -d "$MIC_DIR" ] || { echo "micrograph_dir not a directory: $MIC_DIR" >&2; exit 1; }
+    while IFS= read -r -d '' f; do MICS+=("$f"); done \
+      < <(find "$MIC_DIR" -maxdepth 1 -type f -name "*.mrc" -print0 | sort -z)
+    [ ${#MICS[@]} -gt 0 ] || { echo "no .mrc files in $MIC_DIR" >&2; exit 1; }
+  else
+    [ -r "$MIC" ] || { echo "micrograph not readable: $MIC" >&2; exit 1; }
+    MICS=("$MIC")
+  fi
+
+  echo "[ctffind4] processing ${#MICS[@]} micrograph(s)..."
+
+  # ---- Run CTFFIND4 per micrograph via scripted-mode stdin ----
+  # CTFFIND4's default mode (no flag) is "Scripted" when stdin is a non-TTY:
+  # it reads one answer per prompt in fixed order. The interactive "Input is
+  # a movie?" prompt is SKIPPED in scripted mode (verified May 27 2026 by
+  # failed job 2726 — "Output diagnostic image file name : no" → CTFFIND
+  # never asked the movie question and treated 'no' as the diagnostic path).
+  #
+  # Final order (verified live against ctffind 4.1.14 scripted mode on
+  # clusde74 job 2731, RELION 3 tutorial micrograph, COMPLETED in 28s):
+  #   1  input image
+  #   2  output diagnostic image (.mrc)
+  #   3  pixel size (Å)
+  #   4  acceleration voltage (kV)
+  #   5  spherical aberration Cs (mm)
+  #   6  amplitude contrast
+  #   7  size of amplitude spectrum (box size, px)
+  #   8  minimum resolution (Å)
+  #   9  maximum resolution (Å)
+  #  10  minimum defocus (Å)
+  #  11  maximum defocus (Å)
+  #  12  defocus search step (Å)
+  #  13  do you know what astigmatism is present?  (no)
+  #  14  slower exhaustive search?                 (no)
+  #  15  use a restraint on astigmatism?           (no)
+  #  16  find additional phase shift?              (no)
+  #  17  set expert options?                       (no)
+  : > "$OUTPUT_DIR/results.txt"
+  : > "$OUTPUT_DIR/ctffind4.log"
+
+  for mic in "${MICS[@]}"; do
+    base=$(basename "$mic" .mrc)
+    diag="$OUTPUT_DIR/${base}_diag.mrc"
+    echo "[ctffind4] -> $base" | tee -a "$OUTPUT_DIR/ctffind4.log"
+    "$CTFFIND_BIN" <<EOF >>"$OUTPUT_DIR/ctffind4.log" 2>&1
+  $mic
+  $diag
+  $PIXEL
+  $KV
+  $CS
+  $AMP
+  $BOX
+  $MIN_RES
+  $MAX_RES
+  $MIN_DF
+  $MAX_DF
+  $DF_STEP
+  no
+  no
+  no
+  no
+  no
+  EOF
+    # CTFFIND4 writes results to <diag>.txt (replacing .mrc extension).
+    per_mic_txt="${diag%.mrc}.txt"
+    if [ -s "$per_mic_txt" ]; then
+      # Strip comment lines; emit one tab-separated row per micrograph.
+      grep -v '^#' "$per_mic_txt" | awk -v n="$base" 'NF>0 {print n"\t"$0}' >> "$OUTPUT_DIR/results.txt"
+    else
+      echo "[ctffind4] WARN: no results emitted for $base" | tee -a "$OUTPUT_DIR/ctffind4.log"
+    fi
+  done
+
+  TOTAL=${#MICS[@]}
+  PASSED=$(wc -l < "$OUTPUT_DIR/results.txt")
+  echo "=== CTFFIND4 summary: $PASSED / $TOTAL micrographs produced fits ==="
+  echo "outputs written to $OUTPUT_DIR"

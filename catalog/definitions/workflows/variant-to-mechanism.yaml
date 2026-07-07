@@ -1,0 +1,31 @@
+id: variant-to-mechanism
+name: Variant-to-mechanism
+description: |
+  NGS → structural biology bridge: Parabricks DeepVariant → OpenFold3 →
+  openmmpbsa ΔΔG.
+
+  Same shape as cell-to-target: a linear 3-step chain whose
+  "variant → mutant-protein FASTA" bridging step is a tracked product
+  gap. The recipe ships the chain; the bridging is left as a
+  user-supplied FASTA path for now.
+
+vertical: hcls
+category: genomics
+workload_group: genomics
+modality: form
+tools: [Parabricks, OpenFold3, openmmpbsa]
+ready: true
+kind: workflow
+
+steps:
+  - step_id: deepvariant
+    template_id: parabricks-deepvariant
+    display_name: Parabricks DeepVariant
+  - step_id: fold
+    template_id: openfold3
+    display_name: OpenFold3 mutant fold
+    depends_on: [deepvariant]
+  - step_id: ddg
+    template_id: openmmpbsa
+    display_name: openmmpbsa ΔΔG
+    depends_on: [fold]

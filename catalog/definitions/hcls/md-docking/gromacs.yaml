@@ -1,0 +1,170 @@
+id: gromacs
+name: GROMACS molecular dynamics
+description: Classical MD trajectories — grompp + mdrun on right-sized GPU partitions. CLI-driven.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: cli
+tools: [GROMACS, mdrun]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: nvcr.io/hpc/gromacs:2023.2
+  notes: |
+    NGC GROMACS image (apptainer pull). NGC tag list (verified May 8 2026
+    via /v2/hpc/gromacs/tags/list) tops at 2023.2 — there is no public
+    2024.x HPC build. Image lacks a Docker ENTRYPOINT, so 'gmx' is NOT on
+    PATH; every invocation must source /usr/local/gromacs/avx2_256/bin/GMXRC
+    inside the container first. GMXRC references $shell and $GMXLDLIB
+    without defaults so we `set +u` around the source. NGC publishes 4 SIMD
+    variants (avx2_256, avx_512, avx_256, sse4.1) — avx2_256 works on every
+    modern x86 EC2 family.
+
+    Verified on g5.8xlarge / A10G (clusde74 job 1814, May 8 2026): 884-water
+    cubic box, 2000 steps PME, -nb gpu -pme gpu (CPU bonded; pure water has
+    no bonded terms so '-bonded gpu' is rejected by mdrun, and '-update gpu'
+    segfaults on the NGC 2023.2 build for water-only systems — drop them
+    for the smoke). Wall ~9s mdrun, ~1297 ns/day. Real protein systems
+    (lysozyme tutorial / drug-disco-bench EGFR) keep -bonded gpu.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=12:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:l40s:1
+  {{- if gt (int .params.candidate_count) 1 }}
+  #SBATCH --array=1-{{.params.candidate_count}}
+  {{- end }}
+inputs:
+  - key: tpr
+    role: generic_path
+    required: false
+    description: |
+      Single .tpr (solo run mode). Required when candidate_count=1. For an
+      array sweep, supply tpr_dir + candidate_count instead — array task N
+      reads candidate_${SLURM_ARRAY_TASK_ID}.tpr from tpr_dir.
+  - key: tpr_dir
+    role: generic_path
+    required: false
+    description: |
+      Directory of candidate_<N>.tpr files (array mode). Required when
+      candidate_count>1. drug-disco-bench-prep stages this at
+      /mnt/efs/bench/drug-disco/gromacs/.
+
+parameters:
+  - key: candidate_count
+    widget: number
+    default: 1
+    min: 1
+    max: 32
+    description: |
+      Number of replicate candidates to run in parallel. >1 emits
+      #SBATCH --array=1-N and the script picks candidate_${SLURM_ARRAY_TASK_ID}.tpr
+      from tpr_dir; =1 runs solo against `tpr`.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/gromacs-{{.ctx.run_id}}"
+  artifacts:
+    - key: trajectory
+      path: "{{.outputs.dir}}/prod.xtc"
+      role: primary_output
+    - key: final_structure
+      path: "{{.outputs.dir}}/prod.gro"
+      role: generic
+    - key: mdrun_log
+      path: "{{.outputs.dir}}/prod.log"
+      role: log
+    - key: rmsd
+      path: "{{.outputs.dir}}/rmsd.xvg"
+      role: generic
+
+script: |
+  #!/bin/bash
+  # ── GROMACS production MD ────────────────────────────────────────────────
+  # Takes a production-ready .tpr (e.g. drug-disco-bench-prep stages a 1 ns
+  # NPT .tpr: AMBER99SB-ILDN + TIP3P, 500,000 steps × 2 fs, EGFR kinase domain
+  # post-EM/NVT/NPT equilibration) and runs `gmx mdrun` on 1× L40s.
+  #
+  # Two modes (chosen at submit time via candidate_count param):
+  #   - Solo (candidate_count=1):  reads inputs.tpr; writes to outputs.dir.
+  #   - Array (candidate_count>1): #SBATCH --array=1-N spawns N parallel tasks;
+  #     each task N reads tpr_dir/candidate_${SLURM_ARRAY_TASK_ID}.tpr and
+  #     writes to outputs.dir/candidate_${SLURM_ARRAY_TASK_ID}/. Each task is
+  #     billed/cost-stamped independently via slurmd's admin_comment stamping.
+  #
+  # Outputs prod.xtc (trajectory, ~100 frames at nstxtcout=5000), prod.gro
+  # (final structure), prod.log (full mdrun log). The Performance: ns/day
+  # line is echoed at the end so it shows up in the slurm stdout for the
+  # case-study writeup. Backbone RMSD vs the starting structure is computed
+  # via `gmx rms` as a final scientific output (rmsd.xvg).
+  set -euo pipefail
+
+  # Resolve INPUT_TPR + OUTPUT_DIR for solo vs array mode. The Go template
+  # picks one branch at render time (text/template runs with missingkey=error,
+  # so we can only reference whichever input was supplied). The bash check on
+  # SLURM_ARRAY_TASK_ID is defensive — array-mode renders only when
+  # candidate_count>1, which is also when #SBATCH --array is emitted.
+  {{- if gt (int .params.candidate_count) 1 }}
+  if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+    echo "FATAL: array-mode template (candidate_count={{.params.candidate_count}}) ran without SLURM_ARRAY_TASK_ID"
+    exit 1
+  fi
+  INPUT_TPR={{.inputs.tpr_dir | quote}}/candidate_${SLURM_ARRAY_TASK_ID}.tpr
+  OUTPUT_DIR={{.outputs.dir | quote}}/candidate_${SLURM_ARRAY_TASK_ID}
+  if [ ! -f "$INPUT_TPR" ]; then
+    echo "FATAL: array task ${SLURM_ARRAY_TASK_ID} expected $INPUT_TPR but file is missing"
+    exit 1
+  fi
+  {{- else }}
+  INPUT_TPR={{.inputs.tpr | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  {{- end }}
+  mkdir -p "$OUTPUT_DIR"
+  cd "$OUTPUT_DIR"
+
+  # `gmx mdrun -deffnm prod` writes prod.{xtc,gro,log,edr,cpt}; symlink the
+  # input .tpr so all outputs share the `prod` stem.
+  ln -sf "$INPUT_TPR" prod.tpr
+
+  # APPTAINER_CACHEDIR must be slurmd-local (NVMe via $TMPDIR), not EFS —
+  # EFS NFSv4 rejects apptainer's 0700 chmod. Pre-pulled SIFs persist on
+  # EFS at $SIF_DIR so we still skip cross-job re-extracts.
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"
+  mkdir -p "$APPTAINER_CACHEDIR"
+  SIF_DIR=/mnt/efs/_apt-sifs
+  mkdir -p "$SIF_DIR"
+  GROMACS_SIF="$SIF_DIR/gromacs-2023.2.sif"
+  if [ ! -f "$GROMACS_SIF" ]; then
+    apptainer pull "$GROMACS_SIF" "docker://{{.runtime.image}}" 2>&1 | tail -5
+  fi
+
+  # NGC image lacks ENTRYPOINT; source GMXRC inside container with set +u
+  # since GMXRC references $shell / $GMXLDLIB without defaults.
+  # -bonded gpu is valid here (protein system has bonded terms, unlike the
+  # pure-water smoke). -update gpu is omitted: NGC 2023.2 has crashed with
+  # it on similarly-sized systems; leave the update step on CPU.
+  apptainer exec --nv \
+    --bind /mnt/efs:/mnt/efs \
+    --bind "$OUTPUT_DIR:$OUTPUT_DIR" \
+    "$GROMACS_SIF" bash -c '
+      set +u
+      source /usr/local/gromacs/avx2_256/bin/GMXRC
+      set -u
+      cd "'"$OUTPUT_DIR"'"
+      gmx mdrun -deffnm prod -nsteps 500000 \
+                -nb gpu -bonded gpu -pme gpu -ntmpi 1 \
+                -ntomp ${SLURM_CPUS_PER_TASK:-8} -pin on
+      # Backbone RMSD vs starting structure (group 4 = Backbone, twice for
+      # both -s reference and -f fit selection).
+      printf "Backbone\nBackbone\n" | \
+        gmx rms -s prod.tpr -f prod.xtc -o rmsd.xvg -tu ns 2>&1 | tail -5 || true
+    '
+
+  # Surface the headline metric for the case-study writeup. mdrun emits
+  # `Performance:    <ns/day>    <hour/ns>` near the end of the log.
+  echo "=== mdrun performance ==="
+  grep -E "^Performance:" prod.log || echo "Performance: (line not found in prod.log)"

@@ -1,0 +1,318 @@
+id: metamorpheus-to-pglyco3
+name: MetaMorpheus → pGlyco3 format (DeepGP rescorer input prep)
+description: |
+  Connector: converts a MetaMorpheus GlycoSearchTask `AllPSMs.psmtsv`
+  to pGlyco3's `pGlycoDB-GP-FDR-Pro.txt` schema so a downstream
+  DeepGP (BSD-2-Clause, Lu lab Nature MI 2024) rescoring job can
+  consume it. DeepGP's `1_dataset_format.py::pglyco3_result()` parser
+  reads exactly 13 of pGlyco3's 39 columns; this connector emits
+  those 13 plus a handful of provenance columns DeepGP ignores but
+  pGlyco3 tools may expect (GlyID stub, decoy flag).
+
+  Why it's possible cheaply: MetaMorpheus and pGlyco3 already share
+  the same glycan-tree encoding — parenthesized `(N(H(A))(N(H)))`
+  for structure and `HexNAc(2)Hex(5)` for composition (both inherited
+  from Bo Peng's original 2014 pGlyco paper). The heavy lift is
+  ~50 lines of Python: column renames, J-substitution at the
+  N-glycosite, Mod-syntax reformat from MM's `[Type:Name on R]` to
+  pGlyco3's `pos,Name[R];` form. No GlyID lookup table, no
+  MetaMorpheus fork.
+
+  Heuristic scope:
+    - glycan_class = n: full coverage. DeepGP requires exactly one
+      `J` per peptide (line 88 of its parser); we substitute the
+      N-X-S/T sequon N with J. PSMs that don't satisfy the sequon
+      are dropped with a count to stderr.
+    - glycan_class = o: experimental. DeepGP's published benchmarks
+      are N-glyco-dominant; O-glyco support depends on the model
+      checkpoint loaded. We emit the same schema with the localized
+      Ser/Thr site marked but tag the output `experimental_o = true`
+      in the run manifest. Try it on a small subset before promoting.
+
+  Output is parquet-tab text matching pGlyco3 schema exactly —
+  `pGlycoDB-GP-FDR-Pro.txt` is the canonical filename DeepGP scans
+  for in an input directory.
+
+  Pair with: any `metamorpheus-*-glyco` template upstream;
+  `deepgp-rescore` downstream.
+
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [Python, pandas]
+ready: true
+kind: batch
+display: connector
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: python:3.11
+  cache_dir: /mnt/efs/_mm-to-pglyco3-venv
+  entrypoint: python
+  requirements:
+    - "pandas==2.2.3"
+  notes: |
+    pandas only — no rdkit, no torch. Pure column-rename + light
+    string parsing. Persistent EFS venv; flock-guarded first-run.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=4G
+  #SBATCH --time=0:10:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: psm_tsv
+    role: generic_path
+    required: true
+    description: |
+      Absolute /mnt/efs path to MetaMorpheus `AllPSMs.psmtsv`. When
+      wired downstream of `metamorpheus-n-glyco` in a workflow, set
+      to `/mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-search-n/Task1GlycoSearchTask/AllPSMs.psmtsv`.
+
+parameters:
+  - key: glycan_class
+    label: Glycan class (n or o)
+    widget: enum
+    options: [n, o]
+    default: n
+    description: |
+      n = N-glycopeptide PSMs (DeepGP-supported, full coverage).
+      o = O-glycopeptide PSMs (experimental — verify against your
+      DeepGP checkpoint before relying on results).
+
+  - key: fdr_input_cutoff
+    label: Input PSM-FDR cutoff (q-value)
+    widget: number
+    default: 0.05
+    min: 0.001
+    max: 0.50
+    description: |
+      Filter input PSMs to QValue <= this. Default 0.05 (wider than
+      the 0.01 publishing cutoff) so DeepGP has a candidate pool it
+      can rescue PSMs out of. Tightening to 0.01 means DeepGP can
+      only re-rank within the already-confident set; loosening past
+      0.10 inflates noise.
+
+  - key: include_decoys
+    label: Include decoy PSMs in output
+    widget: bool
+    default: true
+    description: |
+      Emit decoy PSMs alongside targets with `Decoy=1`, `PepDecoy=1`,
+      `GlyDecoy=1` set. Required for downstream FDR control after
+      DeepGP rescoring (DeepGP's `Post_analysis` script's hard-coded
+      Yeast/Mouse decoy regimes don't match generic samples; we apply
+      our own decoy-based FDR with MM's flagging). Turn off only if
+      using DeepGP for re-ranking within an already-FDR-controlled
+      target set.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-{{.ctx.step_id}}"
+  artifacts:
+    - key: pglyco3_tsv
+      path: "{{.outputs.dir}}/pGlycoDB-GP-FDR-Pro.txt"
+      role: primary_output
+    - key: manifest
+      path: "{{.outputs.dir}}/manifest.json"
+      role: generic
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  export OUTPUT_DIR
+
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  export PIP_CACHE_DIR=/mnt/efs/_mm-to-pglyco3-pip-cache
+  mkdir -p "$PIP_CACHE_DIR" "$(dirname "$VENV_DIR")"
+
+  IMAGE="docker://{{.runtime.base_image}}"
+
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+      apptainer exec "$IMAGE" bash -c "
+        set -euo pipefail
+        python{{.runtime.python_version}} -m venv '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' \
+          {{range .runtime.requirements}}'{{.}}' {{end}}
+      "
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  SCRIPT_PATH="$OUTPUT_DIR/convert.py"
+  cat > "$SCRIPT_PATH" <<'__CONVERT_PY_EOF__'
+  import json
+  import os
+  import pathlib
+  import re
+  import sys
+  from datetime import datetime, timezone
+
+  import pandas as pd
+
+  OUTPUT_DIR = pathlib.Path(os.environ["OUTPUT_DIR"])
+  PSM_TSV = pathlib.Path(os.environ["CONV_PSM_TSV"])
+  GLYCAN_CLASS = os.environ["CONV_GLYCAN_CLASS"].lower()
+  FDR_CUT = float(os.environ.get("CONV_FDR_CUT") or "0.05")
+
+  if not PSM_TSV.is_file():
+      sys.exit(f"convert: psm_tsv not found: {PSM_TSV}")
+  if GLYCAN_CLASS not in ("n", "o"):
+      sys.exit(f"convert: glycan_class must be 'n' or 'o', got {GLYCAN_CLASS!r}")
+
+  INCLUDE_DECOYS = (os.environ.get("CONV_INCLUDE_DECOYS", "true").lower() == "true")
+
+  df = pd.read_csv(PSM_TSV, sep="\t", low_memory=False)
+  print(f"input rows: {len(df)}", flush=True)
+
+  target_col = "Decoy/Contaminant/Target"
+  keep_labels = ("T", "D") if INCLUDE_DECOYS else ("T",)
+  df = df[df[target_col].isin(keep_labels)].copy()
+  df["_is_decoy"] = (df[target_col] == "D").astype(int)
+  df = df[df["QValue"].astype(float) <= FDR_CUT].copy()
+  df = df[df["Plausible GlycanComposition"].fillna("").astype(str).str.len() > 0].copy()
+  print(f"after target+{'decoy ' if INCLUDE_DECOYS else ''}+ QValue<={FDR_CUT} + has-glycan filter: {len(df)} (targets={int((df['_is_decoy']==0).sum())}, decoys={int(df['_is_decoy'].sum())})", flush=True)
+
+  # Parse Full Sequence's `[Type:Name on R]` blocks into pGlyco3 `pos,Name[R];` form.
+  # Position is 1-based in the unmodified BaseSequence. The glycosylation mod itself
+  # is excluded — it's represented by J + GlycanComposition in pGlyco3.
+  MOD_BLOCK = re.compile(r"\[([^\[\]]+?):([^\[\]]+?) on ([A-Z])\]")
+  GLYCO_MOD_NAMES = ("Glycosylation", "Glycan", "N-Glycan", "O-Glycan", "GlcNAc", "HexNAc")
+
+  def parse_mods(full_seq: str) -> str:
+      pos = 0
+      out = []
+      i = 0
+      while i < len(full_seq):
+          ch = full_seq[i]
+          if ch == "[":
+              end = full_seq.index("]", i)
+              block = full_seq[i + 1:end]
+              m = re.match(r"([^:]+):([^[]+) on ([A-Z])", block)
+              if m and not any(g in m.group(2) for g in GLYCO_MOD_NAMES):
+                  out.append(f"{pos},{m.group(2).strip()}[{m.group(3)}]")
+              i = end + 1
+          else:
+              pos += 1
+              i += 1
+      return ";".join(out)
+
+  # Glycosite extraction:
+  # N-glyco: find the N-X-S/T sequon position in BaseSequence (X != P).
+  # O-glyco: parse "Localized Glycans with Peptide Site Specific Probability"
+  # for the highest-probability Ser/Thr position.
+  SEQUON = re.compile(r"N[^P](?=[ST])")
+  LOC_PROB = re.compile(r"(\d+)\((\d+(?:\.\d+)?)\)")
+
+  def n_glyco_site(base_seq: str) -> int | None:
+      m = SEQUON.search(base_seq)
+      return m.start() + 1 if m else None
+
+  def o_glyco_site(loc_str: str, base_seq: str) -> int | None:
+      candidates = [(int(p), float(s)) for p, s in LOC_PROB.findall(loc_str or "")]
+      if not candidates:
+          # fallback: first S/T
+          for i, ch in enumerate(base_seq):
+              if ch in ("S", "T"):
+                  return i + 1
+          return None
+      return max(candidates, key=lambda x: x[1])[0] + 1
+
+  def j_substitute(base_seq: str, site_1based: int) -> str:
+      i = site_1based - 1
+      return base_seq[:i] + "J" + base_seq[i + 1:]
+
+  def raw_name(file_name: str) -> str:
+      stem = pathlib.Path(str(file_name)).stem
+      return stem[:-5] if stem.endswith(".mzML") else stem
+
+  records = []
+  dropped_no_site = 0
+  dropped_multi_j = 0
+  for _, row in df.iterrows():
+      base = str(row["Base Sequence"])
+      if GLYCAN_CLASS == "n":
+          site = n_glyco_site(base)
+      else:
+          site = o_glyco_site(str(row.get("Localized Glycans with Peptide Site Specific Probability", "")), base)
+      if site is None:
+          dropped_no_site += 1
+          continue
+      peptide_j = j_substitute(base, site)
+      if peptide_j.count("J") != 1:
+          dropped_multi_j += 1
+          continue
+      rn = raw_name(row["File Name"])
+      scan = int(row["Scan Number"])
+      charge = int(row["Precursor Charge"])
+      records.append({
+          "GlySpec": f"{rn}-{scan}-{scan}-{charge}-0.dta",
+          "RawName": rn,
+          "Scan": scan,
+          "Charge": charge,
+          "RT": float(row["Scan Retention Time"]),
+          "PrecursorMZ": float(row["Precursor MZ"]),
+          "Peptide": peptide_j,
+          "Mod": parse_mods(str(row.get("Full Sequence", ""))),
+          "PlausibleStruct": str(row.get("Plausible GlycanStructure", "") or ""),
+          "GlycanComposition": str(row["Plausible GlycanComposition"]),
+          "GlySite": site,
+          "GlycanFDR": float(row["QValue"]),
+          "TotalFDR": float(row["QValue"]),
+          "Proteins": str(row.get("Protein Accession", "") or ""),
+          # decoy flagging — pGlyco3 schema uses these for FDR sweep;
+          # DeepGP's parser ignores them but we use them in our own post-rescore FDR.
+          "GlyID": "0",
+          "Decoy": int(row["_is_decoy"]),
+          "PepDecoy": int(row["_is_decoy"]),
+          "GlyDecoy": int(row["_is_decoy"]),
+      })
+
+  print(f"dropped (no glycosite found): {dropped_no_site}", flush=True)
+  print(f"dropped (peptide didn't have exactly one J after substitution): {dropped_multi_j}", flush=True)
+  print(f"emitted PSMs: {len(records)}", flush=True)
+
+  if not records:
+      sys.exit("convert: emitted zero rows — check glycan_class and QValue cutoff")
+
+  out_df = pd.DataFrame(records)
+  out_path = OUTPUT_DIR / "pGlycoDB-GP-FDR-Pro.txt"
+  out_df.to_csv(out_path, sep="\t", index=False)
+  print(f"wrote: {out_path} ({len(out_df)} rows)", flush=True)
+
+  manifest = {
+      "schema_version": 1,
+      "produced_at": datetime.now(timezone.utc).isoformat(),
+      "psm_tsv_in": str(PSM_TSV),
+      "glycan_class": GLYCAN_CLASS,
+      "experimental_o": GLYCAN_CLASS == "o",
+      "fdr_input_cutoff": FDR_CUT,
+      "rows_in": int(len(df)) + dropped_no_site + dropped_multi_j,  # pre-filter count not tracked; approximate
+      "rows_out": int(len(out_df)),
+      "dropped_no_site": dropped_no_site,
+      "dropped_multi_j": dropped_multi_j,
+  }
+  (OUTPUT_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2))
+  print("DONE", flush=True)
+  __CONVERT_PY_EOF__
+
+  export CONV_PSM_TSV={{.inputs.psm_tsv | quote}}
+  export CONV_GLYCAN_CLASS={{.params.glycan_class | quote}}
+  export CONV_FDR_CUT={{.params.fdr_input_cutoff}}
+  export CONV_INCLUDE_DECOYS={{.params.include_decoys}}
+
+  cd "$OUTPUT_DIR"
+  exec apptainer exec --bind /mnt/efs "$IMAGE" \
+    "$VENV_DIR/bin/{{.runtime.entrypoint}}" "$SCRIPT_PATH" \
+    2>&1 | tee "$OUTPUT_DIR/stdout.log"

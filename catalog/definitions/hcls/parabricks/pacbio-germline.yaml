@@ -1,0 +1,81 @@
+id: parabricks-pacbio-germline
+name: Parabricks PacBio HiFi Germline (GPU)
+description: |
+  GPU-accelerated PacBio HiFi WGS germline pipeline via NVIDIA Parabricks
+  `pbrun pacbio_germline` — wraps HiFi-aware alignment + DeepVariant in PacBio
+  mode in a single GPU pass. ~2h end-to-end on A10G vs ~24h CPU baseline.
+vertical: hcls
+category: variant-calling
+workload_group: genomics
+modality: form
+tools: [Parabricks, DeepVariant]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: nvcr.io/nvidia/clara/clara-parabricks:4.6.0-1
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=12
+  #SBATCH --mem=64G
+  #SBATCH --time=3:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+  #SBATCH --requeue
+inputs:
+  - key: input_bam
+    role: bam
+    required: true
+    description: PacBio HiFi reads (uBAM straight off Revio or pre-aligned BAM).
+  - key: reference_fasta
+    role: reference_fasta
+    required: false
+    default: /mnt/s3-refs/igenomes/Homo_sapiens/GATK/GRCh38/Sequence/WholeGenomeFasta/Homo_sapiens_assembly38.fasta
+  - key: intervals_bed
+    role: generic_path
+    required: false
+    default: ""
+
+parameters: []
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/pbrun-pacbio-{{.ctx.run_id}}"
+  artifacts:
+    - key: bam
+      path: "{{.outputs.dir}}/aligned.bam"
+      role: primary_output
+    - key: vcf
+      path: "{{.outputs.dir}}/variants.vcf.gz"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_BAM={{.inputs.input_bam | quote}}
+  REF={{.inputs.reference_fasta | quote}}
+  INTERVALS={{.inputs.intervals_bed | quote}}
+
+  for f in "$INPUT_BAM" "$REF"; do
+    [ -r "$f" ] || { echo "input not readable: $f" >&2; exit 1; }
+  done
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  OUTPUT_BAM="$OUTPUT_DIR/aligned.bam"
+  OUTPUT_VCF="$OUTPUT_DIR/variants.vcf.gz"
+
+  ARGS=(
+    --ref            "$REF"
+    --in-bam         "$INPUT_BAM"
+    --out-bam        "$OUTPUT_BAM"
+    --out-variants   "$OUTPUT_VCF"
+    --tmp-dir        "$TMPDIR"
+  )
+  [ -n "$INTERVALS" ] && ARGS+=( --interval-file "$INTERVALS" )
+
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" \
+    "docker://{{.runtime.image}}" \
+    pbrun pacbio_germline "${ARGS[@]}"

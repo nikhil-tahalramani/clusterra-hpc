@@ -1,0 +1,140 @@
+id: modelangelo
+name: ModelAngelo (cryo-EM atomic model building)
+description: |
+  Automated atomic model building from cryo-EM density maps via a graph
+  neural network. ModelAngelo (3dem/model-angelo, Sjors Scheres lab) replaces
+  manual Coot model building for many SPA / cryo-EM workflows. Wedge report
+  § 5 trust signal: same RELION authors, 166 stars. GPU mandatory.
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [ModelAngelo]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.10"
+  base_image: python:3.11
+  requirements: ["model-angelo==1.0.12"]
+  cache_dir: /mnt/efs/_modelangelo-venv/1.0.12
+  entrypoint: model_angelo
+  notes: |
+    No upstream ModelAngelo container exists on Docker Hub / Quay / GHCR
+    (verified May 11 2026). Pip install into a persistent EFS site-packages
+    cache. First real run auto-downloads the ~5 GB ModelAngelo neural-net
+    weights to /root/.cache/model_angelo — to persist, set
+    MODEL_ANGELO_WEIGHTS_DIR=/mnt/efs/_modelangelo-weights.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=4:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: density_map
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Cryo-EM density map (.mrc, .map). Empty = SMOKE_MODE (model_angelo
+      --help only).
+  - key: fasta_sequence
+    role: fasta
+    required: false
+    default: ""
+    description: |
+      Target protein sequence(s) (.fa). Optional — `build_no_seq` mode runs
+      without sequence prior when this is empty.
+
+parameters:
+  - key: mode
+    widget: enum
+    options: [build, build_no_seq]
+    default: build
+    description: |
+      build = sequence-guided (needs fasta_sequence). build_no_seq = de novo
+      model building without sequence prior.
+  - key: map_resolution
+    label: Map resolution (Å)
+    widget: number
+    default: 3.0
+    min: 1.5
+    max: 8.0
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/modelangelo-{{.ctx.run_id}}"
+  artifacts:
+    - key: model
+      path: "{{.outputs.dir}}/output.cif"
+      role: primary_output
+      description: Built atomic model in mmCIF.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+
+  MA_VENV={{.runtime.cache_dir | quote}}
+  mkdir -p "$MA_VENV"
+  export PYTHONUSERBASE="$MA_VENV"
+
+  if [ "${MODELANGELO_SMOKE:-1}" = "1" ] || [ -z {{.inputs.density_map | quote}} ]; then
+    echo "[modelangelo] SMOKE_MODE: model_angelo --help (set MODELANGELO_SMOKE=0 + provide density_map for real model building)"
+    RUNNER="$TMPDIR/ma-runner.sh"
+    cat > "$RUNNER" <<'RUN'
+  #!/bin/bash
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$PYTHONUSERBASE/bin:$PATH"
+  if ! python -c "import model_angelo, torch" 2>/dev/null; then
+    apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1 || true
+    # CPU torch wheel — light enough for SMOKE; real GPU runs swap to CUDA wheel
+    pip install --user --no-cache-dir --quiet \
+      --index-url https://download.pytorch.org/whl/cpu torch
+    rm -rf /tmp/ma-src
+    git clone --depth 1 --branch v1.0.12 https://github.com/3dem/model-angelo.git /tmp/ma-src
+    pip install --user --no-cache-dir --quiet /tmp/ma-src
+  fi
+  exec model_angelo --help
+  RUN
+    chmod +x "$RUNNER"
+    exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+      --env "PYTHONUSERBASE=$PYTHONUSERBASE" \
+      "docker://{{.runtime.base_image}}" bash "$RUNNER"
+  fi
+
+  MAP={{.inputs.density_map | quote}}
+  SEQ={{.inputs.fasta_sequence | quote}}
+  [ -f "$MAP" ] || { echo "density_map not readable: $MAP" >&2; exit 1; }
+  MODE={{.params.mode | quote}}
+  if [ "$MODE" = "build" ]; then
+    [ -f "$SEQ" ] || { echo "build mode requires fasta_sequence" >&2; exit 1; }
+    SUBCMD="build --volume_path \"$MAP\" --fasta_path \"$SEQ\""
+  else
+    SUBCMD="build_no_seq --volume_path \"$MAP\""
+  fi
+
+  RUNNER="$TMPDIR/ma-runner.sh"
+  cat > "$RUNNER" <<RUN
+  #!/bin/bash
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$PYTHONUSERBASE/bin:$PATH"
+  if ! python -c "import model_angelo, torch" 2>/dev/null; then
+    apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1 || true
+    # CPU torch wheel — light enough for SMOKE; real GPU runs swap to CUDA wheel
+    pip install --user --no-cache-dir --quiet \
+      --index-url https://download.pytorch.org/whl/cpu torch
+    rm -rf /tmp/ma-src
+    git clone --depth 1 --branch v1.0.12 https://github.com/3dem/model-angelo.git /tmp/ma-src
+    pip install --user --no-cache-dir --quiet /tmp/ma-src
+  fi
+  exec model_angelo $SUBCMD --output_dir "$OUTPUT_DIR"
+  RUN
+  chmod +x "$RUNNER"
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+    --env "PYTHONUSERBASE=$PYTHONUSERBASE" \
+    "docker://{{.runtime.base_image}}" bash "$RUNNER"

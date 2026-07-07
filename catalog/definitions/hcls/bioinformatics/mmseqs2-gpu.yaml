@@ -1,0 +1,132 @@
+id: mmseqs2-gpu
+name: MMseqs2 (GPU sequence search)
+description: |
+  GPU-accelerated protein/nucleotide sequence search, clustering, and
+  metagenomic profiling. Upstream soedinglab/MMseqs2 at 2k stars dwarfs the
+  CPU baseline HMMER (409 stars) — the wedge-report § 3.1/§ 5 candidate for
+  the bioinformatics row. Standalone template (separate from the MMseqs2-GPU
+  step embedded in OpenFold3). A single A10G runs `easy-search` against
+  UniRef90 at ~100× CPU throughput on equivalent recall.
+vertical: hcls
+category: bioinformatics
+workload_group: bioinformatics
+modality: form
+tools: [MMseqs2]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://soedinglab/mmseqs2@sha256:f6ef1538cd81120e9ac6217ff65a07d5ead05d6514a4d94490af723be0a294d5
+  notes: |
+    soedinglab/mmseqs2:version-13 (latest tagged build, amd64). Upstream
+    publishes integer `version-N` tags from MMseqs2 HEAD; CUDA support is
+    compiled in and activated by passing `--gpu 1` to search-family commands.
+    Falls back to CPU when /dev/nvidia* are not bound (so SMOKE_MODE works
+    on any node).
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=32G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: query_fasta
+    role: fasta
+    required: false
+    default: /mnt/efs/smoke/mmseqs/query.fasta
+    description: |
+      Query FASTA (protein or nucleotide). Default = staged 3-sequence
+      smoke fixture (EGFR + p53 + BRCA1 fragments).
+  - key: target_fasta
+    role: fasta
+    required: false
+    default: /mnt/efs/smoke/mmseqs/target.fasta
+    description: |
+      Target sequence database FASTA. Default = the same staged smoke
+      file so easy-search runs query-vs-self (small but non-trivial).
+
+parameters:
+  - key: sensitivity
+    label: Search sensitivity (-s)
+    widget: number
+    default: 5.7
+    min: 1.0
+    max: 7.5
+  - key: e_value
+    label: E-value cutoff (-e)
+    widget: number
+    default: 0.001
+  - key: gpu
+    label: Use GPU (0=CPU, 1=GPU)
+    widget: number
+    default: 1
+    min: 0
+    max: 1
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/mmseqs-{{.ctx.run_id}}"
+  artifacts:
+    - key: hits
+      path: "{{.outputs.dir}}/hits.m8"
+      role: primary_output
+      description: BLAST-tab (m8) format hits from easy-search.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  QUERY={{.inputs.query_fasta | quote}}
+  TARGET={{.inputs.target_fasta | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  USE_GPU={{.params.gpu}}
+
+  # Idempotent smoke-fixture stager. Three tiny protein sequences (EGFR,
+  # p53, BRCA1 N-terminal fragments) — same FASTA reused as query + target
+  # so easy-search produces a non-empty m8 even in CPU fallback.
+  SMOKE_ROOT=/mnt/efs/smoke/mmseqs
+  if { [[ "$QUERY" == "$SMOKE_ROOT/"* ]] || [[ "$TARGET" == "$SMOKE_ROOT/"* ]]; } \
+     && [ ! -s "$SMOKE_ROOT/query.fasta" ]; then
+    echo "[mmseqs] staging smoke fixture into $SMOKE_ROOT"
+    mkdir -p "$SMOKE_ROOT"
+    cat > "$SMOKE_ROOT/query.fasta" <<'FASTA'
+  >sp|P00533|EGFR_HUMAN_frag
+  MRPSGTAGAALLALLAALCPASRALEEKKVCQGTSNKLTQLGTFEDHFLSLQRMFNNCEVV
+  LGNLEITYVQRNYDLSFLKTIQEVAGYVLIALNTVERIPLENLQIIRGNMYYENSYALAVL
+  SNYDANKTGLKELPMRNLQEILHGAVRFSNNPALCNVESIQWRDIVSSDFLSNMSMDFQNH
+  >sp|P04637|P53_HUMAN_frag
+  MEEPQSDPSVEPPLSQETFSDLWKLLPENNVLSPLPSQAMDDLMLSPDDIEQWFTEDPGPD
+  EAPRMPEAAPPVAPAPAAPTPAAPAPAPSWPLSSSVPSQKTYQGSYGFRLGFLHSGTAKSV
+  >sp|P38398|BRCA1_HUMAN_frag
+  MDLSALRVEEVQNVINAMQKILECPICLELIKEPVSTKCDHIFCKFCMLKLLNQKKGPSQC
+  PLCKNDITKRSLQESTRFSQLVEELLKIICAFQLDTGLEYANSYNFAKKENNSPEHLKDEV
+  FASTA
+    cp "$SMOKE_ROOT/query.fasta" "$SMOKE_ROOT/target.fasta"
+  fi
+
+  mkdir -p "$OUTPUT_DIR"
+  cd "$OUTPUT_DIR"
+
+  # SMOKE_MODE: `mmseqs version` exercises the binary + shared-libs; <1s.
+  if [ "${MMSEQS_SMOKE:-1}" = "1" ]; then
+    echo "[mmseqs2] SMOKE_MODE: mmseqs version (set MMSEQS_SMOKE=0 to run easy-search)"
+    exec apptainer exec --nv --bind /mnt/efs \
+      "{{.runtime.image}}" \
+      mmseqs version
+  fi
+
+  [ -s "$QUERY" ] || { echo "query_fasta not readable: $QUERY" >&2; exit 1; }
+  [ -s "$TARGET" ] || { echo "target_fasta not readable: $TARGET" >&2; exit 1; }
+
+  exec apptainer exec --nv --bind /mnt/efs \
+    "{{.runtime.image}}" \
+    mmseqs easy-search \
+      "$QUERY" "$TARGET" \
+      "$OUTPUT_DIR/hits.m8" \
+      "$OUTPUT_DIR/tmp" \
+      -s {{.params.sensitivity}} \
+      -e {{.params.e_value}} \
+      --gpu "$USE_GPU" \
+      --threads 16

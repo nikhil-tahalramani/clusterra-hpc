@@ -1,0 +1,286 @@
+id: proteinmpnn
+name: ProteinMPNN — backbone-conditioned sequence design
+description: |
+  Inverse-folding / sequence design for a fixed protein backbone via
+  ProteinMPNN (Dauparas et al. Science 2022,
+  https://github.com/dauparas/ProteinMPNN, MIT). Given a PDB, samples
+  N sequences that are predicted to fold to that backbone — the
+  canonical pairing for RFdiffusion-generated scaffolds.
+
+  Pipeline:
+    A. `helper_scripts/parse_multiple_chains.py` — PDB → parsed JSONL
+    B. `protein_mpnn_run.py` — JSONL + checkpoint → FASTA of N designs
+
+  Runtime posture: small model (~few hundred MB of weights ship with the
+  repo across vanilla / soluble / CA variants). A10G is overkill — even
+  CPU would finish a 100-residue design in seconds — but we keep `--nv`
+  so a 5k-variant capsid sweep runs in the same template at scale.
+
+  License / weights: MIT, weights vendored in the GitHub tree. No
+  separate download — the curl-tarball clone brings the .pt files along.
+
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+cost_anchor: ~$0.02 / PDB (10 sequences, A10G spot)
+tools: [ProteinMPNN]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  # python:3.11 (NOT slim) — torch wheels are CUDA-resolved by pip,
+  # and we want gcc/g++ available in case any dep JIT-compiles.
+  # Cap-pods ship CUDA + drivers via DL-AMI; apptainer --nv exposes
+  # /dev/nvidia* and the host CUDA userspace. See MEMORY:
+  # dl_ami_skip_pytorch_base.md.
+  base_image: python:3.11
+  requirements: ["torch", "numpy", "biopython"]
+  cache_dir: /mnt/efs/_proteinmpnn-venv/v1
+  entrypoint: python
+  notes: |
+    ProteinMPNN publishes no pip wheel — it's a git repo with two
+    Python entrypoints (parse_multiple_chains.py + protein_mpnn_run.py)
+    that import a sibling protein_mpnn_utils.py. We curl-tarball
+    the repo to a shared EFS path (cap-pods have no git/unzip — see
+    glyco PXD024195 session learnings) and pip-install the runtime
+    deps (torch, numpy, biopython) into a persistent EFS venv. Both
+    are flock-guarded so concurrent first-time jobs don't race.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=16G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:1
+
+inputs:
+  - key: input_pdb
+    role: pdb
+    required: true
+    description: |
+      Absolute /mnt/efs path to a single PDB whose backbone you want
+      sequence designs for. For multi-chain inputs all chains are
+      designed by default; pin chains with `design_chains`.
+
+  - key: fixed_positions_jsonl
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Optional path to a fixed-positions JSON (per ProteinMPNN's
+      `helper_scripts/make_fixed_positions_dict.py` output). Positions
+      in this dict are clamped to the wild-type residue; everything
+      else is designed. Leave empty for full redesign.
+
+parameters:
+  - key: num_seq_per_target
+    label: Sequences per backbone
+    widget: number
+    default: 8
+    min: 1
+    max: 256
+    description: |
+      Number of independent sequence designs to sample per input PDB.
+      8 is a reasonable default for screening; bump to 32-64 if you
+      plan to filter by predicted pLDDT downstream.
+
+  - key: sampling_temp
+    label: Sampling temperature
+    widget: enum
+    options: ["0.1", "0.15", "0.2", "0.25", "0.3", "0.5"]
+    default: "0.1"
+    description: |
+      Higher temperature = more sequence diversity but lower
+      per-sequence likelihood. 0.1 is the paper's default for
+      "best per-sequence quality"; 0.2-0.3 for diverse libraries.
+
+  - key: model_name
+    label: ProteinMPNN model checkpoint
+    widget: enum
+    options: [v_48_002, v_48_010, v_48_020, v_48_030]
+    default: v_48_020
+    description: |
+      Trained noise level. v_48_020 = 0.20 A backbone noise during
+      training (paper default, most robust to imperfect backbones —
+      use for RFdiffusion outputs). v_48_002 = least noise (clean
+      crystal-quality inputs only).
+
+  - key: model_variant
+    label: Model variant
+    widget: enum
+    options: [vanilla, soluble, ca_only]
+    default: vanilla
+    description: |
+      vanilla = all-atom backbone model (default). soluble =
+      trained on soluble proteins only (biases against membrane
+      residues). ca_only = CA-only backbone input (for sparse /
+      coarse-grain backbones).
+
+  - key: backbone_noise
+    label: Backbone noise (A)
+    widget: number
+    default: 0.0
+    min: 0.0
+    max: 0.5
+    description: |
+      Stdev of Gaussian noise added to backbone atoms at inference.
+      0.0 = deterministic backbone. Bump for RFdiffusion outputs
+      whose backbones are noisier than crystal structures.
+
+  - key: design_chains
+    label: Chains to design (space-separated)
+    widget: text
+    default: ""
+    description: |
+      Space-separated chain IDs to design (e.g. "A" or "A B").
+      Empty = design every chain in the PDB. Used as
+      --pdb_path_chains for single-PDB mode.
+
+  - key: seed
+    label: Random seed
+    widget: number
+    default: 37
+    min: 0
+    max: 999999
+    description: |
+      Sampling seed. 0 = pick a random one. Pin for reproducibility.
+
+  - key: batch_size
+    label: Batch size
+    widget: number
+    default: 1
+    min: 1
+    max: 8
+    description: |
+      Sequences sampled per forward pass. 1 is safe for any GPU; 4-8
+      on A10G/L4 if num_seq_per_target is large.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/proteinmpnn-{{.ctx.run_id}}"
+  artifacts:
+    - key: sequences
+      path: "{{.outputs.dir}}/seqs"
+      role: primary_output
+      description: |
+        Directory of FASTA files — one per input PDB stem — each
+        containing num_seq_per_target designed sequences plus the
+        wild-type for reference.
+    - key: parsed_pdbs
+      path: "{{.outputs.dir}}/parsed_pdbs.jsonl"
+      role: generic
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_PDB={{.inputs.input_pdb | quote}}
+  FIXED_JSONL={{.inputs.fixed_positions_jsonl | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  NUM_SEQ={{.params.num_seq_per_target}}
+  SAMPLING_TEMP={{.params.sampling_temp | quote}}
+  MODEL_NAME={{.params.model_name | quote}}
+  MODEL_VARIANT={{.params.model_variant | quote}}
+  BACKBONE_NOISE={{.params.backbone_noise}}
+  DESIGN_CHAINS={{.params.design_chains | quote}}
+  SEED={{.params.seed}}
+  BATCH_SIZE={{.params.batch_size}}
+
+  [ -r "$INPUT_PDB" ] || { echo "input_pdb not readable: $INPUT_PDB" >&2; exit 1; }
+  mkdir -p "$OUTPUT_DIR"
+
+  IMAGE="docker://{{.runtime.base_image}}"
+
+  # ---- Lazy stage: ProteinMPNN repo on EFS (one-time, flock-guarded) ----
+  # Cap-pods have no git/unzip/wget — use curl + tarball, python3 -m tarfile.
+  # Sentinel = the protein_mpnn_run.py script in the repo root.
+  MPNN_REPO=/mnt/efs/_proteinmpnn/repo/main
+  mkdir -p /mnt/efs/_proteinmpnn/repo
+  (
+    flock -x 9
+    if [ ! -f "$MPNN_REPO/protein_mpnn_run.py" ]; then
+      rm -rf "$MPNN_REPO.tmp" "$MPNN_REPO"
+      mkdir -p "$MPNN_REPO.tmp"
+      curl -fSL https://codeload.github.com/dauparas/ProteinMPNN/tar.gz/refs/heads/main \
+        -o /tmp/proteinmpnn.tar.gz
+      tar -xzf /tmp/proteinmpnn.tar.gz -C "$MPNN_REPO.tmp" --strip-components=1
+      mv "$MPNN_REPO.tmp" "$MPNN_REPO"
+      rm -f /tmp/proteinmpnn.tar.gz
+    fi
+  ) 9>/mnt/efs/_proteinmpnn/.repo.lock
+
+  # ---- Lazy stage: venv with torch + numpy + biopython ----
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  export PIP_CACHE_DIR=/mnt/efs/_proteinmpnn-venv-cache
+  mkdir -p "$PIP_CACHE_DIR" "$(dirname "$VENV_DIR")"
+
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/python" ] || \
+       ! "$VENV_DIR/bin/python" -c "import torch, numpy, Bio" 2>/dev/null; then
+      apptainer exec --nv "$IMAGE" bash -c "
+        set -euo pipefail
+        python{{.runtime.python_version}} -m venv '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' \
+          torch numpy biopython
+      "
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  # ---- Step A: parse PDB(s) into ProteinMPNN's JSONL format ----
+  # parse_multiple_chains.py expects a directory of PDBs; we stage a
+  # symlink so the user can pass a single file.
+  PDB_STAGE_DIR="$OUTPUT_DIR/pdb_stage"
+  mkdir -p "$PDB_STAGE_DIR"
+  ln -sf "$INPUT_PDB" "$PDB_STAGE_DIR/$(basename "$INPUT_PDB")"
+
+  PARSED_JSONL="$OUTPUT_DIR/parsed_pdbs.jsonl"
+
+  apptainer exec --nv --bind /mnt/efs "$IMAGE" \
+    "$VENV_DIR/bin/python" "$MPNN_REPO/helper_scripts/parse_multiple_chains.py" \
+      --input_path "$PDB_STAGE_DIR" \
+      --output_path "$PARSED_JSONL" \
+    2>&1 | tee -a "$OUTPUT_DIR/stdout.log"
+
+  [ -s "$PARSED_JSONL" ] || { echo "[proteinmpnn] step A produced no parsed JSONL" >&2; exit 71; }
+
+  # ---- Step B: design sequences ----
+  ARGS=(
+    --jsonl_path        "$PARSED_JSONL"
+    --out_folder        "$OUTPUT_DIR"
+    --num_seq_per_target "$NUM_SEQ"
+    --sampling_temp     "$SAMPLING_TEMP"
+    --model_name        "$MODEL_NAME"
+    --backbone_noise    "$BACKBONE_NOISE"
+    --seed              "$SEED"
+    --batch_size        "$BATCH_SIZE"
+  )
+
+  if [ "$MODEL_VARIANT" = "soluble" ]; then
+    ARGS+=( --use_soluble_model )
+  elif [ "$MODEL_VARIANT" = "ca_only" ]; then
+    ARGS+=( --ca_only )
+  fi
+
+  if [ -n "$FIXED_JSONL" ] && [ "$FIXED_JSONL" != "" ]; then
+    [ -r "$FIXED_JSONL" ] || { echo "fixed_positions_jsonl not readable: $FIXED_JSONL" >&2; exit 1; }
+    ARGS+=( --fixed_positions_jsonl "$FIXED_JSONL" )
+  fi
+
+  apptainer exec --nv --bind /mnt/efs "$IMAGE" \
+    "$VENV_DIR/bin/python" "$MPNN_REPO/protein_mpnn_run.py" "${ARGS[@]}" \
+    2>&1 | tee -a "$OUTPUT_DIR/stdout.log"
+
+  # ---- Verify output FASTA landed ----
+  if ! find "$OUTPUT_DIR/seqs" -maxdepth 1 -name '*.fa' -type f 2>/dev/null | grep -q .; then
+    echo "[proteinmpnn] no designed FASTA in $OUTPUT_DIR/seqs" >&2
+    exit 72
+  fi
+  echo "[proteinmpnn] DONE — see $OUTPUT_DIR/seqs/"

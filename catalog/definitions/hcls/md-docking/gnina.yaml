@@ -1,0 +1,152 @@
+id: gnina
+name: GNINA (CNN docking & scoring)
+description: |
+  CNN-based molecular docking and pose rescoring on GPU. GNINA extends
+  AutoDock-Vina with a built-in convolutional neural network scoring
+  function trained on PDBbind; the gold-standard "score-only" rescorer for
+  Uni-Dock / Vina hits and a competent standalone docker. Composed downstream
+  of `unidock` in the `virtual-screen-rescore` workflow.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: form
+tools: [GNINA]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://gnina/gnina@sha256:c0727c8e38bf0a70fd2779937040af6dfc9afbfedc38b3eba9a489c8dc47e327
+  notes: |
+    gnina/gnina:v1.3.1 (amd64, ~27 GB). Content-addressed pull is shared
+    across templates so EFS SIF cache hit-rate is preserved.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: receptor
+    role: pdbqt
+    required: false
+    default: /mnt/efs/fixtures/unidock-smoke/receptor.pdbqt
+    description: |
+      Receptor in PDBQT (or PDB) format. Default = the Uni-Dock def
+      screening_test receptor auto-staged by the unidock template; reused
+      here.
+  - key: ligand_dir
+    role: generic_path
+    required: false
+    default: /mnt/efs/fixtures/unidock-smoke/ligands
+    description: |
+      Directory of ligand .pdbqt files (or a single .sdf). Default = the
+      10-ligand Uni-Dock smoke set.
+
+parameters:
+  - key: mode
+    label: Mode
+    widget: enum
+    options: [score_only, dock]
+    default: score_only
+    description: |
+      score_only = CNN rescore of pre-docked poses (~1s/ligand, the smoke
+      path). dock = full pose search with --exhaustiveness 8 (~30s/ligand).
+  - key: center_x
+    widget: number
+    default: -36.0
+  - key: center_y
+    widget: number
+    default: 25.6
+  - key: center_z
+    widget: number
+    default: 67.5
+  - key: size_x
+    widget: number
+    default: 22.5
+  - key: size_y
+    widget: number
+    default: 22.5
+  - key: size_z
+    widget: number
+    default: 22.5
+  - key: exhaustiveness
+    label: Exhaustiveness (dock mode)
+    widget: number
+    default: 8
+    min: 1
+    max: 64
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/gnina-{{.ctx.run_id}}"
+  artifacts:
+    - key: poses
+      path: "{{.outputs.dir}}"
+      role: primary_output
+      description: Per-ligand <name>_out.sdf with CNNscore + CNNaffinity tags.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  RECEPTOR={{.inputs.receptor | quote}}
+  LIGAND_DIR={{.inputs.ligand_dir | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  MODE={{.params.mode | quote}}
+
+  mkdir -p "$OUTPUT_DIR"
+
+  # SMOKE_MODE: `gnina --version` is fast (<2s) and exercises the CUDA
+  # libtorch link. The 27 GB image pull dominates first-run wall time; the
+  # actual command is cheap. Re-runs hit the EFS SIF cache.
+  if [ "${GNINA_SMOKE:-1}" = "1" ]; then
+    echo "[gnina] SMOKE_MODE: gnina --version (set GNINA_SMOKE=0 to run docking/rescore)"
+    exec apptainer exec --nv --bind /mnt/efs \
+      "{{.runtime.image}}" \
+      gnina --version
+  fi
+
+  [ -r "$RECEPTOR" ] || { echo "receptor not readable: $RECEPTOR" >&2; exit 1; }
+  [ -d "$LIGAND_DIR" ] || { echo "ligand_dir not a directory: $LIGAND_DIR" >&2; exit 1; }
+  shopt -s nullglob
+  LIGANDS=( "$LIGAND_DIR"/*.pdbqt "$LIGAND_DIR"/*.sdf "$LIGAND_DIR"/*.mol2 )
+  shopt -u nullglob
+  if [ "${#LIGANDS[@]}" -eq 0 ]; then
+    echo "no ligand files (.pdbqt/.sdf/.mol2) found under $LIGAND_DIR" >&2
+    exit 1
+  fi
+  echo "[gnina] $MODE: ${#LIGANDS[@]} ligand(s)"
+
+  for L in "${LIGANDS[@]}"; do
+    NAME=$(basename "$L"); NAME=${NAME%.*}
+    OUT="$OUTPUT_DIR/${NAME}_out.sdf"
+    if [ "$MODE" = "score_only" ]; then
+      apptainer exec --nv --bind /mnt/efs \
+        "{{.runtime.image}}" \
+        gnina \
+          --receptor "$RECEPTOR" \
+          --ligand "$L" \
+          --score_only \
+          --cnn_scoring rescore \
+          --out "$OUT"
+    else
+      apptainer exec --nv --bind /mnt/efs \
+        "{{.runtime.image}}" \
+        gnina \
+          --receptor "$RECEPTOR" \
+          --ligand "$L" \
+          --center_x {{.params.center_x}} \
+          --center_y {{.params.center_y}} \
+          --center_z {{.params.center_z}} \
+          --size_x   {{.params.size_x}} \
+          --size_y   {{.params.size_y}} \
+          --size_z   {{.params.size_z}} \
+          --exhaustiveness {{.params.exhaustiveness}} \
+          --cnn_scoring rescore \
+          --out "$OUT"
+    fi
+  done
+
+  echo "[gnina] wrote $(ls -1 "$OUTPUT_DIR" | wc -l) result file(s) to $OUTPUT_DIR"

@@ -1,0 +1,49 @@
+# clusterra-customer chart values
+#
+# Per-tenant identity + slurmctld reachability are set by the
+# tenant-workloads ApplicationSet. Image refs (slurmd, edge-agent) come from
+# envs/{env}/{regionShort}/images.yaml via the $values overlay; populate in
+# CI bot-commit, never hardcode here.
+#
+# Karpenter EC2NodeClass + NodePool are now installed by stage-b-k8s
+# (kubernetes_manifest blocks); not part of this chart.
+
+# Cluster identity (required). clusterId is THE identifier:
+#   - sent as CLUSTER_ID by edge-agent on heartbeats
+#   - used to form the slurmd → slurmctld hostAlias DNS
+clusterId: ""
+
+# slurmctld reachability over VPC peering: central_private_ip:NodePort
+# e.g. "10.100.1.100:6817"
+slurmctldHost: ""
+
+# imageDigests is supplied by envs/{env}/{regionShort}/images.yaml ($values
+# overlay). Templates read .Values.imageDigests.{slurmd,edgeAgent,...}; the
+# `required` calls in template files surface missing keys as render errors.
+imageDigests: {}
+
+# How long a Slurm node must be IDLE before central DRAINs it (seconds).
+# Matches AWS ParallelCluster/PCS default. Prevents churn from short inter-job gaps.
+scaleInCooldownSeconds: 150
+
+# ── EFS shared filesystem ─────────────────────────────────────────────────────
+efs:
+  enabled: false
+  mountTargetIp: ""
+
+# Ghost-node TTL (seconds). A Karpenter worker older than this with no Ready
+# slurmd pod is considered a ghost (image-pull failure, GPU misclassification,
+# slurmctld unreachable during bootstrap) and reclaimed by edge-agent via
+# NodeClaim deletion. 480s covers cold-pull P99; tune down once you have
+# telemetry. See internal design notes.
+ghostNodeTimeoutSeconds: 480
+
+# ── Edge agent ────────────────────────────────────────────────────────────────
+# Off by default: the agent actuates node-shape commands from a central
+# controller that is NOT part of this open-source release. With it disabled you
+# get a working cluster you scale yourself. Enable it only if you point
+# centralApiUrl at your own controller.
+edgeAgent:
+  enabled: false
+  centralApiUrl: ""  # Required if enabled: http://<your-controller-ip>:30080
+  pollInterval: "15"

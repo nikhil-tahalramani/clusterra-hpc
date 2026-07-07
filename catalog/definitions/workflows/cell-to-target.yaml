@@ -1,0 +1,30 @@
+id: cell-to-target
+name: Cell-to-target
+description: |
+  Discover targets from a single-cell experiment: RAPIDS single-cell DE →
+  OpenFold3 → Uni-Dock virtual screening.
+
+  The DE-gene → FASTA bridging step is a tracked product gap; the chain
+  runs linearly and the user supplies the FASTA path for the fold step
+  explicitly until the bridging widget ships.
+
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [RAPIDS-singlecell, OpenFold3, Uni-Dock]
+ready: true
+kind: workflow
+
+steps:
+  - step_id: rapids-de
+    template_id: rapids-singlecell
+    display_name: RAPIDS single-cell DE
+  - step_id: fold
+    template_id: openfold3
+    display_name: OpenFold3 fold
+    depends_on: [rapids-de]
+  - step_id: dock
+    template_id: unidock
+    display_name: Uni-Dock screen
+    depends_on: [fold]

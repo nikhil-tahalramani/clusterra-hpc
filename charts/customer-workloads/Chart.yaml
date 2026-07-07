@@ -1,0 +1,10 @@
+apiVersion: v2
+name: clusterra-customer
+description: |
+  Clusterra customer-side K3s workloads.
+  Deploys: Karpenter NodePool/EC2NodeClass and the Go edge agent.
+  slurmd Deployments are created dynamically by the edge agent based on
+  shape commands from the central scaling engine.
+type: application
+version: 0.2.0
+appVersion: "3.0.0"

@@ -1,0 +1,48 @@
+# ArgoCD ApplicationSet plugin generator: registers the cluster-api endpoint
+# as a tenant source. The `clusters` ApplicationSet polls
+# GET /internal/argocd/tenants every requeueAfterSeconds and renders one
+# Application per returned tenant — DDB is the sole source of truth.
+#
+# The endpoint has no auth middleware (in-cluster only, same pattern as
+# heartbeat), but the ApplicationSet plugin contract requires a token. We
+# generate one and sync it via ESO so rotation is centralised.
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: argocd-tenants-plugin-token
+  namespace: argocd
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: aws-secretsmanager
+  target:
+    name: argocd-tenants-plugin-token
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      metadata:
+        labels:
+          app.kubernetes.io/part-of: argocd
+  data:
+    - secretKey: token
+      remoteRef:
+        key: clusterra/central/argocd-tenants-plugin-token
+        property: token
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-tenants-plugin
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: argocd
+data:
+  # ApplicationSet plugin-generator ConfigMap shape: flat baseUrl + token.
+  # ArgoCD appends /api/v1/getparams.execute to baseUrl. ?env=$ENV is omitted —
+  # cluster-api defaults the filter from CENTRAL_ENV set on the deployment, so
+  # each central naturally returns only its own tenants.
+  baseUrl: "http://cluster-api.clusterra:8080/internal/argocd"
+  token: "$argocd-tenants-plugin-token:token"
+  requestTimeout: "30"

@@ -1,0 +1,634 @@
+id: tcr-complex-metrics
+name: TCR-pMHC complex metrics (DockQ + TM-score + ipTM)
+description: |
+  Bridge step for tcr-pmhc-bench. Walks a directory of per-complex
+  OpenFold3 predictions (each a subdir containing `predicted.cif` +
+  `confidence.json`) and scores them against the native crystal mmCIFs
+  staged by tcr-pmhc-bench-prep.
+
+  Per-complex metrics computed:
+    DockQ           — joint complex-quality metric (pip install DockQ, runs
+                       on chain pairs; we score TCR-vs-MHC and TCR-vs-
+                       peptide interfaces separately and report the mean).
+    TM-score        — chain-level structural similarity via gemmi's
+                       align_min_rmsd helper (~1.0 = identical fold,
+                       ~0.5 = same topology, <0.3 = unrelated).
+    backbone RMSD   — Cα RMSD per chain after rigid-body superposition.
+    pLDDT, pTM, ipTM — pulled straight from OpenFold3's confidence.json
+                       (no recompute; these are the model's self-confidence).
+
+  Bench thresholds the case study cites (DockQ from Basu & Wallner 2016):
+    DockQ >= 0.80  "high"        — near-native pose
+    DockQ >= 0.49  "medium"      — acceptable pose
+    DockQ >= 0.23  "acceptable"  — usable for hypothesis generation
+    DockQ <  0.23  "incorrect"   — pose is wrong
+
+  Aggregate outputs (outputs.json):
+    {
+      "n_total":          int,                # total complexes attempted
+      "n_scored":         int,                # complexes with successful DockQ
+      "dockq":      {"mean": ..., "median": ..., "min": ..., "max": ...,
+                     "n_high": ..., "n_medium": ..., "n_acceptable": ..., "n_incorrect": ...},
+      "tm_score":   {"mean": ..., "median": ..., per-chain breakdowns},
+      "ipTM":       {"mean": ..., "median": ...},
+      "pLDDT":      {"mean": ..., "median": ...},
+      "per_complex": [
+        {"pdb_id": ..., "dockq": ..., "tm_score": {...},
+         "ipTM": ..., "pLDDT": ..., "rmsd_ca_angstroms": {...},
+         "status": "ok" | "predict_missing" | "crystal_missing" | "dockq_failed"}
+      ]
+    }
+
+  This step is CPU-only (DockQ is fast — seconds per complex). For a
+  50-complex bench, wall-clock is ~5-10 min including the venv warm-up.
+
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [DockQ, gemmi]
+ready: true
+kind: batch
+display: connector
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: python:3.11
+  cache_dir: /mnt/efs/_tcr-metrics-venv
+  entrypoint: python
+  requirements:
+    - "DockQ==2.1.3"
+    - "gemmi==0.6.7"
+    - "numpy==1.26.4"
+  notes: |
+    DockQ 2.1.3 is the pip-installable rewrite that accepts mmCIF natively.
+    gemmi for CIF parsing + chain alignment. flock-guarded EFS venv;
+    first-run ~2 min, subsequent runs reuse.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=8G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: predictions_dir
+    role: generic_path
+    required: false
+    description: |
+      Run dir from openfold3-batch (each sub-dir is one complex). When
+      wired downstream in a workflow, leave empty — the script
+      auto-discovers $PREV_STEP_OUT_DIR.
+
+  - key: manifest_csv
+    role: generic_path
+    required: true
+    description: |
+      tcr-pmhc-bench-prep's manifest.csv (drives the iteration order and
+      provides allele / peptide / K_D metadata for the per-complex report).
+
+  - key: crystals_dir
+    role: generic_path
+    required: true
+    description: |
+      Directory of native crystal mmCIFs from prep. Each <pdb_id>.cif is
+      the DockQ / TM-score ground truth.
+
+parameters:
+  - key: dockq_pairs
+    label: Chain pairs to DockQ-score
+    widget: text
+    default: "tcr_vs_mhc,tcr_vs_peptide"
+    advanced: true
+    description: |
+      Comma-separated DockQ pairings. Each token resolves to a (group1,
+      group2) chain-set lookup against the predicted vs crystal chain map:
+        tcr_vs_mhc       — (TCR α + β) vs (MHC + β2m)
+        tcr_vs_peptide   — (TCR α + β) vs peptide
+        peptide_vs_mhc   — peptide vs (MHC + β2m)
+      The mean across the listed pairings becomes the headline DockQ.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/tcr-complex-metrics-{{.ctx.run_id}}"
+  artifacts:
+    - key: per_complex
+      path: "{{.outputs.dir}}/per_complex.csv"
+      role: primary_output
+    - key: outputs
+      path: "{{.outputs.dir}}/outputs.json"
+      role: generic
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  export OUTPUT_DIR
+
+  VENV_DIR="$OUTPUT_DIR/venv"
+  export PIP_CACHE_DIR=/mnt/efs/_pip-cache
+  mkdir -p "$PIP_CACHE_DIR"
+
+  IMAGE="docker://{{.runtime.base_image}}"
+
+  apptainer exec "$IMAGE" bash -c "
+    set -euo pipefail
+    python{{.runtime.python_version}} -m venv '$VENV_DIR'
+    '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+    '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' \
+      {{range .runtime.requirements}}'{{.}}' {{end}}
+  "
+
+  SCRIPT_PATH="$OUTPUT_DIR/bridge.py"
+  cat > "$SCRIPT_PATH" <<'__BRIDGE_PY_EOF__'
+  import csv
+  import json
+  import os
+  import pathlib
+  import statistics
+  import subprocess
+  import sys
+  from datetime import datetime, timezone
+
+  import gemmi
+
+  OUTPUT_DIR = pathlib.Path(os.environ["OUTPUT_DIR"])
+  OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+  predictions_dir = (os.environ.get("BRIDGE_PREDICTIONS_DIR") or "").strip()
+  if not predictions_dir:
+      prev = os.environ.get("PREV_STEP_OUT_DIR") or ""
+      if not prev:
+          sys.exit("predictions_dir empty and PREV_STEP_OUT_DIR unset")
+      predictions_dir = prev
+  predictions_dir = pathlib.Path(predictions_dir)
+  if not predictions_dir.is_dir():
+      sys.exit(f"predictions_dir not found: {predictions_dir}")
+
+  manifest_csv = pathlib.Path(os.environ["BRIDGE_MANIFEST_CSV"])
+  crystals_dir = pathlib.Path(os.environ["BRIDGE_CRYSTALS_DIR"])
+  pairs_str = os.environ.get("BRIDGE_DOCKQ_PAIRS", "tcr_vs_mhc,tcr_vs_peptide")
+  pairs = [p.strip() for p in pairs_str.split(",") if p.strip()]
+
+  # ── Load the manifest + per-complex chain assignments ───────────────────
+  with manifest_csv.open() as fh:
+      manifest = list(csv.DictReader(fh))
+
+  chains_dir = manifest_csv.parent / "chains"
+
+  def load_chain_map(pdb_id):
+      """Return the crystal chain assignments staged by prep, or None."""
+      p = chains_dir / f"{pdb_id}.json"
+      if not p.is_file():
+          return None
+      return json.loads(p.read_text())
+
+  # ── Per-complex scoring ──────────────────────────────────────────────────
+
+  THREE_TO_ONE = {
+      "ALA": "A", "CYS": "C", "ASP": "D", "GLU": "E", "PHE": "F", "GLY": "G",
+      "HIS": "H", "ILE": "I", "LYS": "K", "LEU": "L", "MET": "M", "ASN": "N",
+      "PRO": "P", "GLN": "Q", "ARG": "R", "SER": "S", "THR": "T", "VAL": "V",
+      "TRP": "W", "TYR": "Y",
+  }
+
+  def chain_seq(chain):
+      return "".join(
+          THREE_TO_ONE[r.name.upper()]
+          for r in chain
+          if r.name.upper() in THREE_TO_ONE
+      )
+
+  def find_predicted(complex_id):
+      """OpenFold3 0.4.0 emits <complex>/<complex>/seed_42/<complex>_seed_42_sample_N_model.cif.
+      Earlier layouts: predicted.cif / ranked_0.cif at top level."""
+      sub = predictions_dir / complex_id
+      if not sub.is_dir():
+          return None, None
+      # Fast-path: flat layout (openfold3 <0.4)
+      for candidate in (sub / "predicted.cif", sub / "ranked_0.cif"):
+          if candidate.is_file():
+              cif = candidate
+              conf = _load_confidence(cif.parent, cif.stem)
+              return cif, conf
+      # OF3 0.4.0: *_model.cif nested under seed_42/
+      model_cifs = sorted(sub.rglob("*_model.cif"))
+      if not model_cifs:
+          model_cifs = sorted(sub.rglob("*.cif"))
+      if not model_cifs:
+          return None, None
+      cif = model_cifs[0]  # sample_1 alphabetically first
+      conf = _load_confidence(cif.parent, cif.stem)
+      return cif, conf
+
+  def _load_confidence(parent, stem):
+      """Find confidence JSON next to a model CIF.
+      OF3 0.4.0 uses <stem_without_model>_confidences_aggregated.json."""
+      conf = None
+      # Derive base from "..._sample_N_model" -> "..._sample_N"
+      base = stem.replace("_model", "")
+      for name in (
+          f"{base}_confidences_aggregated.json",
+          f"{base}_confidences.json",
+          "confidence.json", "ranking.json",
+      ):
+          p = parent / name
+          if p.is_file():
+              try:
+                  conf = json.loads(p.read_text())
+              except Exception:
+                  pass
+              break
+      return conf
+
+  def _patch_cif_occupancy(cif_path):
+      """OF3 0.4.0 mmCIF omits _atom_site.occupancy. DockQ 2.1.3 requires it.
+      Injects the column with value 1.00 per atom via text manipulation."""
+      text = pathlib.Path(cif_path).read_text()
+      if "_atom_site.occupancy" in text:
+          return str(cif_path)
+      lines = text.split("\n")
+      last_tag = None
+      first_data = None
+      in_loop = False
+      for i, line in enumerate(lines):
+          s = line.strip()
+          if s == "loop_":
+              in_loop = True
+          elif in_loop and s.startswith("_atom_site."):
+              last_tag = i
+          elif in_loop and last_tag is not None and s and not s.startswith("_") and s != "loop_" and not s.startswith("#"):
+              first_data = i
+              break
+      if last_tag is None or first_data is None:
+          return str(cif_path)
+      lines.insert(last_tag + 1, "_atom_site.occupancy")
+      first_data += 1
+      out = lines[:first_data]
+      for line in lines[first_data:]:
+          s = line.strip()
+          if s and not s.startswith(("_", "#", "data_", "loop_")):
+              out.append(line + " 1.00")
+          else:
+              out.append(line)
+      import tempfile
+      tmp = tempfile.NamedTemporaryFile(suffix=".cif", mode="w", delete=False, dir="/tmp")
+      tmp.write("\n".join(out))
+      tmp.close()
+      return tmp.name
+
+  def run_dockq(model_cif, native_cif, model_g1, native_g1, model_g2, native_g2):
+      """DockQ 2.1.3: use run_on_all_native_interfaces.
+      Scores interfaces between group1 chains and group2 chains (cross-group only).
+      chain_map: native_chain_id → model_chain_id."""
+      patched_model = patched_native = None
+      try:
+          import traceback as tb
+          from DockQ.DockQ import load_PDB, run_on_all_native_interfaces
+          patched_model = _patch_cif_occupancy(model_cif)
+          patched_native = _patch_cif_occupancy(native_cif)
+          model_struct = load_PDB(patched_model, n_model=0)
+          native_struct = load_PDB(patched_native, n_model=0)
+          # chain_map: native → model for all chains in both groups
+          chain_map = {n: m for n, m in zip(native_g1 + native_g2, model_g1 + model_g2)}
+          result_mapping, _ = run_on_all_native_interfaces(
+              model_struct, native_struct, chain_map=chain_map
+          )
+          if not result_mapping:
+              return None, "no_interfaces"
+          # Filter: only cross-group interfaces (group1 native vs group2 native)
+          g1_native = set(native_g1)
+          g2_native = set(native_g2)
+          cross_scores = []
+          for iface_key, info in result_mapping.items():
+              # iface_key is two concatenated native chain IDs
+              c1, c2 = iface_key[0], iface_key[1]
+              if (c1 in g1_native and c2 in g2_native) or \
+                 (c2 in g1_native and c1 in g2_native):
+                  cross_scores.append(info["DockQ"])
+          if not cross_scores:
+              # fall back to all interfaces if cross-group filter leaves nothing
+              cross_scores = [v["DockQ"] for v in result_mapping.values()]
+          score = sum(cross_scores) / len(cross_scores)
+          return score, result_mapping
+      except Exception:
+          return None, f"dockq_err: {tb.format_exc()[-400:]}"
+      finally:
+          for p in (patched_model, patched_native):
+              if p and p != str(model_cif) and p != str(native_cif):
+                  try: os.unlink(p)
+                  except: pass
+
+  def _parse_dockq_json(payload):
+      """Extract DockQ score from DockQ 2.1.3 JSON output."""
+      if not isinstance(payload, dict):
+          return None
+      # Top-level key is the interface name; value has 'DockQ'
+      scores = []
+      for v in payload.values():
+          if isinstance(v, dict) and "DockQ" in v:
+              scores.append(float(v["DockQ"]))
+          elif isinstance(v, (int, float)) and isinstance(list(payload.keys())[0], str):
+              pass
+      if not scores:
+          # Flat format: {"DockQ": 0.xx, ...}
+          if "DockQ" in payload:
+              return float(payload["DockQ"])
+          return None
+      return sum(scores) / len(scores)
+
+
+  def _get_ca_in_seq_order(cif_path, chain_id):
+      """Read Cα coordinates for a chain in residue-sequential order with
+      alternate conformers deduplicated.
+
+      Why this matters: high-resolution crystals (1.5-2.0 Å) frequently have
+      alternate conformers (alt_loc A/B) for surface side chains. Each row of
+      _atom_site is one atom-conformer combo, so naive extraction returns 2x
+      Cα for residues with alt_locs. This shifts subsequent residues out of
+      register in positional pairing, producing 10+ Å RMSD artifacts.
+
+      The OF3 input sequence comes from crystal-resolved residues only (see
+      tcr-pmhc-bench-prep), so model residue i corresponds to crystal's i-th
+      resolved residue. Hence positional pairing on the deduplicated list is
+      the correct alignment — residue numbers may differ (crystal can start
+      at 2 with residue 1 disordered) but the SEQUENCE order matches."""
+      seen = set()
+      ordered = []
+      try:
+          doc = gemmi.cif.read(str(cif_path))
+          block = doc.sole_block()
+          for chain_col in ("auth_asym_id", "label_asym_id"):
+              try:
+                  tbl = block.find("_atom_site.", [
+                      chain_col, "auth_comp_id", "label_atom_id",
+                      "Cartn_x", "Cartn_y", "Cartn_z", "auth_seq_id"])
+                  for row in tbl:
+                      cid = row[0].strip('"')
+                      atom = row[2].strip('"')
+                      if cid != chain_id or atom != "CA":
+                          continue
+                      try:
+                          resnum = int(row[6].strip('"'))
+                      except (ValueError, IndexError):
+                          continue
+                      if resnum in seen:
+                          continue  # alt_loc — keep first occurrence
+                      seen.add(resnum)
+                      ordered.append((resnum, gemmi.Position(
+                          float(row[3]), float(row[4]), float(row[5]))))
+                  if ordered:
+                      ordered.sort(key=lambda x: x[0])
+                      return [p for _, p in ordered]
+              except Exception:
+                  continue
+      except Exception:
+          pass
+      return []
+
+  def tm_score(model_cif, native_cif, model_chain_id, native_chain_id):
+      """TM-score via alt-loc-deduplicated, residue-sequential Cα extraction.
+
+      Pairs coordinates positionally on the deduplicated lists. This is
+      correct because the OF3 input sequence (from tcr-pmhc-bench-prep) is
+      the crystal-resolved sequence in residue order, so model_pos[i] and
+      native_pos[i] are the same residue in the input chain — regardless of
+      how the crystal numbers it."""
+      coords_m = _get_ca_in_seq_order(model_cif, model_chain_id)
+      coords_n = _get_ca_in_seq_order(native_cif, native_chain_id)
+      if not coords_m or not coords_n:
+          return None, None
+      n = min(len(coords_m), len(coords_n))
+      if n < 20:
+          return None, None
+      coords_m = coords_m[:n]
+      coords_n = coords_n[:n]
+      sup = gemmi.superpose_positions(coords_n, coords_m)
+      tr = sup.transform
+      rmsd = sup.rmsd
+      L = max(15, n)
+      d0 = max(1.24 * ((L - 15) ** (1.0/3.0)) - 1.8, 0.5)
+      tm = 0.0
+      for cm, cn in zip(coords_m, coords_n):
+          ap = tr.apply(cm)
+          dx = ap.x - cn.x; dy = ap.y - cn.y; dz = ap.z - cn.z
+          d = (dx*dx + dy*dy + dz*dz) ** 0.5
+          tm += 1.0 / (1.0 + (d/d0)**2)
+      return tm / L, rmsd
+
+  per_complex_rows = []
+  dockq_scores = []
+  ipTMs = []
+  pLDDTs = []
+  tm_means = []
+
+  for row in manifest:
+      pdb = (row.get("pdb_id") or "").strip().upper()
+      if not pdb:
+          continue
+      if (row.get("status") or "").strip() != "ok":
+          per_complex_rows.append({
+              "pdb_id": pdb,
+              "status": row.get("status") or "prep_skipped",
+          })
+          continue
+
+      record = {"pdb_id": pdb,
+                "hla_allele": row.get("hla_allele", ""),
+                "peptide_sequence": row.get("peptide_sequence", ""),
+                "kd_micromolar": row.get("kd_micromolar", "")}
+
+      model_cif, conf = find_predicted(pdb)
+      if model_cif is None:
+          record["status"] = "predict_missing"
+          per_complex_rows.append(record)
+          continue
+
+      native_cif = crystals_dir / f"{pdb}.cif"
+      if not native_cif.is_file():
+          record["status"] = "crystal_missing"
+          per_complex_rows.append(record)
+          continue
+
+      chain_meta = load_chain_map(pdb)
+      if chain_meta is None:
+          record["status"] = "chains_missing"
+          per_complex_rows.append(record)
+          continue
+
+      # Predicted CIF chain IDs are A..E in the order written by prep:
+      #   A=MHC, B=b2m, C=peptide, D=TCR α, E=TCR β.
+      # Crystal chain IDs come from the chain_meta map.
+      crystal = chain_meta["chains"]
+      role_to_model = {"mhc": "A", "b2m": "B", "peptide": "C",
+                        "tcr_a": "D", "tcr_b": "E"}
+      role_to_native = {role: data["chain"] for role, data in crystal.items()}
+
+      # ── DockQ per requested pairing ──────────────────────────────────
+      group_chains = {
+          "tcr_vs_mhc":     (["D", "E"], ["A", "B"]),
+          "tcr_vs_peptide": (["D", "E"], ["C"]),
+          "peptide_vs_mhc": (["C"], ["A", "B"]),
+      }
+      role_pairings = {
+          "tcr_vs_mhc":     (["tcr_a", "tcr_b"], ["mhc", "b2m"]),
+          "tcr_vs_peptide": (["tcr_a", "tcr_b"], ["peptide"]),
+          "peptide_vs_mhc": (["peptide"], ["mhc", "b2m"]),
+      }
+      pair_scores = {}
+      pair_errors = {}
+      for pair in pairs:
+          if pair not in group_chains:
+              pair_errors[pair] = "unknown_pair"
+              continue
+          model_g1, model_g2 = group_chains[pair]
+          roles_g1, roles_g2 = role_pairings[pair]
+          native_g1 = [role_to_native[r] for r in roles_g1]
+          native_g2 = [role_to_native[r] for r in roles_g2]
+          score, info = run_dockq(
+              model_cif, native_cif,
+              model_g1, native_g1, model_g2, native_g2,
+          )
+          if score is None:
+              pair_errors[pair] = info
+          else:
+              pair_scores[pair] = score
+      if pair_scores:
+          mean_dockq = sum(pair_scores.values()) / len(pair_scores)
+          dockq_scores.append(mean_dockq)
+          record["dockq_mean"] = round(mean_dockq, 4)
+      else:
+          record["dockq_mean"] = None
+      record["dockq_pairs"] = pair_scores
+      record["dockq_errors"] = pair_errors
+
+      # ── TM-score per chain (raw CIF Cα extraction) ──────────────────
+      try:
+          per_chain_tm = {}
+          per_chain_rmsd = {}
+          for role, model_cid in role_to_model.items():
+              native_cid = role_to_native[role]
+              tm, rmsd = tm_score(model_cif, native_cif, model_cid, native_cid)
+              if tm is not None:
+                  per_chain_tm[role] = round(tm, 4)
+                  per_chain_rmsd[role] = round(rmsd, 3)
+          if per_chain_tm:
+              mean_tm = sum(per_chain_tm.values()) / len(per_chain_tm)
+              tm_means.append(mean_tm)
+              record["tm_score_mean"] = round(mean_tm, 4)
+              record["tm_score_per_chain"] = per_chain_tm
+              record["rmsd_ca_angstroms"] = per_chain_rmsd
+      except Exception as ex:
+          import traceback
+          record["tm_error"] = traceback.format_exc()[-300:]
+          print(f"{pdb} tm_error: {record['tm_error']}", flush=True)
+
+      # ── Confidence from OpenFold3's own output ──────────────────────
+      if conf:
+          ipTM = conf.get("ipTM") or conf.get("iptm")
+          # OF3 0.4.0: aggregated confidence uses 'avg_plddt' (scalar 0-100)
+          pLDDT = None
+          for k in ("avg_plddt", "pLDDT", "plddt", "mean_pLDDT", "mean_plddt"):
+              v = conf.get(k)
+              if v is not None and not isinstance(v, list):
+                  pLDDT = float(v)
+                  break
+          if pLDDT is None:
+              for k in ("per_residue_plddt", "pLDDT_per_residue", "plddt"):
+                  v = conf.get(k)
+                  if isinstance(v, list) and v:
+                      pLDDT = sum(float(x) for x in v) / len(v)
+                      break
+          if ipTM is not None:
+              record["ipTM"] = round(float(ipTM), 4)
+              ipTMs.append(float(ipTM))
+          if pLDDT is not None:
+              record["pLDDT"] = round(float(pLDDT), 4)
+              pLDDTs.append(float(pLDDT))
+          if "ranking_confidence" in conf:
+              record["ranking_confidence"] = round(float(conf["ranking_confidence"]), 4)
+
+      record["status"] = "ok"
+      per_complex_rows.append(record)
+      dq_err = record.get('dockq_errors') or {}
+      print(f"{pdb}: dockq={record.get('dockq_mean')} tm={record.get('tm_score_mean')} "
+            f"ipTM={record.get('ipTM')} pLDDT={record.get('pLDDT')} "
+            f"dockq_err={dq_err}", flush=True)
+
+  # ── Aggregate ────────────────────────────────────────────────────────────
+  def summarize(values):
+      if not values:
+          return {"mean": None, "median": None, "min": None, "max": None, "n": 0}
+      return {
+          "mean":   round(statistics.fmean(values), 4),
+          "median": round(statistics.median(values), 4),
+          "min":    round(min(values), 4),
+          "max":    round(max(values), 4),
+          "n":      len(values),
+      }
+
+  dockq_buckets = {"high": 0, "medium": 0, "acceptable": 0, "incorrect": 0}
+  for s in dockq_scores:
+      if s >= 0.80:    dockq_buckets["high"] += 1
+      elif s >= 0.49:  dockq_buckets["medium"] += 1
+      elif s >= 0.23:  dockq_buckets["acceptable"] += 1
+      else:            dockq_buckets["incorrect"] += 1
+
+  outputs = {
+      "schema_version": 1,
+      "produced_at": datetime.now(timezone.utc).isoformat(),
+      "n_total":   len(per_complex_rows),
+      "n_scored":  len(dockq_scores),
+      "dockq":     {**summarize(dockq_scores), **dockq_buckets},
+      "tm_score":  summarize(tm_means),
+      "ipTM":      summarize(ipTMs),
+      "pLDDT":     summarize(pLDDTs),
+      "pairs_used": pairs,
+      "per_complex": per_complex_rows,
+  }
+  (OUTPUT_DIR / "outputs.json").write_text(json.dumps(outputs, indent=2))
+
+  # Flat CSV for the case-study collator.
+  flat_fields = [
+      "pdb_id", "status", "hla_allele", "peptide_sequence", "kd_micromolar",
+      "dockq_mean", "tm_score_mean", "ipTM", "pLDDT",
+  ]
+  with (OUTPUT_DIR / "per_complex.csv").open("w", newline="") as fh:
+      w = csv.DictWriter(fh, fieldnames=flat_fields, extrasaction="ignore")
+      w.writeheader()
+      for r in per_complex_rows:
+          w.writerow({k: r.get(k, "") for k in flat_fields})
+
+  print()
+  print(f"=== summary ===")
+  print(f"n_scored:    {len(dockq_scores)}/{len(per_complex_rows)}")
+  if dockq_scores:
+      print(f"DockQ mean:  {outputs['dockq']['mean']}  "
+            f"(median {outputs['dockq']['median']}, min {outputs['dockq']['min']}, "
+            f"max {outputs['dockq']['max']})")
+      print(f"DockQ buckets: high={dockq_buckets['high']}  medium={dockq_buckets['medium']}  "
+            f"acceptable={dockq_buckets['acceptable']}  incorrect={dockq_buckets['incorrect']}")
+  if tm_means:
+      print(f"TM-score mean: {outputs['tm_score']['mean']}")
+  if ipTMs:
+      print(f"ipTM mean:     {outputs['ipTM']['mean']}")
+  if pLDDTs:
+      print(f"pLDDT mean:    {outputs['pLDDT']['mean']}")
+  __BRIDGE_PY_EOF__
+
+  export BRIDGE_PREDICTIONS_DIR={{.inputs.predictions_dir | quote}}
+  export BRIDGE_MANIFEST_CSV={{.inputs.manifest_csv | quote}}
+  export BRIDGE_CRYSTALS_DIR={{.inputs.crystals_dir | quote}}
+  export BRIDGE_DOCKQ_PAIRS={{.params.dockq_pairs | quote}}
+
+  cd "$OUTPUT_DIR"
+  export APPTAINERENV_PREPEND_PATH="$VENV_DIR/bin"
+  exec apptainer exec --bind /mnt/efs "$IMAGE" \
+    "$VENV_DIR/bin/{{.runtime.entrypoint}}" "$SCRIPT_PATH" \
+    2>&1 | tee "$OUTPUT_DIR/stdout.log"

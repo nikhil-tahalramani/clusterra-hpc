@@ -1,0 +1,31 @@
+{{- /*
+Standalone NodePort Service for slurmctld, owned by this chart (not by
+the Slinky operator). Customer slurmd pods reach it at
+<central-node-ip>:<nodePort> over VPC peering. Kept separate from the
+operator-managed ClusterIP because overriding controller.service on the
+Slinky Controller CR causes the operator to append-merge ports by name
+and fail K8s validation with "port name 'slurmctld' is already taken".
+externalTrafficPolicy: Local preserves the slurmd source IP so each
+node registers with its own NodeAddr; otherwise kube-proxy SNAT
+collapses every registration to the central node IP.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-{{ .Values.cluster.name }}-controller-nodeport
+  namespace: {{ .Values.cluster.name }}
+  labels:
+    clusterra.io/cluster: {{ .Values.cluster.name }}
+    clusterra.io/component: slurmctld-nodeport
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/instance: slurm-{{ .Values.cluster.name }}
+    app.kubernetes.io/name: slurmctld
+  ports:
+  - name: slurmctld
+    port: 6817
+    targetPort: 6817
+    nodePort: {{ required "slurm.controller.nodePort is required (unique per tenant; see provisioner)" .Values.slurm.controller.nodePort }}
+    protocol: TCP

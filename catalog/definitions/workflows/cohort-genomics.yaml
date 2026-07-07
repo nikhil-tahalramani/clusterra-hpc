@@ -1,0 +1,34 @@
+id: cohort-genomics
+name: Cohort genomics
+description: |
+  Cohort variant calling: per-sample Parabricks DeepVariant → joint
+  genotyping (GATK GenomicsDBImport + GenotypeGVCFs).
+
+  Real customer demo. A true joint-calling DAG is tracked as a (B)
+  Nextflow follow-up; the recipe captures the current 2-step linear
+  placeholder shape so before/after timings remain comparable.
+
+vertical: hcls
+category: genomics
+workload_group: genomics
+modality: form
+tools: [Parabricks, GATK]
+ready: true
+kind: workflow
+
+steps:
+  - step_id: deepvariant
+    template_id: parabricks-deepvariant
+    display_name: Parabricks DeepVariant
+  - step_id: joint-genotype
+    template_id: custom-slurm
+    display_name: Joint genotyping (sbatch)
+    depends_on: [deepvariant]
+    param_overrides:
+      # Placeholder script — the real DAG migration to Nextflow replaces
+      # this; for now we ship a stub the user can edit on the launch page
+      # if they need cohort-specific sample lists.
+      script_body: |
+        #!/bin/bash
+        set -euo pipefail
+        echo "TODO: GATK GenomicsDBImport + GenotypeGVCFs across ${WORKFLOW_DIR}/step-1-deepvariant/*.g.vcf.gz"

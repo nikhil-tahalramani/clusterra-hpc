@@ -1,0 +1,80 @@
+---
+# Minimal slurm.conf for customer slurmd.
+#
+# We bypass Slinky's configless (--conf-server) on customer side because the
+# operator hardcodes SlurmctldPort=6817 in the rendered ConfigMap, which does
+# not match the per-tenant NodePort allocated on the central node
+# (range 30817-32716). Slurm's slurm.conf parser is first-wins for duplicate
+# scalars, so appending a second SlurmctldPort via Controller.spec.extraConf
+# does NOT override the hardcoded value — verified on cluse154 2026-04-20.
+#
+# slurmd -Z (dynamic nodes) does not require configless. A static local conf
+# with the connection essentials is sufficient. Node attributes are still
+# self-registered by slurmd at runtime from /proc.
+#
+# Fields must stay in sync with the operator-rendered central slurm.conf:
+#   - AuthType / CredType / AuthInfo (slurmd↔slurmctld RPC auth)
+#   - ClusterName (Slinky derives as "{namespace}_slurm-{namespace}"; our
+#     namespace == clusterId and release name == "slurm-{clusterId}")
+# AuthAltTypes=auth/jwt is intentionally omitted — JWT is only used for user
+# RPCs (scontrol/restapi); slurmd never authenticates with JWT, so jwt.key
+# doesn't need to land on customer nodes.
+#
+# slurm.key is mounted separately via the slurm-secret K8s Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurmd-conf
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurmd
+    app.kubernetes.io/component: slurmd-conf
+data:
+  slurm.conf: |
+    ClusterName={{ .Values.clusterId }}_slurm-{{ .Values.clusterId }}
+    SlurmctldHost=slurm-{{ .Values.clusterId }}-controller-0({{ (split ":" .Values.slurmctldHost)._0 }})
+    SlurmctldPort={{ (split ":" .Values.slurmctldHost)._1 }}
+    # SlurmUser must match central; default is root, which rejects slurmctld's
+    # uid 401 RPCs as "Security violation" (PING/BATCH_JOB_LAUNCH/TERMINATE_JOB).
+    SlurmUser=slurm
+    AuthType=auth/slurm
+    CredType=cred/slurm
+    AuthInfo=use_client_ids
+    # Plugin stack must match central, or slurmstepd silently fails at job
+    # launch. Central renders these via Slinky defaults; mirroring them here
+    # keeps the stepd lifecycle aligned.
+    ProctrackType=proctrack/cgroup
+    TaskPlugin=task/affinity,task/cgroup
+    PrologFlags=Contain
+    # Per-job scratch + per-user HOME bootstrap. Prolog (root, per-job-per-node)
+    # creates /mnt/scratch/job-$ID/{,apptainer-tmp,apptainer-cache} (NVMe when
+    # present, EFS fallback) + /mnt/efs/.home/$USER. TaskProlog (user, per-task)
+    # echoes the matching `export TMPDIR=... APPTAINER_TMPDIR=... HOME=...`
+    # lines that Slurm splices into the task env. Without these directives the
+    # scripts live in the image but slurmd never calls them, so every PyTorch
+    # / apptainer job re-implements TMPDIR + cache-dir + HOME shims and
+    # frequently gets them wrong. See core/images/clusterra-slurmd/Dockerfile
+    # lines 52-60 for the per-job-cache-on-NVMe design rationale.
+    Prolog=/etc/clusterra/prolog.sh
+    TaskProlog=/etc/clusterra/task_prolog.sh
+    SelectType=select/cons_tres
+    SelectTypeParameters=CR_Core_Memory
+    CommunicationParameters=block_null_hash
+    ReturnToService=2
+    # Mirror central's GresTypes so sbatch on login + slurmd on customer
+    # workers recognize `gpu` GRES. Without this, --gres=gpu:* is rejected
+    # at submit with "Invalid generic resource (gres) specification".
+    GresTypes=gpu
+    # Per-job scratch directory. Slurm exports $TMPDIR=$TmpFS/$SLURM_JOB_ID
+    # when the script does not set its own TMPDIR. /mnt/scratch is the
+    # bind-mount over the Karpenter-managed NVMe RAID0 array (instance-store);
+    # absent on non-`*d` CPU families, in which case TmpDisk is unset and
+    # the scheduler refuses --tmp= jobs.
+    TmpFS=/mnt/scratch
+  # cgroup.conf must match what Slinky renders on the central side so slurmd's
+  # step launcher uses the same cgroup hierarchy. IgnoreSystemd=yes is required
+  # because the slurmd container has no dbus — without it slurmstepd fails to
+  # create its systemd scope and slurmd crashes at startup.
+  cgroup.conf: |
+    CgroupPlugin=cgroup/v2
+    IgnoreSystemd=yes

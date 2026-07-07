@@ -1,0 +1,155 @@
+id: plexdia-demux
+name: plexDIA Channel Demultiplex
+description: |
+  Step 4a of the scp-dia chain. Demultiplexes mTRAQ / TMT plex-DIA channels
+  out of the per-cell precursor matrices written by step-3. One Slurm task
+  per LC-MS run (not per cell — channels share the same run).
+
+  Tool: SlavovLab/plexDIA scripts (R + Python helpers vendored at a frozen
+  commit SHA on EFS at /mnt/efs/refs/plexdia-scripts/<sha>/). Pure
+  interpreted code — no compile, no container build, just `apptainer exec
+  python /mnt/efs/refs/plexdia-scripts/.../plexdia_demux.py`.
+
+  License: ⚠ NOASSERTION on the SlavovLab/plexDIA repo as of May 2026 —
+  see Risk §6 in internal design notes. Vendoring a frozen
+  commit is acceptable for internal smoke; clearance from Slavov lab is
+  required before this can ship in a customer-facing case study or
+  marketing blog. This template does NOT bundle the scripts into the
+  Clusterra repo — it expects them to be staged out-of-band onto EFS at
+  the path declared by `scripts_dir`. Treat the staging step as part of
+  the de-risk plan, not the template.
+
+  Modality switch: when the parent workflow runs with `modality=label_free`,
+  this step is replaced by `plexdia-passthrough` (sibling template).
+
+  Output: per-channel quant TSVs under
+  $WORKFLOW_DIR/step-4-plex-demux/<channel>/. Step-5 (cohort-qc) reads them.
+
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [plexDIA]
+ready: false
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://condaforge/miniforge3@sha256:e005c6b132774b4093b96af586fe46a2464efec691ebbeefd1b710d291f8a67e
+  notes: |
+    Vendored SlavovLab/plexDIA scripts at /mnt/efs/refs/plexdia-scripts/<sha>/
+    must be pre-staged by ops; the template does not download them at job
+    time. License clarification pending (see description). Pure
+    R/Python — no compile, just runs out of the conda env on top of the
+    miniforge3 base image.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=8G
+  #SBATCH --time=0:10:00
+  #SBATCH --nodes=1
+  {{- if gt (int .params.run_count) 1 }}
+  #SBATCH --array=1-{{.params.run_count}}%{{.params.max_concurrent}}
+  {{- end }}
+
+inputs:
+  - key: channel_design_csv
+    role: generic_path
+    required: true
+    description: |
+      CSV with columns: raw_file, channel_tag (d0/d4/d8 for mTRAQ-3 or
+      tmt0..tmt13 for TMT-14), cell_id, sample_meta. Used by the demux
+      to assign each precursor to a cell-channel.
+  - key: scripts_dir
+    role: generic_path
+    required: false
+    default: /mnt/efs/refs/plexdia-scripts/HEAD
+    description: |
+      Pre-staged SlavovLab/plexDIA scripts on EFS. Default points at the
+      "HEAD" symlink the ops staging script maintains. Pin to a specific
+      commit-sha subdirectory for reproducibility.
+
+parameters:
+  - key: modality
+    widget: enum
+    options: [plex_mtraq_3, plex_mtraq_5, plex_tmt_14]
+    default: plex_mtraq_3
+    description: Plex modality. Drives the channel-tag list passed to demux.
+  - key: run_count
+    widget: number
+    default: 1
+    min: 1
+    max: 5000
+    description: Number of LC-MS runs (= upstream raw files).
+  - key: max_concurrent
+    widget: number
+    default: 32
+    min: 1
+    max: 256
+    description: Slurm array %K throttle.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/plexdia-{{.ctx.run_id}}"
+  artifacts:
+    - key: demuxed_dir
+      path: "{{.outputs.dir}}/by_channel"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  CHANNEL_CSV={{.inputs.channel_design_csv | quote}}
+  SCRIPTS_DIR={{.inputs.scripts_dir | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  MODALITY={{.params.modality | quote}}
+
+  [ -r "$CHANNEL_CSV" ] || { echo "channel_design_csv missing: $CHANNEL_CSV" >&2; exit 1; }
+  if [ ! -d "$SCRIPTS_DIR" ]; then
+    echo "[plex-demux] WARNING: scripts_dir not found: $SCRIPTS_DIR" >&2
+    echo "  Run the plexDIA staging script (ops) before this template:" >&2
+    echo "    aws s3 cp s3://clusterra-public/refs/plexdia/<sha>.tar.gz - | tar -xz -C /mnt/efs/refs/plexdia-scripts/" >&2
+    echo "  License: NOASSERTION on SlavovLab/plexDIA (May 2026). Clarification pending." >&2
+    exit 2
+  fi
+
+  STEP_DIR="${WORKFLOW_DIR:-$OUTPUT_DIR}/step-4-plex-demux"
+  [ "${WORKFLOW_DIR:-}" = "" ] && STEP_DIR="$OUTPUT_DIR"
+  UPSTREAM="${WORKFLOW_DIR:-}/step-3-dia-search/cells"
+  mkdir -p "$STEP_DIR/by_channel"
+
+  IDX="${SLURM_ARRAY_TASK_ID:-1}"
+  # tail -n +2 to skip header; pick run N
+  RAW_FILE=$(tail -n +2 "$CHANNEL_CSV" | awk -F',' -v i="$IDX" 'NR==i {print $1; exit}')
+  if [ -z "$RAW_FILE" ]; then
+    echo "[plex-demux] no row $IDX in channel CSV; exiting clean"
+    exit 0
+  fi
+  echo "[plex-demux] task $IDX → $RAW_FILE modality=$MODALITY"
+
+  MAMBA_ROOT="/mnt/efs/{{.ctx.user_email}}/_plexdia-mamba"
+  mkdir -p "$MAMBA_ROOT"
+  export HOME="$MAMBA_ROOT" MAMBA_ROOT_PREFIX="$MAMBA_ROOT"
+
+  RUNNER="$STEP_DIR/runner-${IDX}-$$.sh"
+  cat > "$RUNNER" <<EOSH
+  #!/bin/bash
+  set -euo pipefail
+  if ! python -c "import pandas, numpy" 2>/dev/null; then
+    pip install --user --quiet pandas numpy pyarrow scipy
+  fi
+  python "$SCRIPTS_DIR/plexdia_demux.py" \
+    --modality "$MODALITY" \
+    --channel-design "$CHANNEL_CSV" \
+    --raw-file "$RAW_FILE" \
+    --precursor-dir "$UPSTREAM" \
+    --output-dir "$STEP_DIR/by_channel"
+  EOSH
+  chmod +x "$RUNNER"
+
+  apptainer exec \
+    "{{.runtime.image}}" \
+    bash "$RUNNER"
+
+  echo "[plex-demux] task $IDX complete"

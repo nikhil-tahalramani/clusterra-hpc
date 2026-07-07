@@ -1,0 +1,219 @@
+id: relion-tomo-align
+name: Cryo-ET tilt-series alignment + tomogram reconstruction (AreTomo2)
+description: |
+  The cryo-electron tomography front half: GPU markerless tilt-series
+  alignment + tomogram reconstruction with AreTomo2. Takes a raw
+  tilt-series stack (.mrc) plus its tilt angles and produces an aligned
+  tilt series, the alignment solution, and a reconstructed tomogram (plus
+  IMOD-compatible alignment files) — the step single-particle cryo-EM
+  pipelines don't have and that gates everything downstream.
+
+  AreTomo2 is a single CUDA binary, not part of the RELION container. Since
+  cluster nodes can't build container images, this template stages the
+  prebuilt AreTomo2 CUDA-12 binary onto the shared filesystem (once,
+  flock-guarded) and runs it inside the RELION CUDA-12.6 runtime so the
+  CUDA libraries resolve — the validated cap-pod "binary-on-EFS" pattern.
+
+  Feeds `relion-tomo-sta` (subtomogram averaging) once you have particle
+  positions. Validated on EMPIAR-10164 TS_01 (4k x 4k x 41-tilt, 2.3 GB):
+  align + WBP reconstruction in 192 s on a single spot T4. See
+  relion-tomo-align.SMOKE.md.
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [AreTomo2, RELION]
+ready: true
+kind: batch
+
+cost_anchor: ~$0.05-0.20 (1x T4/A10G spot, ~3 min) per tilt series at bin 6; markerless align + WBP reconstruction
+
+runtime:
+  kind: docker_image
+  image: jidaniel/relion:5.0-cuda12.6
+  notes: |
+    The RELION 5.0 + CUDA 12.6 SIF (cached at /mnt/efs/sifs) supplies the
+    CUDA-12 userspace; `apptainer exec --nv` mounts the host driver. The
+    AreTomo2 binary itself is staged separately onto /mnt/efs/bin/aretomo2
+    from the official GitHub release (AreTomo2_1.1.2, Cuda121 build) and run
+    inside the SIF. A future bundled `relion-tomo` image (RELION + IMOD +
+    AreTomo2 + CTFFIND4) would remove the runtime download; until then the
+    one-time staged binary is cached on EFS like the SIF.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task={{.params.cpus_per_task}}
+  #SBATCH --mem={{.params.mem_gb}}G
+  #SBATCH --time={{.params.time_limit}}
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:{{.params.n_gpus}}
+  #SBATCH --requeue
+
+inputs:
+  - key: tilt_series
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Raw tilt-series stack (.mrc / .st), one image per tilt. Empty =
+      SMOKE_MODE (prints AreTomo2 -Help and exits).
+  - key: angle_file
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Tilt angles, one per line (.rawtlt or .tlt), in the stack's frame
+      order. Passed as AreTomo2 -AngFile. If empty, AreTomo2 will try to
+      read angles from the MRC extended header.
+
+parameters:
+  - key: out_bin
+    label: Output tomogram binning
+    widget: number
+    default: 6
+    min: 1
+    max: 12
+    description: |
+      Binning of the reconstructed tomogram (AreTomo2 -OutBin). 6 is the
+      usual working bin for picking/visualization (8.1 A/px on this data);
+      drop to 2-4 for higher-resolution tomograms (heavier I/O + VRAM).
+  - key: vol_z
+    label: Tomogram thickness (unbinned px)
+    widget: number
+    default: 2000
+    min: 200
+    max: 4000
+    description: Reconstruction Z thickness (AreTomo2 -VolZ).
+  - key: pixel_size
+    label: Pixel size (A/px, unbinned)
+    widget: number
+    default: 1.35
+    min: 0.1
+    max: 20
+    description: Unbinned pixel size (AreTomo2 -PixSize).
+  - key: recon_method
+    label: Reconstruction
+    widget: enum
+    options: [wbp, sart]
+    default: wbp
+    description: Weighted back-projection (-Wbp 1) or SART (-Sart). WBP is faster.
+  - key: patches
+    label: Local-alignment patches (NxN, 0 = global)
+    widget: number
+    default: 0
+    min: 0
+    max: 6
+    description: |
+      Local patch alignment grid (AreTomo2 -Patch N N). 0 = global
+      alignment only (fastest, robust for purified samples); raise for
+      in-situ data that needs local refinement.
+  - key: n_gpus
+    label: GPUs
+    widget: number
+    default: 1
+    min: 1
+    max: 4
+    description: |
+      AreTomo2 processes one tomogram per GPU. 1 GPU per tilt series is the
+      norm; >1 only helps when reconstructing several tomograms in a batch.
+  - key: cpus_per_task
+    label: CPUs per task
+    widget: number
+    default: 3
+    min: 2
+    max: 32
+  - key: mem_gb
+    label: Memory (GiB)
+    widget: number
+    default: 13
+    min: 8
+    max: 256
+    description: |
+      Headroom to read the tilt-series stack (a 4k x 4k x ~41 stack is
+      ~2.5 GB) plus AreTomo2 working buffers. 13 GiB fits a small g4dn/g5.
+  - key: time_limit
+    label: Wall-clock limit (HH:MM:SS)
+    widget: text
+    default: "1:00:00"
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/relion-tomo-align-{{.ctx.run_id}}"
+  artifacts:
+    - key: tomogram
+      path: "{{.outputs.dir}}/tomogram_aretomo.mrc"
+      role: primary_output
+      description: Reconstructed tomogram (binned per out_bin).
+    - key: alignment
+      path: "{{.outputs.dir}}/tomogram_aretomo.aln"
+      role: primary_output
+      description: AreTomo2 tilt-series alignment solution.
+    - key: proj_xy
+      path: "{{.outputs.dir}}/tomogram_aretomo_projXY.mrc"
+      role: primary_output
+      description: XY projection of the tomogram (quick field-of-view view).
+    - key: log
+      path: "{{.outputs.dir}}/run.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -uo pipefail
+
+  IMG="docker://{{.runtime.image}}"
+  TILTS={{.inputs.tilt_series | quote}}
+  ANGS={{.inputs.angle_file | quote}}
+  OUTDIR={{.outputs.dir | quote}}
+  NGPU={{.params.n_gpus}}
+  mkdir -p "$OUTDIR"
+
+  # --- one-time, flock-guarded SIF pull (CUDA runtime) -----------------
+  SIF_STORE=/mnt/efs/sifs; mkdir -p "$SIF_STORE" || true
+  SIF_PATH="$SIF_STORE/relion_5.0-cuda12.6.sif"
+  export APPTAINER_CACHEDIR="$TMPDIR/apptainer-cache" APPTAINER_TMPDIR="$TMPDIR/apptainer-tmp"
+  mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
+  if [ ! -s "$SIF_PATH" ]; then
+    exec 9>"$SIF_STORE/.relion_5.0-cuda12.6.sif.lock" || true
+    if flock -w 1800 9 2>/dev/null; then
+      [ -s "$SIF_PATH" ] || { echo "[tomo-align] pulling $IMG"; apptainer pull --force "$SIF_PATH" "$IMG" 2>&1 || SIF_PATH="$IMG"; }
+      flock -u 9 2>/dev/null || true
+    else SIF_PATH="$IMG"; fi
+  fi
+
+  # --- one-time, flock-guarded AreTomo2 binary stage -------------------
+  ARE_DIR=/mnt/efs/bin/aretomo2
+  ARE_BIN="$ARE_DIR/AreTomo2_1.1.2_Cuda121"
+  ARE_URL="https://github.com/czimaginginstitute/AreTomo2/releases/download/v1.1.2/AreTomo2_1.1.2_03-27-2024.zip"
+  if [ ! -x "$ARE_BIN" ]; then
+    mkdir -p "$ARE_DIR"
+    exec 8>"$ARE_DIR/.stage.lock" || true
+    if flock -w 600 8 2>/dev/null; then
+      if [ ! -x "$ARE_BIN" ]; then
+        echo "[tomo-align] staging AreTomo2 1.1.2 (Cuda121)"
+        ( cd "$ARE_DIR" && curl -fSL --retry 4 -o a.zip "$ARE_URL" && python3 -m zipfile -e a.zip ./ && rm -f a.zip )
+        chmod +x "$ARE_DIR"/AreTomo2_1.1.2_* 2>/dev/null || true
+      fi
+      flock -u 8 2>/dev/null || true
+    fi
+  fi
+  [ -x "$ARE_BIN" ] || { echo "AreTomo2 binary not available at $ARE_BIN" >&2; exit 1; }
+
+  # --- SMOKE_MODE ------------------------------------------------------
+  if [ -z "$TILTS" ]; then
+    echo "[tomo-align] SMOKE_MODE: AreTomo2 -Help"
+    exec apptainer exec --nv --bind /mnt/efs "$SIF_PATH" "$ARE_BIN" 2>&1 | head -40
+  fi
+  [ -r "$TILTS" ] || { echo "tilt_series not readable: $TILTS" >&2; exit 1; }
+
+  OUT_MRC="$OUTDIR/tomogram_aretomo.mrc"
+  RECON_FLAG="-Wbp 1"; [ "{{.params.recon_method}}" = "sart" ] && RECON_FLAG="-Sart 15 5"
+  ANG_FLAG=(); [ -n "$ANGS" ] && [ -r "$ANGS" ] && ANG_FLAG=( -AngFile "$ANGS" )
+  GPU_LIST=$(seq 0 $((NGPU-1)) | tr '\n' ' ')
+
+  echo "[tomo-align] AreTomo2 align+reconstruct: $TILTS -> $OUT_MRC"
+  apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs "$SIF_PATH" "$ARE_BIN" \
+    -InMrc "$TILTS" -OutMrc "$OUT_MRC" "${ANG_FLAG[@]}" \
+    -VolZ {{.params.vol_z}} -OutBin {{.params.out_bin}} -PixSize {{.params.pixel_size}} \
+    -Patch {{.params.patches}} {{.params.patches}} $RECON_FLAG \
+    -FlipVol 1 -OutImod 1 -Gpu $GPU_LIST 2>&1
+
+  echo "[tomo-align] done; outputs:"; ls -la "$OUTDIR"/ 2>&1 | head

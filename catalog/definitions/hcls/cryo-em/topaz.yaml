@@ -1,0 +1,127 @@
+id: topaz
+name: Topaz (GPU cryo-EM particle picking)
+description: |
+  GPU-accelerated particle picking for cryo-EM micrographs. Topaz (tbepler,
+  208 stars) trains CNN models on a small set of hand-picked particles and
+  extrapolates picks across an entire dataset — replaces RELION manual /
+  template picking for SPA workflows. Bundled by cryoSPARC as the default
+  picker; equally usable standalone in RELION pipelines (wedge report § 5).
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [Topaz]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.10"
+  base_image: python:3.11
+  requirements: ["topaz-em==0.3.7"]
+  cache_dir: /mnt/efs/_topaz-venv/0.3.7
+  entrypoint: topaz
+  notes: |
+    No upstream Topaz container exists on Docker Hub / Quay / GHCR
+    (verified May 11 2026 — tbepler/topaz docker namespace 404s). Pip
+    install into a persistent EFS site-packages cache so install cost is
+    one-time per cluster. CUDA torch wheels pulled in by the topaz-em dep
+    tree so `--device 0` works when /dev/nvidia* is bound via apptainer --nv.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: micrograph_dir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Directory of preprocessed micrographs (.mrc or .png). Empty = SMOKE_MODE
+      (topaz --help only).
+  - key: model_path
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Pretrained topaz model (.sav). Empty = use bundled `resnet8_u64` general
+      model that ships with topaz-em.
+
+parameters:
+  - key: particle_radius
+    label: Particle radius (px)
+    widget: number
+    default: 18
+    min: 2
+    max: 200
+  - key: threshold
+    label: Score threshold
+    widget: number
+    default: -6.0
+    min: -10.0
+    max: 10.0
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/topaz-{{.ctx.run_id}}"
+  artifacts:
+    - key: picks
+      path: "{{.outputs.dir}}/particles.txt"
+      role: primary_output
+      description: Tab-separated particle coordinates (image_name, x, y, score).
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+
+  TOPAZ_VENV={{.runtime.cache_dir | quote}}
+  mkdir -p "$TOPAZ_VENV"
+  export PYTHONUSERBASE="$TOPAZ_VENV"
+
+  if [ "${TOPAZ_SMOKE:-1}" = "1" ] || [ -z {{.inputs.micrograph_dir | quote}} ]; then
+    echo "[topaz] SMOKE_MODE: topaz --help (set TOPAZ_SMOKE=0 + provide micrograph_dir for real picking)"
+    RUNNER="$TMPDIR/topaz-runner.sh"
+    cat > "$RUNNER" <<'RUN'
+  #!/bin/bash
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$PYTHONUSERBASE/bin:$PATH"
+  if ! python -c "import topaz" 2>/dev/null; then
+    pip install --user --no-cache-dir --quiet topaz-em==0.3.7
+  fi
+  exec topaz --help
+  RUN
+    chmod +x "$RUNNER"
+    exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+      --env "PYTHONUSERBASE=$PYTHONUSERBASE" \
+      "docker://{{.runtime.base_image}}" bash "$RUNNER"
+  fi
+
+  MICRO_DIR={{.inputs.micrograph_dir | quote}}
+  [ -d "$MICRO_DIR" ] || { echo "micrograph_dir not a directory: $MICRO_DIR" >&2; exit 1; }
+  MODEL={{.inputs.model_path | quote}}
+
+  RUNNER="$TMPDIR/topaz-runner.sh"
+  cat > "$RUNNER" <<RUN
+  #!/bin/bash
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$PYTHONUSERBASE/bin:$PATH"
+  if ! python -c "import topaz" 2>/dev/null; then
+    pip install --user --no-cache-dir --quiet topaz-em==0.3.7
+  fi
+  exec topaz extract \\
+    ${MODEL:+--model "$MODEL"} \\
+    --radius {{.params.particle_radius}} \\
+    --threshold {{.params.threshold}} \\
+    --output "$OUTPUT_DIR/particles.txt" \\
+    --device 0 \\
+    "$MICRO_DIR"/*.mrc
+  RUN
+  chmod +x "$RUNNER"
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+    --env "PYTHONUSERBASE=$PYTHONUSERBASE" \
+    "docker://{{.runtime.base_image}}" bash "$RUNNER"

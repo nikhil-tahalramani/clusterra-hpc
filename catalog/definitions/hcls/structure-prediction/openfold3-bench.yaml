@@ -1,0 +1,120 @@
+id: openfold3-bench
+name: OpenFold3 (4×A10G)
+description: |
+  OpenFold3 pinned to 4×A10G for the drug discovery workflow.
+  g5.12xlarge (4 A10Gs, 48 vCPU, 192 GiB) brings a ~500 aa target from
+  ~60 min (single A10G) to ~18 min — cost-neutral at $1.60/hr spot vs
+  $0.40/hr on g5.xlarge because the wall-clock compresses 4×.
+
+  Identical implementation to `openfold3`; only gpu.count differs.
+  The default input fixture is the EGFR kinase domain input YAML
+  pre-staged at /mnt/efs/bench/drug-disco/egfr-kinase-input.yaml
+  by the drug-disco-bench-prep job.
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [OpenFold3]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: /mnt/efs/_sifs/openfold3-0.4.0.sif
+  notes: |
+    Pre-staged from openfoldconsortium/openfold3:0.4.0 — same SIF as
+    the openfold3 template. See openfold3.yaml for pull notes.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=28G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:l40s:1
+inputs:
+  - key: input_yaml
+    role: generic_path
+    required: false
+    default: /mnt/efs/bench/drug-disco/egfr-kinase-input.yaml
+    description: |
+      OpenFold3 input YAML (sequences + ligands). Defaults to the EGFR
+      kinase domain benchmark fixture (~500 aa; see drug-disco-bench-prep).
+
+parameters:
+  - key: num_recycles
+    label: Recycle iterations
+    widget: number
+    default: 3
+    min: 1
+    max: 10
+  - key: num_diffusion_samples
+    label: Diffusion samples
+    widget: number
+    default: 5
+    min: 1
+    max: 25
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openfold3-bench-{{.ctx.run_id}}"
+  artifacts:
+    - key: predicted_cif
+      path: "{{.outputs.dir}}/predicted.cif"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+
+  OF3_BIN=/opt/conda/envs/openfold3/bin/run_openfold
+
+  INPUT={{.inputs.input_yaml | quote}}
+  [ -f "$INPUT" ] || { echo "input not readable: $INPUT" >&2; exit 1; }
+
+  # OF3 0.4.0 `predict` requires JSON via --query-json. The slurmd host has
+  # stdlib-only python (no PyYAML), so we don't do YAML→JSON at job time —
+  # the prep step writes a sibling .json next to the .yaml fixture.
+  # --num-recycles isn't a flag on this CLI version; dropped.
+  case "$INPUT" in
+    *.json) QUERY_JSON="$INPUT" ;;
+    *.yaml|*.yml)
+      QUERY_JSON="${INPUT%.*}.json"
+      [ -f "$QUERY_JSON" ] || { echo "expected sibling JSON not found: $QUERY_JSON" >&2; exit 1; }
+      ;;
+    *) echo "unknown input ext: $INPUT" >&2; exit 1 ;;
+  esac
+
+  # OF3 downloads model weights to $OPENFOLD_CACHE (default ~/.openfold3) on
+  # first use. slurmd sets HOME=/nonexistent so the default is non-writable,
+  # AND OF3 prompts interactively for the download — slurmd has no stdin so
+  # the prompt defaults to Aborted. Fix: point cache at EFS so weights
+  # persist across runs, and pipe `yes` to auto-confirm the first download.
+  CACHE=/mnt/efs/_openfold3-cache
+  mkdir -p "$CACHE"
+
+  # K8s pods default /dev/shm to 64 MB — PyTorch DataLoader workers
+  # bus-error there (jobs 2095 / 2101). Apptainer's --mount type=tmpfs
+  # is rejected (job 2107: "only 'bind' is supported"). Workaround: bind
+  # a per-job dir under /tmp (96 GiB overlay on the slurmd pod) onto
+  # /dev/shm. Not actual tmpfs but unlimited size, no bus error.
+  SHM_DIR=$(mktemp -d -t of3-shm-XXXXX)
+  trap 'rm -rf "$SHM_DIR"' EXIT
+
+  # `yes |` answers the first-run weight-download prompt, but yes never
+  # exits — when apptainer finishes 0, yes gets SIGPIPE (141) and pipefail
+  # propagates the failure (job 2113). Run in a subshell with pipefail
+  # off and return apptainer's status (PIPESTATUS[1]).
+  set +o pipefail
+  yes 2>/dev/null | apptainer exec --nv \
+    --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs --bind "$SHM_DIR:/dev/shm" \
+    --env "HOME=$CACHE" --env "OPENFOLD_CACHE=$CACHE" \
+    "{{.runtime.image}}" \
+    "$OF3_BIN" predict \
+      --query-json "$QUERY_JSON" \
+      --output-dir "$OUTPUT_DIR" \
+      --num-diffusion-samples {{.params.num_diffusion_samples}}
+  RC=${PIPESTATUS[1]}
+  set -o pipefail
+  exit "$RC"

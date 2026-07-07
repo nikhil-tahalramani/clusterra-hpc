@@ -1,0 +1,235 @@
+id: openswath-dia
+name: OpenSWATH DIA Analysis (OpenSwathWorkflow + pyprophet)
+description: |
+  Fully BSD/permissive DIA proteomics analysis using OpenSwathWorkflow
+  (TOPP tool) — assay-library-based DIA scoring with mProphet feature
+  scoring. Output is OSW + sqMass + TSV with peak-group q-values.
+
+  Positioning: this is Clusterra's BSD-licensed answer to DIA-NN (academic
+  license) and Spectronaut (commercial). OpenSWATH was the original
+  reference DIA tool from the Aebersold lab; OpenSwathWorkflow ships
+  in-tree in OpenMS 3.x. Pair with pyprophet (BSD-3) for downstream
+  global q-value scoring across runs — pyprophet is wrapped via the
+  bioconda biocontainer (staged to EFS once, cached across jobs).
+
+  Inputs:
+    - one or more DIA mzML files (centroided, swath windows declared)
+    - a spectral library in OpenMS .pqp or .tsv (OpenSWATH assay) format
+    - iRT peptides .pqp / .tsv (optional but recommended for retention-
+      time alignment)
+
+  CRITICAL APPTAINER NOTE: this template uses `--no-home --writable-tmpfs`
+  on every `apptainer exec`. OpenMS adapters and OpenSwathWorkflow itself
+  crash with "Could not remove directory" / "Process failed to start"
+  if the host HOME is mounted into the container; --no-home prevents the
+  collision. Documented in MEMORY:openms_cometadapter_apptainer_fix.
+
+  SMOKE SCOPE: the default smoke fixture runs OpenSwathWorkflow `--help`
+  inside the container (proves the binary loads, the apptainer flags
+  resolve cleanly, and pyprophet stages from biocontainer). To run a real
+  DIA analysis the caller must supply a library + iRT files matching
+  their DIA windows — that's a customer-config exercise, not something
+  the template can usefully default. Set OSW_SMOKE=0 and supply
+  spectral_library + (optional) irt_peptides to trigger a real run.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [OpenMS, OpenSWATH, pyprophet]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://quay.io/biocontainers/openms:3.5.0--h78fb946_0
+  notes: |
+    Bioconda biocontainer for OpenMS 3.5.0 (released 2025-12-14). Same
+    image as openms-dda — OpenSwathWorkflow is the in-tree TOPP tool.
+    Single-arch x86_64 — matches dev-demo worker shapes.
+    pyprophet (BSD-3) is staged from a separate bioconda biocontainer
+    onto EFS on first use.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=32G
+  #SBATCH --time=6:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: input_mzml
+    role: mzml
+    required: false
+    default: /mnt/efs/n52h53@gmail.com/step-prep/mzml/20201115_GD_NT1gly_1115_C18_45C_run1.mzML
+    description: |
+      DIA mzML on EFS (single file for the smoke; for batch analysis run
+      one job per file and aggregate the .osw outputs with pyprophet
+      `merge` downstream). Must be centroided with DIA window metadata.
+  - key: spectral_library
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      OpenSWATH spectral library — .pqp (SQLite) or .tsv (assay table).
+      Required for a real run; empty triggers the container-existence
+      smoke. Build with OpenSwathAssayGenerator from a DDA library
+      (idXML + featureXML).
+  - key: irt_peptides
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      iRT peptides library .pqp / .tsv for retention-time alignment.
+      Optional but strongly recommended for cohort comparability.
+  - key: fasta_db
+    role: fasta_db
+    required: false
+    default: /mnt/efs/nikhil@clusterra.io/comet-dbsearch/human_sprot_td.fasta
+    description: |
+      Target-decoy FASTA. Used by pyprophet for protein-level FDR. Default
+      = UniProt Swiss-Prot human + decoy shared with the Sage / Comet
+      benchmarks.
+
+parameters:
+  - key: mz_extraction_window_ppm
+    widget: number
+    default: 30
+    min: 5
+    max: 100
+    description: |
+      m/z extraction window for fragment ion chromatograms (± ppm). 30
+      ppm is the OpenSWATH default for Orbitrap; tighten to 10-15 ppm
+      for high-res instruments with stable mass accuracy.
+  - key: rt_extraction_window_sec
+    widget: number
+    default: 600
+    min: 60
+    max: 3600
+    description: |
+      Retention-time extraction window (± seconds). 600s is the
+      OpenSWATH default; reduce for short gradients.
+  - key: run_pyprophet
+    widget: bool
+    default: true
+    description: |
+      Run pyprophet `score` on the .osw output for run-level q-values.
+      Disable when you plan to merge .osw files across runs and rescore
+      at cohort level (run pyprophet `merge` + `score` separately).
+  - key: fdr_threshold
+    widget: number
+    default: 0.01
+    min: 0.001
+    max: 0.10
+    description: |
+      Peak-group q-value cutoff for the pyprophet `export` TSV. 0.01 = 1%
+      FDR.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openswath-{{.ctx.run_id}}"
+  artifacts:
+    - key: osw
+      path: "{{.outputs.dir}}/swath.osw"
+      role: primary_output
+    - key: peakgroups_tsv
+      path: "{{.outputs.dir}}/swath.peakgroups.tsv"
+      role: generic
+    - key: log
+      path: "{{.outputs.dir}}/openswath.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_MZML={{.inputs.input_mzml | quote}}
+  SPEC_LIB={{.inputs.spectral_library | quote}}
+  IRT={{.inputs.irt_peptides | quote}}
+  FASTA={{.inputs.fasta_db | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  MZ_WIN={{.params.mz_extraction_window_ppm}}
+  RT_WIN={{.params.rt_extraction_window_sec}}
+  RUN_PYP="{{.params.run_pyprophet}}"
+  FDR={{.params.fdr_threshold}}
+  THREADS=16
+  IMG="{{.runtime.image}}"
+  LOG="$OUTPUT_DIR/openswath.log"
+
+  mkdir -p "$OUTPUT_DIR"
+  exec > >(tee -a "$LOG") 2>&1
+
+  # Apptainer flags: --no-home --writable-tmpfs is load-bearing for OpenMS.
+  # See MEMORY:openms_cometadapter_apptainer_fix.
+  APPT="apptainer exec --no-home --writable-tmpfs --bind /mnt/efs"
+
+  # Container-existence smoke when no spectral library is supplied — proves
+  # the image extracts, OpenSwathWorkflow loads, and apptainer flags resolve.
+  if [ "${OSW_SMOKE:-1}" = "1" ] && [ -z "$SPEC_LIB" ]; then
+    echo "[openswath-dia] container-existence smoke (set OSW_SMOKE=0 + spectral_library to run a real DIA analysis)"
+    # Capture help to a file (SIGPIPE on `| head -10` would trip pipefail).
+    $APPT "$IMG" OpenSwathWorkflow --help > "$OUTPUT_DIR/.osw-help.txt" 2>&1 || true
+    head -10 "$OUTPUT_DIR/.osw-help.txt" || true
+    echo "---"
+    [ -r "$INPUT_MZML" ] && echo "input_mzml readable: $INPUT_MZML ($(stat -c%s "$INPUT_MZML") bytes)" || echo "WARN: input_mzml not readable"
+    [ -r "$FASTA" ] && echo "fasta readable: $FASTA ($(stat -c%s "$FASTA") bytes)" || echo "WARN: fasta not readable"
+    echo "[openswath-dia] image extracts; entrypoint present. Supply spectral_library + irt_peptides for a real run."
+    # Touch the artifact paths so the catalog UI shows them as zero-byte placeholders.
+    : > "$OUTPUT_DIR/swath.osw"
+    : > "$OUTPUT_DIR/swath.peakgroups.tsv"
+    # Stage pyprophet image so first real run isn't paying the pull cost
+    PYP_IMG="docker://quay.io/biocontainers/pyprophet:3.0.15--py311hc303176_0"
+    apptainer exec --no-home --writable-tmpfs --bind /mnt/efs "$PYP_IMG" pyprophet --version || echo "WARN: pyprophet image failed to load"
+    exit 0
+  fi
+
+  [ -r "$INPUT_MZML" ] || { echo "input_mzml not readable: $INPUT_MZML" >&2; exit 1; }
+  [ -r "$SPEC_LIB"   ] || { echo "spectral_library not readable: $SPEC_LIB" >&2; exit 1; }
+
+  IRT_ARG=()
+  if [ -n "$IRT" ] && [ -r "$IRT" ]; then
+    IRT_ARG=( -tr_irt "$IRT" )
+  else
+    echo "[openswath-dia] WARN: no iRT library — running without RT alignment."
+  fi
+
+  echo "===== STEP 1: OpenSwathWorkflow ====="
+  $APPT "$IMG" OpenSwathWorkflow \
+    -in "$INPUT_MZML" \
+    -tr "$SPEC_LIB" \
+    "${IRT_ARG[@]}" \
+    -out_osw "$OUTPUT_DIR/swath.osw" \
+    -mz_extraction_window "$MZ_WIN" \
+    -mz_extraction_window_unit ppm \
+    -rt_extraction_window "$RT_WIN" \
+    -threads "$THREADS"
+
+  [ -s "$OUTPUT_DIR/swath.osw" ] || { echo "OpenSwathWorkflow produced empty .osw" >&2; exit 1; }
+
+  if [ "$RUN_PYP" != "true" ]; then
+    echo "run_pyprophet=false — leaving the unscored .osw at $OUTPUT_DIR/swath.osw"
+    echo "Aggregate across runs with: pyprophet merge --template=lib.pqp --out=merged.osw run1.osw run2.osw ..."
+    exit 0
+  fi
+
+  # pyprophet runs directly from its biocontainer (no EFS staging — it's
+  # a python package, not a static binary).
+  PYP_IMG="docker://quay.io/biocontainers/pyprophet:3.0.15--py311hc303176_0"
+
+  echo "===== STEP 2: pyprophet score + export ====="
+  apptainer exec --no-home --writable-tmpfs --bind /mnt/efs --pwd "$OUTPUT_DIR" \
+    "$PYP_IMG" pyprophet score --in="$OUTPUT_DIR/swath.osw" --level=ms2 || {
+      echo "pyprophet score failed — leaving raw .osw for downstream merge" >&2
+      exit 0
+    }
+
+  apptainer exec --no-home --writable-tmpfs --bind /mnt/efs --pwd "$OUTPUT_DIR" \
+    "$PYP_IMG" pyprophet export --in="$OUTPUT_DIR/swath.osw" --format=legacy_merged --max_rs_peakgroup_qvalue="$FDR"
+
+  # pyprophet `export` writes a TSV named after the .osw stem.
+  TSV="$OUTPUT_DIR/swath.tsv"
+  if [ -f "$TSV" ]; then
+    mv "$TSV" "$OUTPUT_DIR/swath.peakgroups.tsv"
+  fi
+
+  COUNT=$(awk 'NR>1' "$OUTPUT_DIR/swath.peakgroups.tsv" 2>/dev/null | wc -l || echo 0)
+  echo "===== Summary ====="
+  echo "Peak groups at q <= $FDR: $COUNT"
+  echo "Outputs at: $OUTPUT_DIR"

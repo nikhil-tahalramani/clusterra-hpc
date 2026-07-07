@@ -1,0 +1,53 @@
+id: scp-dia
+name: Single-Cell DIA Proteomics (scp-dia)
+description: |
+  End-to-end single-cell DIA proteomics cohort pipeline. Five steps:
+  rawconvert → AlphaPeptDeep predict-library → AlphaDIA per-cell search
+  (array) → plexDIA channel demux → cohort QC + tidy quant matrix.
+
+  Target wedge: Wave-2 Vector B (Glow Bio, Seer Bio, PreOmics, Slavov-lab
+  spinouts) and academic proteomics cores running plexDIA / SCoPE-DIA on
+  Orbitrap Astral and timsTOF SCP. Marketing headline: 3,000 cells in ~6h
+  on Clusterra vs ~4 days serial on a workstation, ~$0.04-0.10/cell on
+  AWS spot, ~1,000 proteins/cell median on plexDIA mTRAQ-3plex.
+
+  Cross-step auto-discovery happens in the child templates (they walk up
+  to $WORKFLOW_DIR/step-N-<id>/), so this catalog YAML only declares the
+  linear `afterok` deps. Step-4 plex-demux is no-op'd when modality=label_free
+  via a per-cell substitute step (future: gate predicate; the orchestrator
+  currently fires all five and step-4 short-circuits on empty manifest).
+
+  Modality and search-engine flags surface on the step-level launch forms
+  (param_overrides on the strip). The default uses AlphaDIA + plex mTRAQ-3
+  — the published plexDIA case-study config. Swap `search_engine=diann` on
+  step-3 unfold to use the freeware DIA-NN fallback (lower RAM, slightly
+  faster, well-tested on PXD030604).
+
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [ThermoRawFileParser, AlphaPeptDeep, AlphaDIA, plexDIA, pandas]
+ready: false
+kind: workflow
+
+steps:
+  - step_id: rawconvert
+    template_id: rawconvert
+    display_name: Raw → mzML
+  - step_id: predict-library
+    template_id: alphapeptdeep-predict
+    display_name: AlphaPeptDeep library predict
+    depends_on: [rawconvert]
+  - step_id: dia-search
+    template_id: alphadia-search
+    display_name: AlphaDIA per-cell search
+    depends_on: [predict-library]
+  - step_id: plex-demux
+    template_id: plexdia-demux
+    display_name: plexDIA channel demux
+    depends_on: [dia-search]
+  - step_id: cohort-qc
+    template_id: scp-cohort-qc
+    display_name: Cohort QC + tidy quant
+    depends_on: [plex-demux]

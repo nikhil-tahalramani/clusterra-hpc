@@ -1,0 +1,350 @@
+id: deepgp-rescore
+name: DeepGP glycopeptide PSM rescoring (Nature MI 2024)
+description: |
+  GPU rescoring layer for glycopeptide PSMs using DeepGP
+  (Lu et al. *Nature MI* 2024, github.com/lmsac/DeepGP, BSD-2-Clause).
+  DeepGP is a transformer + GNN that predicts a glycopeptide's MS/MS
+  spectrum, then scores each PSM by predicted-vs-observed cosine
+  similarity. Re-ranks the input PSM list and (with decoys in the
+  input) sweeps FDR for new identifications.
+
+  Architecture truth: rescorer, not a search engine. Must consume a
+  pGlyco3-format `pGlycoDB-GP-FDR-Pro.txt` produced by an upstream
+  search engine. Pair with `metamorpheus-to-pglyco3` connector for
+  MetaMorpheus N-glyco output.
+
+  Pipeline (DeepGP has no single CLI entrypoint):
+    A. `1_dataset_format.py` — pGlyco3 txt + MGF dir → features CSV
+    B. `3_replace_predict_byBY.py` — predict spectra with pre-trained
+       model + score every PSM via cosine similarity
+    C. Custom FDR epilogue — join DeepGP scores to MM decoy column,
+       sweep cumulative decoys/PSMs to find new 1% FDR threshold,
+       emit rescored PSM table
+
+  Step C replaces DeepGP's `Post_analysis/reidentification_post_analysis.py`
+  which is hard-coded to Yeast/Mouse decoy regimes; we use the
+  generic decoy column the upstream connector emits.
+
+  License posture: DeepGP is BSD-2-Clause. Pre-trained weights (DeepFLR
+  base + human spectrum predictor, ~964 MB total) hosted on the project's
+  GitHub Releases page — downloaded lazily on first run to
+  `/mnt/efs/refs/deepgp/models/`.
+
+  Published benchmark headline (Nature MI 2024, paper's test sets):
+  +33% more glycopeptide IDs vs pGlyco3, +89% vs Byonic, +178% vs
+  StrucGP. Our case-study uplift will be the equivalent number computed
+  on MetaMorpheus output, not on pGlyco3 output, so the absolute %
+  values won't match the paper — same methodology, different baseline.
+
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [DeepGP, PyTorch, DGL]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.8"
+  base_image: condaforge/miniforge3@sha256:e005c6b132774b4093b96af586fe46a2464efec691ebbeefd1b710d291f8a67e
+  cache_dir: /mnt/efs/_deepgp-conda-env
+  entrypoint: python
+  notes: |
+    DeepGP's upstream pins (torch 1.12+cu113, dgl 1.0.1+cu113, Python
+    3.8.3) predate L4's sm_89 — upgraded to torch 2.0.1+cu118 +
+    dgl 1.1.x+cu118 to run on g6 (NVIDIA L4). FastNLP 0.6.0 is
+    abandoned upstream; pinned for the `Tester` API DeepGP uses.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:1
+
+inputs:
+  - key: pglyco3_tsv
+    role: generic_path
+    required: true
+    description: |
+      Absolute /mnt/efs path to a `pGlycoDB-GP-FDR-Pro.txt` produced
+      by `metamorpheus-to-pglyco3` (or any pGlyco3-format emitter).
+      Must contain both targets AND decoys for FDR control (the
+      upstream connector's `include_decoys=true` default emits both).
+
+  - key: mgf_dir
+    role: generic_path
+    required: true
+    description: |
+      Directory of MGF files (one per .raw input). MetaMorpheus's
+      upstream step produces these via ThermoRawFileParser into
+      `step-prep/mgf/`. The MGF filename stems must match the
+      RawName column in the pGlyco3 TSV — DeepGP joins on filename.
+
+parameters:
+  - key: model_organism
+    label: Pre-trained model organism
+    widget: enum
+    options: [human, mouse, human.mouse]
+    default: human
+    description: |
+      Which DeepGP pre-trained spectrum predictor to use. `human` for
+      human cell lines / tissues (SimpleCell, plasma, etc.). `mouse`
+      for mouse tissues. `human.mouse` is the combined model — use
+      when sample organism is mixed or unknown.
+
+  - key: ms2_method
+    label: Spectrum similarity metric
+    widget: enum
+    options: [cos_sqrt, cos, pcc]
+    default: cos_sqrt
+    description: |
+      cos_sqrt = cosine similarity on sqrt-transformed intensities
+      (DeepGP default, robust to dominant peaks). cos = raw cosine.
+      pcc = Pearson correlation. cos_sqrt is the paper's headline metric.
+
+  - key: rescored_fdr_cutoff
+    label: Post-rescore FDR cutoff
+    widget: number
+    default: 0.01
+    min: 0.001
+    max: 0.10
+    description: |
+      Target-decoy FDR cutoff applied to the DeepGP-rescored PSM list.
+      0.01 = 1% FDR (publication standard). The number of PSMs passing
+      this cutoff is the uplift headline vs the MM-only count.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-{{.ctx.step_id}}"
+  artifacts:
+    - key: rescored_psms
+      path: "{{.outputs.dir}}/rescored_psms.tsv"
+      role: primary_output
+    - key: uplift_summary
+      path: "{{.outputs.dir}}/uplift_summary.json"
+      role: generic
+    - key: deepgp_raw_scores
+      path: "{{.outputs.dir}}/deepgp_output/predictmonomz.csv"
+      role: generic
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  PGLYCO3_TSV={{.inputs.pglyco3_tsv | quote}}
+  MGF_DIR={{.inputs.mgf_dir | quote}}
+  MODEL_ORG={{.params.model_organism | quote}}
+  MS2_METHOD={{.params.ms2_method | quote}}
+  RESCORED_FDR={{.params.rescored_fdr_cutoff}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+
+  [ -r "$PGLYCO3_TSV" ] || { echo "pglyco3_tsv not readable: $PGLYCO3_TSV" >&2; exit 1; }
+  [ -d "$MGF_DIR" ]     || { echo "mgf_dir not found: $MGF_DIR" >&2; exit 1; }
+  mkdir -p "$OUTPUT_DIR"
+
+  # ---- Lazy stage: DeepGP repo + models on EFS (one-time, flock-guarded) ----
+  DEEPGP_REPO=/mnt/efs/refs/deepgp/repo
+  DEEPGP_MODELS=/mnt/efs/refs/deepgp/models
+  mkdir -p /mnt/efs/refs/deepgp
+  (
+    flock -x 9
+    # Use curl + tarball (no git on slurmd cap-pod image); sentinel = a
+    # known file in the repo root.
+    if [ ! -f "$DEEPGP_REPO/1_dataset_format.py" ]; then
+      rm -rf "$DEEPGP_REPO.tmp" "$DEEPGP_REPO"
+      mkdir -p "$DEEPGP_REPO.tmp"
+      curl -fSL https://codeload.github.com/lmsac/DeepGP/tar.gz/refs/heads/main \
+        -o /tmp/deepgp.tar.gz
+      tar -xzf /tmp/deepgp.tar.gz -C "$DEEPGP_REPO.tmp" --strip-components=1
+      mv "$DEEPGP_REPO.tmp" "$DEEPGP_REPO"
+      rm -f /tmp/deepgp.tar.gz
+    fi
+    mkdir -p "$DEEPGP_MODELS"
+    for asset in DeepFLR.zip human.zip mouse.zip human.mouse.zip; do
+      [ -f "$DEEPGP_MODELS/$asset" ] && continue
+      [ "$asset" = "human.zip" ] && [ "$MODEL_ORG" != "human" ] && continue
+      [ "$asset" = "mouse.zip" ] && [ "$MODEL_ORG" != "mouse" ] && continue
+      [ "$asset" = "human.mouse.zip" ] && [ "$MODEL_ORG" != "human.mouse" ] && continue
+      echo "[deepgp] downloading $asset (one-time)" >&2
+      curl -fsSL -o "$DEEPGP_MODELS/$asset" \
+        "https://github.com/lmsac/DeepGP/releases/download/DeepGP/$asset"
+      # python3 -m zipfile -e (no unzip on slurmd cap-pod image)
+      ( cd "$DEEPGP_MODELS" && python3 -m zipfile -e "$asset" . && rm -f "$asset" )
+    done
+  ) 9>/mnt/efs/refs/deepgp/.lock
+
+  DEEPFLR_DIR=$(find "$DEEPGP_MODELS/DeepFLR" -maxdepth 2 -type d -name 'best*' 2>/dev/null | head -1)
+  ORG_MODEL=$(find "$DEEPGP_MODELS/$MODEL_ORG" -maxdepth 3 -type f -name '*.pt' 2>/dev/null | head -1)
+  [ -n "$DEEPFLR_DIR" ] || { echo "[deepgp] DeepFLR weights missing under $DEEPGP_MODELS/DeepFLR" >&2; exit 71; }
+  [ -n "$ORG_MODEL" ]   || { echo "[deepgp] $MODEL_ORG spectrum model missing under $DEEPGP_MODELS/$MODEL_ORG" >&2; exit 72; }
+  echo "[deepgp] DeepFLR=$DEEPFLR_DIR"
+  echo "[deepgp] spectrum model=$ORG_MODEL"
+
+  # ---- Lazy stage: conda env (torch 2.0+cu118 + DGL + DeepGP deps) ----
+  CONDA_ENV=/mnt/efs/{{.ctx.user_email}}/_deepgp-conda-env
+  MAMBA_ROOT=/mnt/efs/{{.ctx.user_email}}/_deepgp-mamba-root
+  PIP_CACHE=/mnt/efs/{{.ctx.user_email}}/_deepgp-pip-cache
+  mkdir -p "$MAMBA_ROOT" "$PIP_CACHE"
+  export HOME="$MAMBA_ROOT"
+  export MAMBA_ROOT_PREFIX="$MAMBA_ROOT"
+  export CONDA_PKGS_DIRS="$MAMBA_ROOT/pkgs"
+
+  IMAGE="docker://{{.runtime.base_image}}"
+
+  apptainer exec --nv --bind /mnt/efs "$IMAGE" bash -c "
+    set -euo pipefail
+    if [ ! -x '$CONDA_ENV/bin/python' ]; then
+      mamba create -y -p '$CONDA_ENV' -c conda-forge python=3.8 pip
+    fi
+    export PATH='$CONDA_ENV/bin':\$PATH
+    if ! '$CONDA_ENV/bin/python' -c 'import torch, dgl, fastNLP, transformers' 2>/dev/null; then
+      '$CONDA_ENV/bin/pip' install --quiet --cache-dir '$PIP_CACHE' \
+        torch==2.0.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+      '$CONDA_ENV/bin/pip' install --quiet --cache-dir '$PIP_CACHE' \
+        dgl==1.1.3+cu118 -f https://data.dgl.ai/wheels/cu118/repo.html
+      '$CONDA_ENV/bin/pip' install --quiet --cache-dir '$PIP_CACHE' \
+        fastNLP==0.6.0 transformers==4.12.5 torchinfo==1.7.1 \
+        bidict==0.22.0 pandas==1.5.3 numpy==1.23.5 \
+        pyteomics==4.4.2 scikit-learn==1.0.2 \
+        pytorch-lightning==2.0.6 pytorch-memlab==0.2.4 ipdb GitPython
+    fi
+  "
+
+  # ---- Stage input into DeepGP's expected layout ----
+  STAGE_ROOT="$OUTPUT_DIR/deepgp_stage"
+  STAGE_RUN="$STAGE_ROOT/$MODEL_ORG/run"
+  STAGE_MGF="$STAGE_RUN/mgf"
+  mkdir -p "$STAGE_MGF"
+  cp "$PGLYCO3_TSV" "$STAGE_RUN/pGlycoDB-GP-FDR-Pro.txt"
+  for f in "$MGF_DIR"/*.mgf; do
+    [ -e "$f" ] || continue
+    ln -sf "$f" "$STAGE_MGF/$(basename "$f")"
+  done
+  STAGED_MGF_COUNT=$(find "$STAGE_MGF" -name '*.mgf' | wc -l | tr -d ' ')
+  [ "$STAGED_MGF_COUNT" -gt 0 ] || { echo "[deepgp] no MGFs staged" >&2; exit 73; }
+  echo "[deepgp] staged $STAGED_MGF_COUNT MGF files into $STAGE_MGF"
+
+  DEEPGP_OUTPUT="$OUTPUT_DIR/deepgp_output"
+  mkdir -p "$DEEPGP_OUTPUT"
+
+  # ---- Step A: 1_dataset_format.py (CPU-bound, ~5 min for 20k PSMs) ----
+  apptainer exec --nv --bind /mnt/efs "$IMAGE" bash -c "
+    set -euo pipefail
+    export PATH='$CONDA_ENV/bin':\$PATH
+    cd '$DEEPGP_REPO'
+    '$CONDA_ENV/bin/python' 1_dataset_format.py \
+      --datafold '$STAGE_RUN/' \
+      --dfname pGlycoDB-GP-FDR-Pro.txt \
+      --mgfdatafold mgf \
+      --output_name run_data_1st.csv \
+      --dup Retained_all \
+      --mgfsourceorign MsConvert
+  " 2>&1 | tee -a "$OUTPUT_DIR/stdout.log"
+
+  [ -f "$STAGE_RUN/run_data_1st.csv" ] || { echo "[deepgp] step A produced no features CSV" >&2; exit 74; }
+
+  # ---- Step B: 3_replace_predict_byBY.py (GPU, ~25 spectra/sec on 3090) ----
+  apptainer exec --nv --bind /mnt/efs "$IMAGE" bash -c "
+    set -euo pipefail
+    export PATH='$CONDA_ENV/bin':\$PATH
+    export TRANSFORMERS_OFFLINE=0
+    cd '$DEEPGP_REPO'
+    '$CONDA_ENV/bin/python' 3_replace_predict_byBY.py \
+      --trainpathcsv '$STAGE_RUN/run_data_1st.csv' \
+      --datafold '$STAGE_RUN/' \
+      --bestmodelpath '$ORG_MODEL' \
+      --DeepFLR_modelpath '$DEEPFLR_DIR' \
+      --savename run_scored \
+      --ms2_method '$MS2_METHOD' \
+      --postprocessing on \
+      --device 0
+  " 2>&1 | tee -a "$OUTPUT_DIR/stdout.log"
+
+  PERFRAG_CSV="$STAGE_RUN/test_replace_predict/run_scored_predictmonomz.csv"
+  PERPSM_CSV="$STAGE_RUN/test_replace_predict/run_scored_nointensity_predictmonomz.csv"
+  [ -f "$PERFRAG_CSV" ] || { echo "[deepgp] step B produced no per-fragment CSV" >&2; exit 75; }
+  [ -f "$PERPSM_CSV" ]  || { echo "[deepgp] step B produced no per-PSM CSV" >&2; exit 76; }
+  cp "$PERFRAG_CSV" "$DEEPGP_OUTPUT/predictmonomz.csv"
+  cp "$PERPSM_CSV"  "$DEEPGP_OUTPUT/nointensity_predictmonomz.csv"
+
+  # ---- Step C: custom FDR epilogue (target-decoy on DeepGP score + MM q-value combined) ----
+  EPILOGUE="$OUTPUT_DIR/fdr_epilogue.py"
+  cat > "$EPILOGUE" <<'__EPI_PY_EOF__'
+  import json
+  import os
+  import pathlib
+  import sys
+  from datetime import datetime, timezone
+
+  import pandas as pd
+
+  STAGE_RUN = pathlib.Path(os.environ["STAGE_RUN"])
+  PSM_OUT = pathlib.Path(os.environ["PSM_OUT"])
+  UPLIFT_OUT = pathlib.Path(os.environ["UPLIFT_OUT"])
+  FDR_CUT = float(os.environ["RESCORED_FDR"])
+
+  pglyco = pd.read_csv(STAGE_RUN / "pGlycoDB-GP-FDR-Pro.txt", sep="\t")
+  scored = pd.read_csv(STAGE_RUN / "test_replace_predict" / "run_scored_nointensity_predictmonomz.csv")
+  print(f"pglyco input rows: {len(pglyco)}", flush=True)
+  print(f"deepgp scored rows: {len(scored)}", flush=True)
+
+  # Join: DeepGP outputs `_id` which is the iden_pep key — also exposes
+  # `PEP.StrippedSequence` and `PlausibleStruct` for redundancy. We join
+  # on (PEP.StrippedSequence == Peptide after J→N collapse, PlausibleStruct, charge).
+  pglyco["_join_pep"] = pglyco["Peptide"].str.replace("J", "N", regex=False)
+  scored = scored.rename(columns={"PEP.StrippedSequence": "_join_pep", "charge": "Charge"})
+  joined = pglyco.merge(
+      scored[["_join_pep", "PlausibleStruct", "Charge", "metric"]],
+      on=["_join_pep", "PlausibleStruct", "Charge"],
+      how="left",
+  )
+  joined["deepgp_metric"] = joined["metric"].fillna(0.0)
+  joined = joined.drop(columns=["metric", "_join_pep"])
+  print(f"joined: {len(joined)} (with DeepGP score: {(joined['deepgp_metric']>0).sum()})", flush=True)
+
+  # Combined score = DeepGP metric * (1 - MM q-value). Higher = better.
+  joined["combined_score"] = joined["deepgp_metric"] * (1.0 - joined["TotalFDR"].astype(float))
+
+  # Target-decoy FDR sweep on combined score (descending).
+  joined = joined.sort_values("combined_score", ascending=False).reset_index(drop=True)
+  joined["cum_decoys"] = joined["Decoy"].astype(int).cumsum()
+  joined["cum_total"] = pd.Series(range(1, len(joined) + 1))
+  joined["rescored_fdr"] = joined["cum_decoys"] / joined["cum_total"]
+  # q-value: monotonic-min from below (so it never decreases as we descend)
+  joined["rescored_qvalue"] = joined["rescored_fdr"][::-1].cummin()[::-1]
+
+  passing = joined[(joined["rescored_qvalue"] <= FDR_CUT) & (joined["Decoy"] == 0)]
+  n_mm_passing = int(((joined["TotalFDR"].astype(float) <= FDR_CUT) & (joined["Decoy"] == 0)).sum())
+  n_rescored_passing = int(len(passing))
+  uplift_abs = n_rescored_passing - n_mm_passing
+  uplift_pct = (uplift_abs / n_mm_passing * 100.0) if n_mm_passing > 0 else None
+
+  joined.to_csv(PSM_OUT, sep="\t", index=False)
+  print(f"wrote: {PSM_OUT} ({len(joined)} rows)", flush=True)
+
+  summary = {
+      "schema_version": 1,
+      "produced_at": datetime.now(timezone.utc).isoformat(),
+      "rescored_fdr_cutoff": FDR_CUT,
+      "input_rows": int(len(pglyco)),
+      "input_targets": int((pglyco["Decoy"] == 0).sum()),
+      "input_decoys": int((pglyco["Decoy"] == 1).sum()),
+      "joined_with_deepgp_score": int((joined["deepgp_metric"] > 0).sum()),
+      "mm_only_psms_at_cutoff": n_mm_passing,
+      "rescored_psms_at_cutoff": n_rescored_passing,
+      "uplift_absolute": uplift_abs,
+      "uplift_pct": uplift_pct,
+  }
+  UPLIFT_OUT.write_text(json.dumps(summary, indent=2))
+  print(json.dumps(summary, indent=2), flush=True)
+  print("DONE", flush=True)
+  __EPI_PY_EOF__
+
+  export STAGE_RUN PSM_OUT="$OUTPUT_DIR/rescored_psms.tsv" UPLIFT_OUT="$OUTPUT_DIR/uplift_summary.json" RESCORED_FDR
+  apptainer exec --bind /mnt/efs "$IMAGE" \
+    "$CONDA_ENV/bin/python" "$EPILOGUE" 2>&1 | tee -a "$OUTPUT_DIR/stdout.log"

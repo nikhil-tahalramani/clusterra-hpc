@@ -1,0 +1,212 @@
+id: metamorpheus-n-glyco
+name: MetaMorpheus GlycoSearchTask (N-glycopeptides)
+description: |
+  Step 3a of the `glyco-mapps-complete` chain. Database search for
+  N-linked glycopeptides using MetaMorpheus 1.1.7 GlycoSearchTask
+  (Smith Lab, Wisconsin; MIT). Ships 182 human N-glycans as the
+  built-in panel.
+
+  Auto-discovers `step-prep/mzml/` and `step-qc/passing_scans.mgf` from
+  the workflow run directory. Searches against the user-supplied FASTA
+  (default: UniProt human reviewed + decoy) and emits `AllPSMs.psmtsv`
+  + per-quantified-peak TSV.
+
+  Container source: `ghcr.io/smith-chem-wisc/metamorpheus:1.1.7` is the
+  declared image. If that 404s at registry probe (per the
+  template_image_uri_lessons memory), the script falls back to a
+  `dotnet publish` source build on EFS via the apptainer-exec-compile
+  pattern (autodock-gpu precedent).
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [MetaMorpheus]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://ghcr.io/smith-chem-wisc/metamorpheus:1.1.7
+  notes: |
+    Primary path: pull the GHCR image (verify v2 manifest at runtime).
+    Fallback path: pull docker://mcr.microsoft.com/dotnet/sdk:8.0, clone
+    smith-chem-wisc/MetaMorpheus@1.1.7, dotnet publish into
+    /mnt/efs/refs/metamorpheus/1.1.7/bin/, then exec the host CmdMetaMorpheus
+    binary via the SDK image at runtime.
+
+    See the de-risk spike result in
+    internal design notes for which path is
+    active on clusde74 as of build time.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=64G
+  #SBATCH --time=4:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: mzml_dir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Directory of .mzML files. If empty, auto-discovers
+      `step-prep/mzml/` from the workflow run dir.
+  - key: protein_fasta
+    role: fasta_db
+    required: false
+    default: /mnt/efs/glyco-mapps-complete/datasets/uniprot-human/human_sprot_iso_td.fasta
+    description: |
+      Search database (target + decoy concat). UniProt human Swiss-Prot +
+      isoforms with reversed-decoy expansion is the catalog default.
+
+parameters:
+  - key: instrument_class
+    widget: enum
+    options: [orbitrap_hcd, orbitrap_ethcd, timstof_pasef]
+    default: orbitrap_hcd
+    description: |
+      Sets MetaMorpheus's fragmentation params via the bundled
+      .toml task profiles: HCD or EThcD on Orbitraps, PASEF for timsTOF.
+  - key: fdr_threshold
+    widget: number
+    default: 0.01
+    min: 0.001
+    max: 0.10
+    description: PSM-level FDR cutoff (q-value) for the filtered output.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-{{.ctx.step_id}}"
+  artifacts:
+    - key: psms
+      path: "{{.outputs.dir}}/Task1-GlycoSearchTask/AllPSMs.psmtsv"
+      role: primary_output
+    - key: peaks
+      path: "{{.outputs.dir}}/Task1-GlycoSearchTask/AllQuantifiedPeaks.tsv"
+      role: generic
+    - key: results_txt
+      path: "{{.outputs.dir}}/Task1-GlycoSearchTask/results.txt"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  MZML_DIR_IN={{.inputs.mzml_dir | quote}}
+  FASTA={{.inputs.protein_fasta | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  INSTRUMENT={{.params.instrument_class | quote}}
+  FDR={{.params.fdr_threshold}}
+
+  mkdir -p "$OUTPUT_DIR"
+  WORKFLOW_DIR=$(dirname "$OUTPUT_DIR")
+  if [ -z "$MZML_DIR_IN" ]; then
+    MZML_DIR_IN=$(find "$WORKFLOW_DIR" -maxdepth 2 -type d -name 'mzml' 2>/dev/null | head -1)
+  fi
+  [ -d "$MZML_DIR_IN" ] || { echo "mzml_dir not found: $MZML_DIR_IN" >&2; exit 1; }
+  [ -r "$FASTA" ] || { echo "protein_fasta not readable: $FASTA" >&2; exit 1; }
+
+  # Stage FASTA to a job-private dir so parallel MM tasks (e.g. N-glyco and
+  # O-pair) don't collide on the shared `DatabaseIndex/` MM creates next to
+  # the FASTA. Hardlink (zero-disk) if same filesystem; cp otherwise.
+  FASTA_WORKDIR="$OUTPUT_DIR/fasta-workdir"
+  mkdir -p "$FASTA_WORKDIR"
+  STAGED_FASTA="$FASTA_WORKDIR/$(basename "$FASTA")"
+  if [ ! -e "$STAGED_FASTA" ]; then
+    ln "$FASTA" "$STAGED_FASTA" 2>/dev/null || cp "$FASTA" "$STAGED_FASTA"
+  fi
+  FASTA="$STAGED_FASTA"
+
+  # Cache SIFs on NVMe.
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"
+  mkdir -p "$APPTAINER_CACHEDIR"
+
+  PRIMARY_IMAGE="docker://ghcr.io/smith-chem-wisc/metamorpheus:1.1.7"
+  # Pre-built MM 1.1.7 may live either directly under
+  # /mnt/efs/refs/metamorpheus/1.1.7/ (one-shot publish) or under that dir's
+  # bin/ subfolder (template-built layout). Probe both.
+  FALLBACK_BIN_TOP=/mnt/efs/refs/metamorpheus/1.1.7/CMD.dll
+  FALLBACK_BIN_SUB=/mnt/efs/refs/metamorpheus/1.1.7/bin/CMD.dll
+  if [ -f "$FALLBACK_BIN_TOP" ]; then FALLBACK_BIN="$FALLBACK_BIN_TOP"; else FALLBACK_BIN="$FALLBACK_BIN_SUB"; fi
+  SDK_SIF=/mnt/efs/_apt-sifs/dotnet-sdk-8.0.sif
+
+  # ----- Pick execution path -----
+  MM_PATH=""
+  if apptainer exec "$PRIMARY_IMAGE" CMD.dll --version >/dev/null 2>&1; then
+    MM_PATH=container
+  elif apptainer exec "$PRIMARY_IMAGE" CmdMetaMorpheus --version >/dev/null 2>&1; then
+    MM_PATH=container_legacy
+  elif [ -f "$FALLBACK_BIN" ]; then
+    MM_PATH=efs_build
+  else
+    echo "[mm] no primary image and no EFS build — staging EFS build (one-time, ~10-15 min)"
+    mkdir -p /mnt/efs/refs/metamorpheus/1.1.7/src /mnt/efs/refs/metamorpheus/1.1.7/bin
+    [ -f "$SDK_SIF" ] || apptainer pull "$SDK_SIF" docker://mcr.microsoft.com/dotnet/sdk:8.0 2>&1 | tail -3
+    (
+      flock -x 9
+      if [ ! -f "$FALLBACK_BIN" ]; then
+        apptainer exec --bind /mnt/efs "$SDK_SIF" bash -c "
+          set -euo pipefail
+          cd /mnt/efs/refs/metamorpheus/1.1.7/src
+          if [ ! -d MetaMorpheus ]; then
+            git clone --depth=1 --branch=1.1.7 https://github.com/smith-chem-wisc/MetaMorpheus.git
+          fi
+          cd MetaMorpheus/CMD
+          dotnet publish -c Release -o /mnt/efs/refs/metamorpheus/1.1.7/bin
+        "
+      fi
+    ) 9>/mnt/efs/refs/metamorpheus/1.1.7/build.lock
+    MM_PATH=efs_build
+  fi
+  echo "[mm] execution path: $MM_PATH"
+
+  # ----- Write GlycoSearchTask TOML -----
+  TASKDIR="$OUTPUT_DIR/tasks"
+  mkdir -p "$TASKDIR"
+  TOML="$TASKDIR/GlycoSearchTask.toml"
+  case "$INSTRUMENT" in
+    orbitrap_hcd)    DISS=HCD ;;
+    orbitrap_ethcd)  DISS=EThcD ;;
+    timstof_pasef)   DISS=HCD ;;
+    *)               DISS=HCD ;;
+  esac
+  # MM ships its built-in N-glycan database with the published binaries; use
+  # that as the default. If the file isn't found, the search returns 0 glyco-
+  # PSMs (MM falls back to plain peptide search), which is a silent footgun.
+  NGLYCAN_GDB="/mnt/efs/refs/metamorpheus/1.1.7/Glycan_Mods/NGlycan/NGlycan.gdb"
+  [ -r "$NGLYCAN_GDB" ] || { echo "[mm] N-glycan DB not found: $NGLYCAN_GDB" >&2; exit 1; }
+  # MM 1.1.7's Nett TOML schema is strict — DigestionParams / ListOfMods*
+  # expect structured tables, not strings. We rely on MM defaults for those
+  # (trypsin / carbamidomethyl-C / oxidation-M is the default anyway).
+  cat > "$TOML" <<TOMLEOF
+  TaskType = "GlycoSearch"
+  [GlycoSearchParameters]
+  GlycoSearchType = "NGlyco"
+  GlycoSearchTopNum = 50
+  MaximumOGlycanAllowed = 0
+  MaximumNGlycanAllowed = 2
+  OxoniumIonFilt = true
+  OGlycanDatabasefile = ""
+  NGlycanDatabasefile = "${NGLYCAN_GDB}"
+  [CommonParameters]
+  TaskDescriptor = "GlycoSearch_N"
+  DissociationType = "$DISS"
+  PrecursorMassTolerance = "10.0 PPM"
+  ProductMassTolerance = "20.0 PPM"
+  TOMLEOF
+
+  # ----- Run -----
+  case "$MM_PATH" in
+    container)
+      exec apptainer exec --bind /mnt/efs "$PRIMARY_IMAGE" \
+        CMD.dll -t "$TOML" -s "$MZML_DIR_IN" -d "$FASTA" -o "$OUTPUT_DIR"
+      ;;
+    container_legacy)
+      exec apptainer exec --bind /mnt/efs "$PRIMARY_IMAGE" \
+        CmdMetaMorpheus -t "$TOML" -s "$MZML_DIR_IN" -d "$FASTA" -o "$OUTPUT_DIR"
+      ;;
+    efs_build)
+      exec apptainer exec --bind /mnt/efs "$SDK_SIF" \
+        dotnet "$FALLBACK_BIN" -t "$TOML" -s "$MZML_DIR_IN" -d "$FASTA" -o "$OUTPUT_DIR"
+      ;;
+  esac

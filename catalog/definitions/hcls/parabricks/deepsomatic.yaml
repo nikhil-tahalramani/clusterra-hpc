@@ -1,0 +1,258 @@
+id: parabricks-deepsomatic
+name: Parabricks DeepSomatic (GPU, tumor-normal)
+description: |
+  GPU-accelerated somatic SNV/indel calling via NVIDIA Parabricks
+  `pbrun deepsomatic`. Same DeepSomatic model weights as Google's CPU reference —
+  ~10–15× faster on a single A10G. Chain off a sarek somatic prep run.
+vertical: hcls
+category: variant-calling
+workload_group: genomics
+modality: form
+tools: [Parabricks, DeepSomatic]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: nvcr.io/nvidia/clara/clara-parabricks:4.5.1-1
+  notes: |
+    Pinned to 4.5.1-1 (matches parabricks-deepvariant template). Parabricks
+    4.6.0-1 has a SIGSEGV during deepsomatic model init / inference that
+    reproduced on chain 8cedf49f job 2274 (2026-05-14) — `Received signal: 11`
+    ~22 s after DeepSomatic started, exit 255, 0-byte VCF. Same image-version
+    gate as the documented 4.6 deepvariant ONT routing bug. resources.requeue
+    is retained for genuine node failures but does not auto-retry the SIGSEGV
+    (slurmctld only requeues on signaled exit, not on exit-non-zero from the
+    binary).
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=12
+  #SBATCH --mem=64G
+  #SBATCH --time=1:30:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+  #SBATCH --requeue
+inputs:
+  - key: tumor_bam
+    role: bam
+    required: false
+    default: ""
+    description: |
+      Recalibrated tumor BAM/CRAM from sarek somatic-tn run. When running as a
+      chained step in MAPPs Complete, leave empty: the script auto-discovers
+      step-*-sarek/preprocessing/recalibrated/<tumor_sample>/recal.bam from the
+      sibling workflow directory.
+  - key: tumor_bai
+    role: generic_path
+    required: false
+    default: ""
+    description: Optional. If empty, derived as <tumor_bam>.bai (or .crai).
+  - key: normal_bam
+    role: bam
+    required: false
+    default: ""
+    description: |
+      Matched-normal recalibrated BAM/CRAM for the same patient. Auto-discovered
+      from sibling step-*-sarek output when empty (see tumor_bam).
+  - key: normal_bai
+    role: generic_path
+    required: false
+    default: ""
+    description: Optional. If empty, derived as <normal_bam>.bai (or .crai).
+  - key: reference_fasta
+    role: reference_fasta
+    required: false
+    default: /mnt/s3-refs/igenomes/Homo_sapiens/GATK/GRCh38/Sequence/WholeGenomeFasta/Homo_sapiens_assembly38.fasta
+    description: Reference genome FASTA (with .fai sibling).
+  - key: intervals_bed
+    role: generic_path
+    required: false
+    default: ""
+    description: Optional regions BED. Empty = whole genome.
+
+parameters:
+  - key: tumor_sample
+    widget: text
+    default: TUMOR
+    description: |
+      Sample name used for sibling-step auto-discovery: the script looks for
+      step-*-sarek/preprocessing/recalibrated/<tumor_sample>/recal.bam under
+      the workflow root. Ignored when tumor_bam is provided explicitly.
+  - key: normal_sample
+    widget: text
+    default: NORMAL
+    description: |
+      Sample name for the matched normal — see tumor_sample. Ignored when
+      normal_bam is provided explicitly.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/pbrun-ds-{{.ctx.run_id}}"
+  artifacts:
+    - key: vcf
+      path: "{{.outputs.dir}}/somatic.vcf.gz"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  # resolve_bai: pick the first existing index sibling for a BAM/CRAM.
+  # nf-core/sarek's `test` profile emits CRAM with a `.cram.bai` index (it
+  # symlinks the markduplicates `.bai` rather than re-indexing); production
+  # sarek runs emit `.bai` for BAMs and `.crai` for CRAMs. Try every plausible
+  # extension so both layouts work.
+  resolve_bai() {
+    local bam="$1" bai="$2"
+    if [ -n "$bai" ]; then echo "$bai"; return; fi
+    case "$bam" in
+      *.cram)
+        for ext in .crai .cram.crai .bai .cram.bai; do
+          [ -r "${bam%.cram}${ext}" ] && { echo "${bam%.cram}${ext}"; return; }
+          [ -r "${bam}${ext}" ]       && { echo "${bam}${ext}"; return; }
+        done
+        ;;
+      *.bam)
+        for ext in .bai .bam.bai; do
+          [ -r "${bam%.bam}${ext}" ] && { echo "${bam%.bam}${ext}"; return; }
+          [ -r "${bam}${ext}" ]       && { echo "${bam}${ext}"; return; }
+        done
+        ;;
+      *)
+        echo "BAM must end in .bam or .cram (got: $bam)" >&2; exit 1 ;;
+    esac
+    echo "${bam}.bai"  # last-resort default; readability check below will fail
+  }
+
+  TUMOR_BAM={{.inputs.tumor_bam | quote}}
+  NORMAL_BAM={{.inputs.normal_bam | quote}}
+  OUTPUT_DIR_RAW={{.outputs.dir | quote}}
+  TUMOR_SAMPLE={{.params.tumor_sample | quote}}
+  NORMAL_SAMPLE={{.params.normal_sample | quote}}
+  REF_FASTA={{.inputs.reference_fasta | quote}}
+
+  # Workflow auto-discovery (when chained from sarek-wes-somatic): the engine
+  # rewrites outputs.dir to $WORKFLOW_DIR/step-N-deepsomatic. Walk up to the
+  # workflow root and find sibling step-*-sarek recal BAMs/CRAMs.
+  #
+  # Strategy (backwards-compatible with production tumor-normal layouts):
+  #   1. Try canonical `{tumor_sample,normal_sample}/recal.bam` (production).
+  #   2. Glob `*/recal.{bam,cram}` under every sibling step-*-sarek. If exactly
+  #      two are found, treat sort-order[0] as normal, [1] as tumor (the test
+  #      profile and most somatic samplesheets sort NORMAL < TUMOR alphabetically).
+  #   3. If only one is found, self-pair it as both tumor and normal. This is
+  #      a degenerate case used for end-to-end chain demos against the nf-core
+  #      sarek `test` profile (single-sample chr22 fixture); a real production
+  #      run will always have 2+ samples and never hit this branch.
+  if [ -z "$TUMOR_BAM" ] || [ -z "$NORMAL_BAM" ]; then
+    WF_ROOT=$(dirname "$OUTPUT_DIR_RAW")
+    # Pass 1: canonical sample-name layout
+    for sarek_dir in "$WF_ROOT"/step-*-sarek; do
+      [ -d "$sarek_dir/preprocessing/recalibrated" ] || continue
+      for ext in bam cram; do
+        cand_tumor="$sarek_dir/preprocessing/recalibrated/$TUMOR_SAMPLE/recal.$ext"
+        cand_normal="$sarek_dir/preprocessing/recalibrated/$NORMAL_SAMPLE/recal.$ext"
+        [ -z "$TUMOR_BAM" ]  && [ -r "$cand_tumor" ]  && TUMOR_BAM="$cand_tumor"
+        [ -z "$NORMAL_BAM" ] && [ -r "$cand_normal" ] && NORMAL_BAM="$cand_normal"
+      done
+      [ -n "$TUMOR_BAM" ] && [ -n "$NORMAL_BAM" ] && break
+    done
+    # Pass 2: glob fallback. Some sarek profiles (notably `test`) use a single
+    # `test` subdir with `test.recal.cram` (file is `<sample>.recal.<ext>`,
+    # not `recal.<ext>` — accommodate both).
+    if [ -z "$TUMOR_BAM" ] || [ -z "$NORMAL_BAM" ]; then
+      mapfile -t FOUND < <(
+        for sarek_dir in "$WF_ROOT"/step-*-sarek; do
+          [ -d "$sarek_dir/preprocessing/recalibrated" ] || continue
+          find "$sarek_dir/preprocessing/recalibrated" -mindepth 2 -maxdepth 2 \
+            \( -name 'recal.bam' -o -name 'recal.cram' \
+               -o -name '*.recal.bam' -o -name '*.recal.cram' \) \
+            2>/dev/null | sort
+        done
+      )
+      case "${#FOUND[@]}" in
+        0) ;;
+        1)
+          [ -z "$TUMOR_BAM"  ] && TUMOR_BAM="${FOUND[0]}"
+          [ -z "$NORMAL_BAM" ] && NORMAL_BAM="${FOUND[0]}"
+          echo "WARN: only one recal alignment found; self-pairing as tumor+normal" >&2
+          echo "WARN: this is the sarek test-profile shape; production runs require 2 samples" >&2
+          ;;
+        *)
+          [ -z "$NORMAL_BAM" ] && NORMAL_BAM="${FOUND[0]}"
+          [ -z "$TUMOR_BAM"  ] && TUMOR_BAM="${FOUND[-1]}"
+          ;;
+      esac
+    fi
+    if [ -z "$TUMOR_BAM" ] || [ -z "$NORMAL_BAM" ]; then
+      echo "tumor_bam/normal_bam empty and could not auto-discover from $WF_ROOT/step-*-sarek" >&2
+      echo "looked for: preprocessing/recalibrated/{$TUMOR_SAMPLE,$NORMAL_SAMPLE}/recal.{bam,cram}" >&2
+      echo "and: preprocessing/recalibrated/*/{recal,*.recal}.{bam,cram}" >&2
+      exit 1
+    fi
+    echo "auto-discovered tumor_bam=$TUMOR_BAM"
+    echo "auto-discovered normal_bam=$NORMAL_BAM"
+  fi
+
+  # Reference auto-discovery: when chained against sarek's `test` profile, the
+  # default iGenomes GRCh38 fasta is not on EFS (the test profile uses a small
+  # chr22 fixture staged into the nextflow workdir). If the configured ref
+  # isn't readable, walk the sarek nextflow workdirs for `genome.fasta`.
+  if [ ! -r "$REF_FASTA" ]; then
+    echo "WARN: configured reference_fasta not readable: $REF_FASTA" >&2
+    WF_ROOT=${WF_ROOT:-$(dirname "$OUTPUT_DIR_RAW")}
+    # nf-core/sarek stages its test reference under /mnt/efs/work-<jobid>/stage-*/
+    # ($NXF_WORKDIR for the parent sarek step). We don't know <jobid> here, so
+    # glob for the staged genome.fasta. Prefer one with a .fai sibling.
+    CAND=$(find /mnt/efs -maxdepth 5 -path '*/stage-*/*/genome.fasta' 2>/dev/null \
+             | while read -r f; do
+                 fai=$(find "$(dirname "$(dirname "$f")")" -name 'genome.fasta.fai' 2>/dev/null | head -1)
+                 [ -n "$fai" ] && echo "$f"
+               done | head -1)
+    if [ -n "$CAND" ] && [ -r "$CAND" ]; then
+      REF_FASTA="$CAND"
+      echo "auto-discovered reference_fasta=$REF_FASTA (sarek test-profile fixture)"
+    fi
+  fi
+
+  TUMOR_BAI=$(resolve_bai "$TUMOR_BAM" {{.inputs.tumor_bai | quote}})
+  NORMAL_BAI=$(resolve_bai "$NORMAL_BAM" {{.inputs.normal_bai | quote}})
+
+  for f in "$TUMOR_BAM" "$TUMOR_BAI" "$NORMAL_BAM" "$NORMAL_BAI" "$REF_FASTA"; do
+    [ -r "$f" ] || { echo "input not readable: $f" >&2; exit 1; }
+  done
+
+  # Parabricks needs the .fai sibling next to the fasta. If only the staged
+  # workdir copy has it, stage both into TMPDIR so apptainer can bind them.
+  REF_FAI="${REF_FASTA}.fai"
+  REF_DICT="${REF_FASTA%.fasta}.dict"
+  [ -r "$REF_FAI" ] || REF_FAI=$(find "$(dirname "$(dirname "$REF_FASTA")")" -name 'genome.fasta.fai' 2>/dev/null | head -1)
+  [ -r "$REF_DICT" ] || REF_DICT=$(find "$(dirname "$(dirname "$REF_FASTA")")" -name 'genome.dict' 2>/dev/null | head -1)
+  if [ -n "$REF_FAI" ] && [ ! -r "${REF_FASTA}.fai" ]; then
+    STAGED_REF="$TMPDIR/ref/$(basename "$REF_FASTA")"
+    mkdir -p "$TMPDIR/ref"
+    cp -f "$REF_FASTA" "$STAGED_REF"
+    cp -f "$REF_FAI"   "${STAGED_REF}.fai"
+    [ -r "$REF_DICT" ] && cp -f "$REF_DICT" "${STAGED_REF%.fasta}.dict"
+    REF_FASTA="$STAGED_REF"
+    echo "staged reference + .fai into $TMPDIR/ref for parabricks"
+  fi
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  chmod 1777 "$OUTPUT_DIR" 2>/dev/null || true
+  OUTPUT_VCF="$OUTPUT_DIR/somatic.vcf.gz"
+  INTERVALS={{.inputs.intervals_bed | quote}}
+
+  ARGS=(
+    --ref            "$REF_FASTA"
+    --in-tumor-bam   "$TUMOR_BAM"
+    --in-normal-bam  "$NORMAL_BAM"
+    --out-variants   "$OUTPUT_VCF"
+    --tmp-dir        "$TMPDIR"
+  )
+  [ -n "$INTERVALS" ] && ARGS+=( --interval-file "$INTERVALS" )
+
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" \
+    "docker://{{.runtime.image}}" \
+    pbrun deepsomatic "${ARGS[@]}"

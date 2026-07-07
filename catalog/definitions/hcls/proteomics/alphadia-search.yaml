@@ -1,0 +1,163 @@
+id: alphadia-search
+name: AlphaDIA Per-Cell DIA Search (Array)
+description: |
+  Step 3 (primary) of the scp-dia chain. Runs AlphaDIA 1.10 (MannLabs,
+  Apache-2.0) on one mzML / hdf per Slurm array task — the hot-path
+  fan-out that delivers the case-study throughput (1000 cells × ~10 min
+  / 64-wide ≈ 2h36m on plexDIA mTRAQ-3).
+
+  Inputs auto-discovered from the upstream chain:
+    - Spectral library at $WORKFLOW_DIR/step-2-predict-library/library.speclib
+    - mzML files at $WORKFLOW_DIR/step-1-rawconvert/mzml/
+  Override via input keys when launched standalone.
+
+  Runtime: official `mannlabs/alphadia:latest` from Docker Hub (verified
+  May 20 2026 on clusde74 job 2427 — `import alphadia` + `alphadia
+  --version` returns 2.1.1 in 7m16s including SIF conversion of a ~6 GB
+  image; cached at /mnt/efs/_apptainer-cache). Subsequent array tasks hit
+  the SIF cache — no per-task build cost. NOTE: schema upgraded to v2.x;
+  `from alphadia import planning` removed upstream, use `alphadia` CLI.
+
+  Per-cell wall-clock target: 8-15 min. Default memory of 48 GB / r6i.2xlarge
+  reflects AlphaDIA's transfer-learning RAM blowup observed in the wedge
+  research; downsize to c6i.2xlarge (16 GB) only after a calibration spike
+  on the specific cohort — `dia-nn` fallback (sibling template) is the OOM
+  escape hatch.
+
+  Output convention: per-cell precursor.tsv + parquet under
+  $WORKFLOW_DIR/step-3-dia-search/cells/<cell_id>/. Step-4 (plex-demux or
+  passthrough) auto-discovers.
+
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [AlphaDIA]
+ready: false
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://mannlabs/alphadia@sha256:ae4e3957ed7bb394e7eb272046aeb9f6f76d4e82a2143851e8babc903bdd0a5c
+  notes: |
+    Apache-2.0. Upstream official container (verified clusde74 job 2427).
+    Heavy RAM profile (32-64 GB/cell) — default sbatch asks 48 G; do not
+    drop below 32 G without a calibration spike. CPU-only; no GPU
+    dependency. alphadia 2.1.1 CLI is `alphadia --config <config.yaml>`.
+    Digest pin: mannlabs/alphadia:latest as of 2026-04-17 (Docker Hub).
+    Re-resolve with `docker manifest inspect mannlabs/alphadia:latest`
+    before bumping.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=48G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+  {{- if gt (int .params.cell_count) 1 }}
+  #SBATCH --array=1-{{.params.cell_count}}%{{.params.max_concurrent}}
+  {{- end }}
+
+inputs:
+  - key: cell_manifest
+    role: generic_path
+    required: true
+    description: |
+      TSV file with columns: mzml_path \t cell_id \t channel. One row per
+      cell — `awk NR==SLURM_ARRAY_TASK_ID` selects the cell to search.
+      Built by step-0 (manifest renderer) from raw_dir + channel_design_csv,
+      OR hand-written for single-cell smoke spikes.
+  - key: library
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Spectral library .speclib. Empty = auto-discover from
+      $WORKFLOW_DIR/step-2-predict-library/library.speclib.
+
+parameters:
+  - key: cell_count
+    widget: number
+    default: 1
+    min: 1
+    max: 5000
+    description: Number of cells (= manifest rows). >1 emits #SBATCH --array=1-N.
+  - key: max_concurrent
+    widget: number
+    default: 64
+    min: 1
+    max: 256
+    description: Slurm array %K throttle.
+  - key: target_num_elution_groups
+    widget: number
+    default: 12000
+    min: 1000
+    max: 50000
+    description: AlphaDIA search.target_num_elution_groups. Lower = stricter FDR.
+  - key: thread_count
+    widget: number
+    default: 8
+    min: 1
+    max: 32
+    description: AlphaDIA general.thread_count (must match --cpus-per-task).
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/alphadia-{{.ctx.run_id}}"
+  artifacts:
+    - key: cells_dir
+      path: "{{.outputs.dir}}/cells"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  CELL_MANIFEST={{.inputs.cell_manifest | quote}}
+  OVERRIDE_LIB={{.inputs.library | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  NUM_EG={{.params.target_num_elution_groups}}
+  THREADS={{.params.thread_count}}
+
+  [ -r "$CELL_MANIFEST" ] || { echo "cell_manifest not readable: $CELL_MANIFEST" >&2; exit 1; }
+
+  STEP_DIR="${WORKFLOW_DIR:-$OUTPUT_DIR}/step-3-dia-search"
+  [ "${WORKFLOW_DIR:-}" = "" ] && STEP_DIR="$OUTPUT_DIR"
+  mkdir -p "$STEP_DIR/cells"
+
+  IDX="${SLURM_ARRAY_TASK_ID:-1}"
+  read -r MZML CELL_ID CHANNEL < <(awk -F'\t' -v i="$IDX" 'NR==i' "$CELL_MANIFEST") || true
+  if [ -z "${MZML:-}" ] || [ -z "${CELL_ID:-}" ]; then
+    echo "[ad] empty manifest row $IDX (rows? $(wc -l < "$CELL_MANIFEST"))" >&2
+    exit 0
+  fi
+  echo "[ad] task $IDX → cell=$CELL_ID mzml=$MZML channel=${CHANNEL:-na}"
+
+  # Library auto-discover
+  LIBRARY="$OVERRIDE_LIB"
+  if [ -z "$LIBRARY" ]; then
+    LIBRARY="${WORKFLOW_DIR:-}/step-2-predict-library/library.speclib"
+  fi
+  [ -r "$LIBRARY" ] || { echo "library not readable: $LIBRARY" >&2; exit 1; }
+
+  CELL_OUT="$STEP_DIR/cells/$CELL_ID"
+  mkdir -p "$CELL_OUT"
+
+  export APPTAINER_CACHEDIR=/mnt/efs/_apptainer-cache
+  export APPTAINERENV_MPLCONFIGDIR="/mnt/efs/refs/alphadia/mpl"
+  mkdir -p "$APPTAINERENV_MPLCONFIGDIR"
+
+  cat > "$CELL_OUT/config.yaml" <<YEOF
+  general:
+    thread_count: $THREADS
+  library_loading:
+    library_path: $LIBRARY
+  search:
+    target_num_elution_groups: $NUM_EG
+  raw_paths:
+    - $MZML
+  output_directory: $CELL_OUT
+  YEOF
+
+  apptainer exec "{{.runtime.image}}" alphadia --config "$CELL_OUT/config.yaml"
+
+  echo "[ad] cell $CELL_ID done; outputs at $CELL_OUT/"

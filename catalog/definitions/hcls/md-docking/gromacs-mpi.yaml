@@ -1,0 +1,164 @@
+id: gromacs-mpi
+name: GROMACS multi-simulation (gmx_mpi -multidir)
+description: Single-node multi-GPU GROMACS ensemble — N independent simulations (REMD or multi-sim) via gmx_mpi -multidir, one or more replicas per GPU.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: cli
+tools: [GROMACS, gmx_mpi, mdrun]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: ghcr.io/nikhil-tahalramani/clusterra/gromacs@sha256:28eb46241f7079e3f32829afa6457257fcc3c5b47d5b3259cb81299b332e3694
+  notes: |
+    Clusterra-built GROMACS image with the REAL MPI binary (gmx_mpi) + CUDA —
+    required for `mdrun -multidir` (replica exchange / multi-simulation). No
+    upstream GPU image ships gmx_mpi: the NGC (nvcr.io/hpc/gromacs) and Docker
+    Hub (gromacs/gromacs) GPU images are thread-MPI only. Built from
+    core/images/clusterra-gromacs/Dockerfile (GROMACS 2024.4, nvidia/cuda
+    12.6-devel base, OpenMPI 4.1.2, CUDA sm_86). gmx_mpi is on PATH — call it
+    directly via `apptainer exec --nv` (no GMXRC sourcing needed, unlike the
+    NGC image).
+
+    LAUNCH GOTCHA (load-bearing): this is single-node multi-GPU, so launch with
+    the container's OWN mpirun, and tell OpenMPI to ignore Slurm's allocator +
+    oversubscribe — Slurm hands the batch step a SINGLE task, so without
+    `--mca ras ^slurm --oversubscribe` OpenMPI aborts with "not enough slots"
+    when asked for N>1 ranks. All MPI traffic stays inside the one pod; there is
+    NO inter-node MPI (multi-node Slurm/MPI is separately gated on an
+    intra-cluster security-group rule + EFA, and GROMACS multi-node scaling
+    collapses without a fast fabric anyway — single-node multi-GPU is the
+    cost-optimal pattern: one independent sim per GPU, ~4x the efficiency of
+    splitting one sim across the box's GPUs, per Kutzner et al. 2022).
+
+    Validated on clusde74 (Jun 3 2026): 8-replica Trp-cage T-REMD on 4x A10G
+    (g5.12xlarge, 2 sims/GPU), ~53% exchange acceptance, all replicas
+    traversing the full temperature ladder; single-A10G steady-state throughput
+    ~1,547 ns/day (5 ns, -resethway) for an ~8.3k-atom system.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:{{.params.gpus}}
+  #SBATCH --cpus-per-task={{.params.cpus}}
+  #SBATCH --mem={{.params.mem_gb}}G
+  #SBATCH --time=8:00:00
+
+inputs:
+  - key: multidir_root
+    role: generic_path
+    required: true
+    description: |
+      Directory containing one subdirectory per replica, each holding a
+      production .tpr named <deffnm>.tpr (e.g. r0/md.tpr, r1/md.tpr, ...).
+      Build these upstream with `gmx grompp` per replica (one temperature /
+      lambda / seed each). The number of replicas is auto-discovered from the
+      subdirs that contain <deffnm>.tpr; it must be >= 2 and is used as the MPI
+      rank count (-np). Replicas are mapped across the requested GPUs (e.g.
+      8 replicas on 4 GPUs = 2 sims/GPU).
+
+parameters:
+  - key: deffnm
+    widget: text
+    default: md
+    description: GROMACS file stem — each replica dir must contain <deffnm>.tpr; outputs share this stem.
+  - key: replex_steps
+    widget: number
+    default: 0
+    min: 0
+    max: 100000
+    description: |
+      Replica-exchange attempt interval in steps. 0 = independent multi-sim
+      ensemble (no exchange). >0 = REMD: attempts a neighbour swap every N
+      steps (e.g. 500 = every 1 ps at dt=2 fs). Requires per-replica .tpr files
+      that differ (temperature for T-REMD); a healthy dense ladder targets
+      ~20-30% acceptance.
+  - key: gpus
+    widget: number
+    default: 4
+    min: 1
+    max: 8
+    description: GPUs to request (typed A10G GRES → g5 family). 4 = g5.12xlarge, 8 = g5.48xlarge. Replicas pack across these GPUs.
+  - key: ntomp
+    widget: number
+    default: 2
+    min: 1
+    max: 8
+    description: OpenMP threads per replica (per MPI rank). GROMACS here is GPU-bound; 2-4 saturate each A10G.
+  - key: cpus
+    widget: number
+    default: 16
+    min: 2
+    max: 48
+    description: cpus-per-task for the job (>= replicas x ntomp). Default fits g5.12xlarge.
+  - key: mem_gb
+    widget: number
+    default: 64
+    min: 8
+    max: 256
+    description: Memory request in GB.
+
+outputs:
+  dir: "{{.inputs.multidir_root}}"
+  artifacts:
+    - key: ensemble_root
+      path: "{{.inputs.multidir_root}}"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  # ── GROMACS single-node multi-GPU ensemble (gmx_mpi -multidir) ────────────
+  # Runs N independent simulations (one per replica dir) concurrently across
+  # the requested A10G GPUs. With replex_steps>0 this is temperature/Hamiltonian
+  # REMD (neighbour swaps every N steps); with replex_steps=0 it is an
+  # independent multi-simulation ensemble. MPI is intra-pod only (single node).
+  set -euo pipefail
+  ROOT={{.inputs.multidir_root | quote}}
+  DEFFNM={{.params.deffnm | quote}}
+  NTOMP={{.params.ntomp}}
+  REPLEX={{.params.replex_steps}}
+  cd "$ROOT"
+
+  # Auto-discover replica dirs that contain <deffnm>.tpr, natural-sorted.
+  DIRS=$(for d in */; do d=${d%/}; [ -f "$d/$DEFFNM.tpr" ] && echo "$d"; done | sort -V)
+  NSIM=$(printf '%s\n' "$DIRS" | grep -c . || true)
+  if [ "${NSIM:-0}" -lt 2 ]; then
+    echo "FATAL: need >= 2 replica dirs containing $DEFFNM.tpr under $ROOT (found ${NSIM:-0})."
+    echo "       Expected layout: $ROOT/<rep>/$DEFFNM.tpr  (e.g. r0/$DEFFNM.tpr, r1/$DEFFNM.tpr, ...)"
+    exit 1
+  fi
+  echo "multidir: NSIM=$NSIM replicas -> $(echo $DIRS | tr '\n' ' ')"
+  REPLEX_ARG=""
+  if [ "$REPLEX" -gt 0 ]; then REPLEX_ARG="-replex $REPLEX"; echo "REMD: exchange every $REPLEX steps"; else echo "independent multi-sim ensemble (no exchange)"; fi
+
+  # SIF cache: APPTAINER_CACHEDIR must be slurmd-local NVMe ($TMPDIR), not EFS
+  # (EFS NFSv4 rejects apptainer's 0700 chmod); pre-pulled SIF persists on EFS.
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"; mkdir -p "$APPTAINER_CACHEDIR"
+  SIF_DIR=/mnt/efs/_apt-sifs; mkdir -p "$SIF_DIR"
+  SIF="$SIF_DIR/clusterra-gromacs-dev.sif"
+  if [ ! -f "$SIF" ]; then apptainer pull "$SIF" "docker://{{.runtime.image}}" 2>&1 | tail -5; fi
+
+  # Launch: container's own mpirun, ignore Slurm RAS + oversubscribe (Slurm
+  # gives the step ONE task; without this OpenMPI refuses -np >1). GROMACS
+  # auto-maps the NSIM ranks onto the requested GPUs.
+  apptainer exec --nv \
+    --bind /mnt/efs:/mnt/efs \
+    --bind "${TMPDIR:-/tmp}:${TMPDIR:-/tmp}" \
+    "$SIF" \
+    mpirun --allow-run-as-root --mca plm ^slurm --mca ras ^slurm --oversubscribe --bind-to none \
+      -np "$NSIM" \
+      gmx_mpi mdrun -multidir $DIRS -deffnm "$DEFFNM" $REPLEX_ARG \
+                    -ntomp "$NTOMP" -nb gpu -pme gpu
+
+  # Surface headline metrics for the run record.
+  FIRST=$(printf '%s\n' "$DIRS" | head -1)
+  echo "=== replica-exchange statistics ($FIRST/$DEFFNM.log) ==="
+  grep -aA40 'Replica exchange statistics' "$FIRST/$DEFFNM.log" 2>/dev/null | head -45 \
+    || echo "(no exchange block — replex off or single-sim)"
+  echo "=== per-replica performance ==="
+  for d in $DIRS; do
+    printf '%s: ' "$d"
+    grep -aE '^Performance:' "$d/$DEFFNM.log" 2>/dev/null | tail -1 || echo "(n/a)"
+  done

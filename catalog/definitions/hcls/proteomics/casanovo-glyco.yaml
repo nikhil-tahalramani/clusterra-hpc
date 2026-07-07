@@ -1,0 +1,167 @@
+id: casanovo-glyco
+name: Casanovo de novo (glyco passing-scan subset)
+description: |
+  Step 4 of the `glyco-mapps-complete` chain. Casanovo 5.0 de novo
+  peptide sequencing (Apache-2.0, Noble Lab) on the oxonium-passing
+  MGF produced by the QC step. The backbone b/y ladder survives
+  glyco fragmentation (Yilmaz et al. 2024 supp), so Casanovo recovers
+  peptide backbones even where MetaMorpheus DB-search misses them.
+
+  Identical wrapper to the standalone `casanovo` template — the
+  difference is the chain wires `inputs.input_mgf` to
+  `step-qc/passing_scans.mgf` instead of the raw MGF, cutting GPU
+  wall-time 5-10x.
+
+  Used as the "Casanovo arm" of the two-witness join in Step 5's
+  prologue (Tier-A = MetaMorpheus N or O ∩ Casanovo backbone with
+  I/L-collapsed match + precursor mass within 20 ppm).
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [Casanovo]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: condaforge/miniforge3@sha256:e005c6b132774b4093b96af586fe46a2464efec691ebbeefd1b710d291f8a67e
+  requirements: ["casanovo==5.0.0"]
+  cache_dir: /mnt/efs/_casanovo-venv/5.0.0-cu121
+  entrypoint: python -m casanovo.casanovo
+  notes: |
+    Verbatim mirror of hcls/proteomics/casanovo.yaml runtime block. The
+    miniforge3 base + EFS conda env + pip --user pattern is required to
+    pick up rdkit's libXrender stack on cap-pod apptainer (uid 401, no
+    subuid). See cap_pod_apptainer_build_blocked memory.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:l4:1
+inputs:
+  - key: input_mgf
+    role: mgf
+    required: false
+    default: ""
+    description: |
+      MGF to call. If empty, auto-discovers
+      `step-qc/passing_scans.mgf` from the workflow run dir.
+  - key: model_path
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Optional .ckpt path. Empty = auto-download Casanovo v5 weights on
+      first run.
+
+parameters:
+  - key: mode
+    widget: enum
+    options: [sequence, evaluate]
+    default: sequence
+    description: |
+      sequence = de novo inference. evaluate = benchmark against annotated
+      MGFs and emit precision/coverage curves.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-{{.ctx.step_id}}"
+  artifacts:
+    - key: mztab
+      path: "{{.outputs.dir}}/casanovo.mztab"
+      role: primary_output
+    - key: log
+      path: "{{.outputs.dir}}/casanovo.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_MGF={{.inputs.input_mgf | quote}}
+  MODEL_PATH={{.inputs.model_path | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  MODE={{.params.mode | quote}}
+
+  mkdir -p "$OUTPUT_DIR"
+  WORKFLOW_DIR=$(dirname "$OUTPUT_DIR")
+  if [ -z "$INPUT_MGF" ]; then
+    INPUT_MGF=$(find "$WORKFLOW_DIR" -maxdepth 2 -type f -name 'passing_scans.mgf' 2>/dev/null | head -1)
+  fi
+  [ -r "$INPUT_MGF" ] || { echo "input_mgf not readable: $INPUT_MGF" >&2; exit 1; }
+  if [ -n "$MODEL_PATH" ]; then
+    [ -r "$MODEL_PATH" ] || { echo "model_path not readable: $MODEL_PATH" >&2; exit 1; }
+  fi
+
+  cd "$OUTPUT_DIR"
+
+  # Casanovo 5.0 refuses to overwrite an existing <output_root>.log or .mztab
+  # in the output dir. Wipe any leftover artifacts from a prior failed run.
+  rm -f "$OUTPUT_DIR"/casanovo.log "$OUTPUT_DIR"/casanovo.mztab "$OUTPUT_DIR"/casanovo.*
+
+  CASANOVO_VENV="/mnt/efs/{{.ctx.user_email}}/_casanovo-venv/5.0.0-cu121"
+  CASANOVO_CACHE="/mnt/efs/{{.ctx.user_email}}/_casanovo-cache"
+  mkdir -p "$CASANOVO_VENV" "$CASANOVO_CACHE"
+  export TORCH_HOME="$CASANOVO_CACHE/torch"
+  export XDG_CACHE_HOME="$CASANOVO_CACHE/xdg"
+  export PYTHONUSERBASE="$CASANOVO_VENV"
+  mkdir -p "$TORCH_HOME" "$XDG_CACHE_HOME"
+
+  ARGS=( "$MODE" --output_dir "$OUTPUT_DIR" --output_root casanovo )
+  [ -n "$MODEL_PATH" ] && ARGS+=( --model "$MODEL_PATH" )
+  ARGS+=( "$INPUT_MGF" )
+
+  PIP_CACHE_DIR="/mnt/efs/{{.ctx.user_email}}/_casanovo-pip-cache"
+  mkdir -p "$PIP_CACHE_DIR"
+
+  CASANOVO_CONDA_ENV="/mnt/efs/{{.ctx.user_email}}/_casanovo-conda-env"
+  if [ -d "$CASANOVO_VENV" ] && [ ! -d "$CASANOVO_CONDA_ENV" ]; then
+    rm -rf "$CASANOVO_VENV"
+    mkdir -p "$CASANOVO_VENV"
+  fi
+
+  MAMBA_ROOT="/mnt/efs/{{.ctx.user_email}}/_casanovo-mamba-root"
+  mkdir -p "$MAMBA_ROOT"
+
+  RUNNER_DIR="/mnt/efs/{{.ctx.user_email}}/_casanovo-tmp"
+  mkdir -p "$RUNNER_DIR"
+  RUNNER="$RUNNER_DIR/casanovo-runner-$$.sh"
+  {
+    printf '#!/bin/bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'CONDA_ENV=%q\n' "$CASANOVO_CONDA_ENV"
+    printf 'PIP_CACHE_DIR=%q\n' "$PIP_CACHE_DIR"
+    printf 'export HOME=%q\n' "$MAMBA_ROOT"
+    printf 'export MAMBA_ROOT_PREFIX=%q\n' "$MAMBA_ROOT"
+    printf 'export CONDA_PKGS_DIRS=%q\n' "$MAMBA_ROOT/pkgs"
+    printf 'if [ ! -x "$CONDA_ENV/bin/python" ]; then\n'
+    printf '  mamba create -y -p "$CONDA_ENV" -c conda-forge python=3.11 rdkit pip\n'
+    printf 'fi\n'
+    printf 'export PATH="$CONDA_ENV/bin:$PATH"\n'
+    printf 'export CONDA_PREFIX="$CONDA_ENV"\n'
+    printf 'export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"\n'
+    printf 'if ! "$CONDA_ENV/bin/python" -c "import casanovo, torch" 2>/dev/null; then\n'
+    printf '  "$CONDA_ENV/bin/pip" install --user --quiet torch --index-url https://download.pytorch.org/whl/cu121 --cache-dir "$PIP_CACHE_DIR"\n'
+    printf '  "$CONDA_ENV/bin/pip" install --user --quiet casanovo==5.0.0 --cache-dir "$PIP_CACHE_DIR"\n'
+    printf 'fi\n'
+    printf 'exec "$CONDA_ENV/bin/python" -m casanovo.casanovo'
+    for a in "${ARGS[@]}"; do printf ' %q' "$a"; done
+    printf '\n'
+  } > "$RUNNER"
+  chmod +x "$RUNNER"
+
+  if [ -z "${TMPDIR:-}" ]; then
+    TMPDIR="/mnt/efs/tmp/job-${SLURM_JOB_ID:-$$}"
+    mkdir -p "$TMPDIR"
+  fi
+
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs:/mnt/efs \
+    --env "PYTHONUSERBASE=$PYTHONUSERBASE" \
+    --env "TORCH_HOME=$TORCH_HOME" \
+    --env "XDG_CACHE_HOME=$XDG_CACHE_HOME" \
+    "docker://{{.runtime.base_image}}" \
+    bash "$RUNNER"

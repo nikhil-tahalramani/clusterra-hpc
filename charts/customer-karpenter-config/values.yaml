@@ -1,0 +1,8 @@
+# All values are supplied per-tenant by the tenant-karpenter-config
+# ApplicationSet via the plugin generator. Defaults exist only so
+# `helm template` works for local rendering.
+clusterId: ""
+region: us-east-1
+k3sPrivateIp: ""
+karpenterNodeRoleName: ""
+efsMountTargetIp: ""

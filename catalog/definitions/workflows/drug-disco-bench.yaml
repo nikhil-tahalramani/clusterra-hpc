@@ -1,0 +1,83 @@
+id: drug-disco-bench
+name: Drug discovery
+description: |
+  OpenFold3 → prep receptor → Uni-Dock → rank docks → Boltz-2 →
+  GROMACS MD (×3 array fan-out).
+
+  Two python-step bridges replace the bench-prep's pre-staged fixtures
+  with dynamic conversions:
+    • prep-receptor (CIF → PDBQT): protonates at pH and writes an
+      AutoDock-ready receptor from the folded structure.
+    • rank-boltz (Uni-Dock hits → Boltz inputs): picks top-K poses,
+      joins on the ligand library manifest for SMILES, emits per-complex
+      Boltz-2 YAMLs with the affinity head enabled.
+
+  Cross-step paths are resolved via `.ctx.workflow_run_id` — every chain
+  step writes to /mnt/efs/<user>/<workflow_run_id>/step-<step_id>/, so
+  downstream input_overrides reference upstream outputs by step_id rather
+  than the fixed bench fixture path.
+
+  GROMACS MD remains protein-only via the bench-prep TPR fixtures (ligand
+  parameterization bridge deferred; honestly flagged below).
+
+  Fan-out is Slurm-native: the md step submits one job with
+  `#SBATCH --array=1-3`. Each array task reads its own
+  candidate_${SLURM_ARRAY_TASK_ID}.tpr from the prep-staged directory and
+  writes to a per-task output subdir. afterok:<rescore_jobid> gates all
+  three array tasks identically; per-task admin_comment cost-stamping
+  works as it does for any individual job.
+
+  Cited for cost-per-run claims in the drug-discovery deck. Recipe-pins
+  must hold for before/after comparability — keep param_overrides static.
+
+vertical: hcls
+category: drug-discovery
+workload_group: md-docking
+modality: form
+tools: [OpenFold3, Uni-Dock, Boltz-2, GROMACS]
+ready: true
+kind: workflow
+
+steps:
+  - step_id: fold
+    template_id: openfold3
+    display_name: OpenFold3 EGFR
+    input_overrides:
+      # Workflow-pinned bench fixture; user can override on the step's
+      # launch tab. drug-disco-bench-prep stages this file.
+      input_yaml: /mnt/efs/bench/drug-disco/egfr-kinase-input.yaml
+  - step_id: prep-receptor
+    template_id: cif-to-receptor-pdbqt
+    display_name: Receptor prep (CIF → PDBQT)
+    depends_on: [fold]
+    input_overrides:
+      cif_path: /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-fold/predicted.cif
+  - step_id: dock
+    template_id: unidock
+    display_name: Uni-Dock screen
+    depends_on: [prep-receptor]
+    input_overrides:
+      receptor_pdbqt: /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-prep-receptor/receptor.pdbqt
+      ligand_dir: /mnt/efs/bench/drug-disco/zinc-1k/ligands
+  - step_id: rank-boltz
+    template_id: dock-hits-to-boltz-inputs
+    display_name: Rank docks → Boltz inputs
+    depends_on: [dock]
+    input_overrides:
+      dock_dir: /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-dock
+      ligand_manifest: /mnt/efs/bench/drug-disco/zinc-1k/manifest.csv
+      bridge_outputs_json: /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-prep-receptor/outputs.json
+  - step_id: rescore
+    template_id: boltz-2-affinity
+    display_name: Boltz-2 rescore
+    depends_on: [rank-boltz]
+    input_overrides:
+      input_dir: /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-rank-boltz/boltz-inputs
+  - step_id: md
+    template_id: gromacs
+    display_name: GROMACS MD (×3 array)
+    depends_on: [rescore]
+    param_overrides:
+      candidate_count: 3
+    input_overrides:
+      tpr_dir: /mnt/efs/bench/drug-disco/gromacs

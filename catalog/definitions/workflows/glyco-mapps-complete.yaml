@@ -1,0 +1,68 @@
+id: glyco-mapps-complete
+name: Glyco MAPPs Complete
+description: |
+  End-to-end tumor-glycopeptide discovery + structural prioritization.
+  Sibling chain to `mapps-complete` (the neoantigen recipe).
+
+  Topology:
+    prep (Step 1, CPU) — raw/.d to mzML + MGF
+      ├─ qc (Step 2, CPU — fast oxonium QC + scan filter; exits 65 on
+      │         enrichment failure as customer protection)
+      │      ├─ search_n  (Step 3a, CPU — MetaMorpheus GlycoSearchTask)
+      │      ├─ search_o  (Step 3b, CPU — MetaMorpheus O-PairSearch
+      │      │             with the 22-entry tumor O-glycan library;
+      │      │             this is the Pinpoint/Diadem/Glycotope wedge)
+      │      └─ denovo    (Step 4, GPU — Casanovo on passing_scans.mgf)
+      │
+      └────────── fold    (Step 5, GPU — Boltz-2 glycoprotein fold +
+                          glycan-as-ligand + SASA + druggability
+                          heuristic; emits summary.tsv with
+                          ADC-tractable flag)
+
+  Cross-step paths are resolved via `.ctx.workflow_run_id` — every chain
+  step writes to /mnt/efs/<user>/<workflow_run_id>/step-<step_id>/, so
+  downstream inputs auto-discover upstream outputs by walking that root.
+
+  License posture: every binary is MIT/Apache/BSD. No MSFragger, no
+  Byonic, no Spectronaut, no pGlyco3 (email-license gate). The DDA-only
+  scope is intentional — DIA glycoproteomics has no OSS-only path at
+  parity with the commercial offerings in 2026 (see design doc §8).
+
+  Wedge dataset (verify before use!): the canonical Steentoft / Vakhrushev
+  SimpleCell O-GalNAc glycoproteome (Copenhagen Center for Glycomics) — see
+  the wedge_dataset_pxd_misnaming memory note for verified PXD selection.
+  PXD021874 is wrong (archaeal N-glyco); PXD050580 is wrong (TMT-TAILS).
+  Killer metric: Tn+sTn+T-antigen PSM count + Level-1 site localization on
+  the chosen wedge in <1 h for &lt;$5.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [ThermoRawFileParser, alphatims, GlyCounter, MetaMorpheus, Casanovo, Boltz-2, freesasa]
+ready: false
+kind: workflow
+
+steps:
+  - step_id: prep
+    template_id: glyco-input-prep
+    display_name: Input prep (raw/.d → mzML + MGF)
+  - step_id: qc
+    template_id: glycounter-qc
+    display_name: Oxonium QC + scan filter
+    depends_on: [prep]
+  - step_id: search-n
+    template_id: metamorpheus-n-glyco
+    display_name: MetaMorpheus N-glyco search
+    depends_on: [qc]
+  - step_id: search-o
+    template_id: metamorpheus-o-pair
+    display_name: MetaMorpheus O-Pair (tumor lib)
+    depends_on: [qc]
+  - step_id: denovo
+    template_id: casanovo-glyco
+    display_name: Casanovo de novo (passing scans)
+    depends_on: [qc]
+  - step_id: fold
+    template_id: boltz2-glycofold
+    display_name: Boltz-2 glycofold + druggability
+    depends_on: [search-n, search-o, denovo]

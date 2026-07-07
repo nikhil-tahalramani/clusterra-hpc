@@ -1,0 +1,130 @@
+id: openfep
+name: openfep — OpenFE relative free-energy
+description: |
+  Relative binding free-energy (RBFE) campaigns via OpenFE
+  (https://openfree.energy). Single-edge `openfe quickrun` smoke + larger
+  network-build modes share the same env. We avoid OpenFE's published Docker
+  images: `:latest` activates conda via Docker ENTRYPOINT (apptainer skips it,
+  silent exit 127) and the `-apptainer` tag is not a valid OCI layer (FATAL
+  "no extractable OCI/Docker tar layers found"). Instead we materialize a
+  micromamba env on EFS once per tenant and reuse it.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: form
+tools: [OpenFE, OpenMM, GROMACS]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: docker://mambaorg/micromamba:1.5.10
+  cache_dir: /mnt/efs/_openfe-env/v1.11.1-cu126
+  requirements: ["openfe=1.11.1", "cuda-version=12.6"]
+  notes: |
+    Verified May 8 2026 on clusde74. Both upstream container paths fail:
+      - ghcr.io/openfreeenergy/openfe:1.11.1-apptainer
+        FATAL "no extractable OCI/Docker tar layers found in this image"
+      - ghcr.io/openfreeenergy/openfe:latest
+        ENTRYPOINT-activated conda env is skipped by `apptainer exec` →
+        exit 127 (see MEMORY/apptainer_skips_docker_entrypoint.md).
+    Pattern mirrors openmmpbsa: micromamba base image + flock-guarded one-time
+    env materialization at $cache_dir, then `micromamba run -p` for every
+    invocation.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=24:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: input_json
+    role: generic_path
+    required: false
+    default: /mnt/efs/smoke/openfep/rbfe.json
+    description: |
+      OpenFE transformation JSON (output of `plan-rbfe-network` or a hand-built
+      single-edge `rbfe.json` from the OpenFE test fixtures). Pre-baked input
+      for `openfe quickrun -t`. Default = staged smoke fixture.
+
+parameters: []
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openfep-{{.ctx.run_id}}"
+  artifacts:
+    - key: result
+      path: "{{.outputs.dir}}/result.json"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_JSON={{.inputs.input_json | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  ENV_PREFIX={{.runtime.cache_dir | quote}}
+  BASE_IMAGE="{{.runtime.base_image}}"
+
+  # Smoke mode: when input_json is the staged stub (~3 bytes — `{}`) — no
+  # real OpenFE transformation has been provided — exercise env build +
+  # `openfe --version` only. Real RBFE runs require a customer-supplied
+  # rbfe.json from `openfe plan-rbfe-network`. Per 2026-05-05-gpu-wedge-report.md
+  # § 11.1, openfep runs are cluster-blocked on the persistent slurmd
+  # nss_slurm regression (cap-pod path works); the smoke validates the
+  # template renders + venv materializes.
+  SMOKE_MODE=0
+  if [ ! -s "$INPUT_JSON" ] || [ "$(wc -c < "$INPUT_JSON")" -le 16 ]; then
+    SMOKE_MODE=1
+    echo "[openfep] smoke mode (input_json is empty/stub); will run env build + openfe --version"
+  else
+    [ -r "$INPUT_JSON" ] || { echo "input_json not readable: $INPUT_JSON" >&2; exit 1; }
+  fi
+  mkdir -p "$OUTPUT_DIR"
+
+  ENV_LOCK="${ENV_PREFIX}.lock"
+  ENV_READY="${ENV_PREFIX}/.ready"
+  mkdir -p "$(dirname "$ENV_PREFIX")"
+
+  if [ ! -f "$ENV_READY" ]; then
+    (
+      flock -x 9
+      if [ ! -f "$ENV_READY" ]; then
+        echo "[openfep] building openfe env at $ENV_PREFIX (one-time, ~5-10 min)"
+        apptainer exec \
+          --bind /mnt/efs:/mnt/efs \
+          --bind "$TMPDIR:$TMPDIR" \
+          "$BASE_IMAGE" \
+          bash -c "
+            set -euo pipefail
+            export MAMBA_ROOT_PREFIX=$TMPDIR/mamba
+            mkdir -p \$MAMBA_ROOT_PREFIX
+            micromamba create -y -p '$ENV_PREFIX' -c conda-forge openfe=1.11.1 'cuda-version=12.6'
+          "
+        touch "$ENV_READY"
+      fi
+    ) 9>"$ENV_LOCK"
+  fi
+
+  WORK_DIR="${TMPDIR:-/tmp}/openfe-work-${SLURM_JOB_ID:-local}"
+  mkdir -p "$WORK_DIR"
+
+  if [ "$SMOKE_MODE" = 1 ]; then
+    exec apptainer exec --nv \
+      --bind /mnt/efs:/mnt/efs \
+      --bind "$TMPDIR:$TMPDIR" \
+      --bind "$OUTPUT_DIR:$OUTPUT_DIR" \
+      "$BASE_IMAGE" \
+      micromamba run -p "$ENV_PREFIX" \
+        bash -c 'openfe --version && echo "{\"smoke\":true,\"openfe\":\"version-ok\"}" > '"$OUTPUT_DIR/result.json"
+  fi
+
+  exec apptainer exec --nv \
+    --bind /mnt/efs:/mnt/efs \
+    --bind "$TMPDIR:$TMPDIR" \
+    --bind "$OUTPUT_DIR:$OUTPUT_DIR" \
+    "$BASE_IMAGE" \
+    micromamba run -p "$ENV_PREFIX" \
+      openfe quickrun -t "$INPUT_JSON" -d "$WORK_DIR" -o "$OUTPUT_DIR/result.json"

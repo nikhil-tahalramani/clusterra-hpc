@@ -1,0 +1,8 @@
+apiVersion: v2
+name: customer-karpenter-config
+description: |
+  Per-tenant Karpenter EC2NodeClass + NodePool. Karpenter operator + AWS-side
+  glue (SQS interruption queue, IAM, discovery tags) stay in stage-b-k8s
+  Terraform; only the K8s CRs live here so userData edits flow via GitOps.
+type: application
+version: 0.1.0

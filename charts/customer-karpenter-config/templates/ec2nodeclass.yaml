@@ -1,0 +1,227 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiFamily: Custom
+  # Karpenter v1.9 first-class instance-store handling: on instance families
+  # with NVMe SSDs (g5/g6/g6e/g7e/g4dn/p4/p5/*d), Karpenter formats the disks
+  # as a RAID0 xfs array and mounts at /mnt/k8s-disks/0 BEFORE userData runs.
+  # On families without instance-store, this is a no-op. Userland below
+  # bind-mounts to /mnt/scratch for slurmd hostPath consumption.
+  instanceStorePolicy: RAID0
+  amiSelectorTerms:
+    - owner: "898082745236"
+      name: "Deep Learning ARM64 Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) *"
+    - owner: "898082745236"
+      name: "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) *"
+  role: {{ .Values.karpenterNodeRoleName | quote }}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: clusterra-{{ .Values.clusterId }}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: clusterra-{{ .Values.clusterId }}
+  # Pinned kubelet reserves. Karpenter's binpacker subtracts these from on-box
+  # capacity to compute Allocatable; kubelet enforces the same on the node.
+  # The agent derates cap-pod requests from the *same* numbers (Helm value
+  # `kubeletReserves` in customer-workloads) so cap-pod request, Karpenter
+  # binpack, and kubelet Allocatable all agree by construction. No
+  # calibration, no derivation drift on k8s upgrade.
+  #
+  # Sum: cpu = 200m + 200m = 400m; memory = 600Mi + 400Mi + 200Mi = 1200Mi.
+  # If you change these, also bump customer-workloads values.kubeletReserves.
+  kubelet:
+    kubeReserved:
+      cpu: 200m
+      memory: 600Mi
+    systemReserved:
+      cpu: 200m
+      memory: 400Mi
+    evictionHard:
+      memory.available: 200Mi
+  metadataOptions:
+    httpEndpoint: enabled
+    httpPutResponseHopLimit: 2
+    httpTokens: required
+  blockDeviceMappings:
+    - deviceName: /dev/sda1
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        deleteOnTermination: true
+  # K3s worker bootstrap. The K3s join token is fetched at boot from
+  # customer-account SSM (the Karpenter node IAM role has SSM read access via
+  # AmazonSSMManagedInstanceCore) — we deliberately do NOT pipe it through
+  # DDB or the plugin generator response, since that would widen the blast
+  # radius of any central-side compromise to all tenant clusters.
+  userData: |
+    #!/bin/bash
+    set -ex
+    IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+    INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+    AZ=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+    # Fast apt-get without needrestart scanning the whole system
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_SUSPEND=1
+    apt-get update -qq
+    apt-get install -yq --no-install-recommends nfs-common
+
+    # Stable mount path for instance-store NVMe RAID0. Two possible sources
+    # depending on AMI:
+    #   - Karpenter's `instanceStorePolicy: RAID0` formats+mounts the array
+    #     at /mnt/k8s-disks/0 on AL2 / Bottlerocket out of the box.
+    #   - The Deep Learning AMI (Ubuntu) ships its own systemd unit that
+    #     pre-mounts instance-store at /opt/dlami/nvme before cloud-init
+    #     runs, which races Karpenter's mkfs and leaves /mnt/k8s-disks/0
+    #     empty on g5/g6/g7e/g4dn instance families. Detect both, prefer
+    #     Karpenter's, fall back to the DLAMI path.
+    # Bind to /mnt/scratch so the slurmd DaemonSet's hostPath sees a stable
+    # name. On NVMe-less families this branch is skipped — slurmd's
+    # TmpDisk advertisement is then omitted, and Slurm's scheduler refuses
+    # to land `--tmp=N` jobs on those nodes (intentional). See
+    # 2026-04-29-storage-strategy.md.
+    if mountpoint -q /mnt/k8s-disks/0; then
+      SCRATCH_SRC=/mnt/k8s-disks/0
+    elif mountpoint -q /opt/dlami/nvme; then
+      SCRATCH_SRC=/opt/dlami/nvme
+    else
+      SCRATCH_SRC=""
+    fi
+    if [ -n "$SCRATCH_SRC" ]; then
+      mkdir -p /mnt/scratch
+      mount --bind "$SCRATCH_SRC" /mnt/scratch
+      chmod 1777 /mnt/scratch
+      echo "$SCRATCH_SRC /mnt/scratch none bind 0 0" >> /etc/fstab
+    else
+      echo "no instance-store NVMe present; /mnt/scratch will be absent" >&2
+    fi
+
+    # Install Mountpoint for S3 directly via deb (bypassing apt repositories).
+    # Use `apt-get install ./file.deb` so transitive deps (e.g. libfuse2) are
+    # auto-resolved — `dpkg -i` would abort userData on a missing dep.
+    MOUNT_S3_ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/arm64/')
+    curl -fsSLO "https://s3.amazonaws.com/mountpoint-s3-release/latest/$MOUNT_S3_ARCH/mount-s3.deb"
+    apt-get install -yq ./mount-s3.deb
+
+    # Mount EFS before K3s so hostPath is ready for slurmd pods.
+    mkdir -p /mnt/efs
+    for i in $(seq 1 12); do
+      mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport \
+        {{ .Values.efsMountTargetIp }}:/ /mnt/efs && break
+      sleep 3
+    done
+    chmod 1777 /mnt/efs
+    echo "{{ .Values.efsMountTargetIp }}:/ /mnt/efs nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev 0 0" >> /etc/fstab
+
+    # Mount ngi-igenomes read-only via Mountpoint for S3 (lazy, no boot-time data transfer).
+    # `--allow-other` + `user_allow_other` in fuse.conf are both required: without them
+    # FUSE blocks every non-root reader (slurmd jobs run as the per-tenant user uid, e.g.
+    # n52h53/41627, and would EACCES on `stat`/`readdir` even though file modes are 0755).
+    # Symptom is a Java AccessDeniedException on the first iGenomes path the schema validator
+    # touches (e.g. /mnt/s3-refs/igenomes/Homo_sapiens/GATK/GRCh38/Annotation/GATKBundle).
+    sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
+    grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
+    mkdir -p /mnt/s3-refs
+    mount-s3 --read-only --no-sign-request --allow-other s3://ngi-igenomes /mnt/s3-refs
+
+    # EFS-shared Apptainer cache (NXF_SINGULARITY_CACHEDIR). Created with
+    # 1777 (see Apr 8 EFS sticky-writable note) so concurrent Nextflow
+    # children running as non-root tenant users can populate it without
+    # stomping each other. First job to pull an image writes the SIF;
+    # subsequent jobs across all nodes reuse it.
+    mkdir -p /mnt/efs/nxf-cache/_lib
+    chmod 1777 /mnt/efs/nxf-cache /mnt/efs/nxf-cache/_lib
+
+    # NVIDIA container runtime on GPU nodes (no-op on CPU-only).
+    # K3s ships its own containerd at /var/lib/rancher/k3s/agent/etc/containerd/
+    # and ignores /etc/containerd/config.toml. `default-runtime: nvidia` in
+    # /etc/rancher/k3s/config.yaml makes nvidia-container-runtime the default,
+    # so every pod on the GPU node — including the slurmd DS which has no
+    # runtimeClassName — gets host nvidia-smi + CUDA libs bind-mounted in
+    # based on NVIDIA_VISIBLE_DEVICES / NVIDIA_DRIVER_CAPABILITIES env vars.
+    #
+    # Gate on instance-type, NOT `command -v nvidia-ctk` — the ARM64 Deep
+    # Learning AMI ships nvidia-ctk for g5g, so a CPU node like c8g.large
+    # would otherwise enable nvidia default-runtime and every pod would
+    # crashloop on "failed to initialize NVML: Driver Not Loaded".
+    ITYPE=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-type || true)
+    GPU_KUBELET_TAINT=""
+    case "$ITYPE" in
+      g3*|g4*|g5*|g6*|g7e*|g8*|gr6*|p3*|p4*|p5*|p6*)
+        mkdir -p /etc/rancher/k3s
+        echo "default-runtime: nvidia" > /etc/rancher/k3s/config.yaml
+        # Apply the gpu taint at kubelet boot — BEFORE the node ever becomes
+        # Ready to the k8s scheduler. Closes the race that bit job 1238/1239
+        # on May-3: cap-pods bound to a freshly-Ready GPU node in the window
+        # between Node Ready and edge-agent's post-Ready taint reconcile, then
+        # NoSchedule couldn't evict them. With kubelet --register-with-taints,
+        # the taint is on the Node object from the first NodeStatus PATCH, so
+        # the scheduler never considers placing a non-tolerating pod there.
+        # Edge-agent's reconcileGPUTaints continues to apply the same taint
+        # idempotently as defense-in-depth (no-op when already present).
+        # Architectural follow-up: collapse to two partition-pinned NodePools,
+        # at which point this taint moves into the gpu NodePool spec and
+        # edge-agent's reconciler is deleted.
+        # The `nvidia.com/gpu=not-ready:NoSchedule` taint sits alongside the
+        # clusterra.io/gpu isolation taint. Both land atomically at kubelet
+        # boot, BEFORE the node becomes Ready, so no cap-pod can schedule on
+        # the node until edge-agent's reconcileGPUReadyTaint clears the
+        # not-ready taint once nvidia-device-plugin has advertised
+        # nvidia.com/gpu as Allocatable. This closes the device-plugin
+        # bootstrap race that historically caused multi-node GPU runaway
+        # when cap-pods requested nvidia.com/gpu directly.
+        GPU_KUBELET_TAINT="--kubelet-arg=--register-with-taints=clusterra.io/gpu=true:NoSchedule,nvidia.com/gpu=not-ready:NoSchedule"
+        ;;
+    esac
+
+    # Route K3s/kubelet data-dir at the NVMe RAID0 array when present, so
+    # kubelet reports the array's free bytes as ephemeral-storage Allocatable.
+    # Cap-pods request `ephemeral-storage: <TmpMiB>Mi` to budget --tmp scratch;
+    # without this redirect, kubelet defaults to /var/lib/rancher/k3s/agent on
+    # the 100 GiB EBS root and reports ~75 GiB Allocatable on every node
+    # regardless of instance-store size — a cap-pod requesting 200Gi would be
+    # unschedulable on every family. See 2026-05-07-cap-pod-resource-parity-v1.md.
+    K3S_DATA_DIR_FLAG=""
+    if mountpoint -q /mnt/k8s-disks/0; then
+      mkdir -p /mnt/k8s-disks/0/k3s
+      K3S_DATA_DIR_FLAG="--data-dir=/mnt/k8s-disks/0/k3s"
+    fi
+
+    # Fetch the K3s join token from customer-account SSM (the Karpenter node
+    # IAM role has ssm:GetParameter via AmazonSSMManagedInstanceCore). DLAMI
+    # ships awscli v2 by default; if a future AMI drops it, install here.
+    K3S_TOKEN=$(aws ssm get-parameter \
+      --region {{ .Values.region }} \
+      --name /clusterra/customer/{{ .Values.clusterId }}/k3s-token \
+      --with-decryption \
+      --query Parameter.Value --output text)
+
+    # Kubelet reserves passed as --kubelet-arg= flags so the running kubelet
+    # actually enforces them. With amiFamily: Custom + custom userData,
+    # Karpenter does NOT inject the EC2NodeClass `kubelet:` block into
+    # bootstrap (it only consumes the block for its binpack simulation).
+    # Without these flags, kubelet reports Allocatable == Capacity and the
+    # eviction guarantee is purely theoretical. Numbers must match the
+    # EC2NodeClass kubelet: block above and customer-workloads
+    # values.kubeletReserves so cap-pod request, Karpenter binpack, and
+    # kubelet enforcement all agree.
+    curl -sfL https://get.k3s.io | \
+      K3S_URL="https://{{ .Values.k3sPrivateIp }}:6443" \
+      K3S_TOKEN="$K3S_TOKEN" \
+      INSTALL_K3S_EXEC="agent \
+        $K3S_DATA_DIR_FLAG \
+        --kubelet-arg=--provider-id=aws:///$AZ/$INSTANCE_ID \
+        --kubelet-arg=--kube-reserved=cpu=200m,memory=600Mi \
+        --kubelet-arg=--system-reserved=cpu=200m,memory=400Mi \
+        --kubelet-arg=--eviction-hard=memory.available<200Mi \
+        $GPU_KUBELET_TAINT \
+        --node-label=clusterra.io/pool=cpu \
+        --node-taint=karpenter.sh/unregistered=:NoExecute" \
+      sh -
+
+    # Node-local SIF cache for slurmd hostPath. First Jupyter job populates;
+    # subsequent jobs reuse.
+    mkdir -p /var/lib/apptainer/sif-cache
+    chmod 1777 /var/lib/apptainer/sif-cache

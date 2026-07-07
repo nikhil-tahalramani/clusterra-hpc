@@ -1,0 +1,103 @@
+id: dcv-desktop
+name: DCV Remote Desktop
+description: GPU-accelerated remote desktop session for 3D drug-discovery viewers. Pre-installed xfce desktop; launch PyMOL / ChimeraX / VMD via apptainer inside the session.
+vertical: hcls
+category: interactive
+workload_group: interactive
+modality: vendor-gui
+tools: [dcv, xfce, apptainer, pymol, chimerax, vmd]
+ready: true
+kind: interactive
+
+# Direct-connect template. The console's "Launch DCV" button calls
+# GET /v1/sessions/{job_id}/dcv-file which mints a per-session DCV auth
+# token, stores its hash on the session row, and returns a `.dcv` file
+# the OS opens in the NICE DCV native client. dcvserver authenticates
+# each connection by POSTing the plaintext token to
+# /v1/internal/dcv/auth, where cluster-api hashes + compares against
+# the stored hash. There is no HTTP reverse proxy in this path — DCV
+# pixel-streams over its own protocol on port 8443.
+
+# `runtime` is required by templates-sync for any non-preset/non-workflow
+# template. DCV is baked directly into the slurmd image
+# (core/images/clusterra-slurmd/Dockerfile, amd64-only), so this template's
+# script does NOT apptainer-pull anything at runtime. We point at the
+# slurmd image's current digest only to satisfy the validator — it is
+# truthful (DCV does live there) but unused at render time.
+runtime:
+  kind: docker_image
+  image: ghcr.io/nikhil-tahalramani/clusterra/slurmd@sha256:137b002e3a092e4d59dac8af3c6a4aed037c3324c2f6870ef23644a03be6ee9e
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=16G
+  #SBATCH --time=8:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:1
+
+inputs: []
+
+# The console's SessionLaunchPage hardcodes `params: { profile, time_limit }`
+# for every interactive template. Both are decoration here: the chassis has
+# one shape in v1 (NVIDIA GPU + amd64) so profile is informational, and the
+# launch page's time-limit picker overrides --time via sbatch_override
+# regardless of this default.
+parameters:
+  - key: profile
+    widget: enum
+    options: [gpu-a10]
+    default: gpu-a10
+    description: GPU profile. Only one shape in v1; sbatch hardcodes --partition / --gres.
+  - key: time_limit
+    widget: number
+    default: 480
+    description: Wall-time limit in minutes. Console picker overrides via sbatch_override at submit.
+
+# `routing` is required by the v2 schema for kind=interactive. For
+# direct-connect templates (DCV native client, not HTTP) it is purely
+# schema decoration — the reverse-proxy mount cluster-api registers at
+# /dcv/{cluster}/{job}/ is never reached because no CloudFront behavior
+# routes /dcv/* and the user-facing flow hits /v1/sessions/{id}/dcv-file
+# instead. Keep `ready_callback: true` so the prolog's POST to
+# /v1/internal/sessions/{id}/ready still persists the session row.
+routing:
+  path_prefix: /dcv
+  port_param: profile
+  ready_callback: true
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  # Prolog (root, see core/images/clusterra-slurmd/prolog.sh) has already
+  # started dbus-daemon + dcvserver and created the session
+  # `job-${SLURM_JOB_ID}`. This script only registers the session's public
+  # endpoint with cluster-api and then idles until slurmstepd kills it.
+
+  # Public IPv4 via IMDSv2 — the NICE DCV client connects from the
+  # internet, so the .dcv file needs the public address (hostname -I
+  # returns the private 10.x). Fall back to private IP if IMDS is
+  # unreachable (would yield an unreachable .dcv but won't crash the job).
+  IMDS_TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+      -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+  NODE_IP=$(curl -sf -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN:-}" \
+      "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+  [ -n "$NODE_IP" ] || NODE_IP=$(hostname -I | awk '{print $1}')
+
+  AUTH=""
+  [ -z "${CLUSTERRA_INTERNAL_TOKEN:-}" ] || AUTH="-H Authorization: Bearer ${CLUSTERRA_INTERNAL_TOKEN}"
+  curl -sf -X POST ${AUTH} \
+      -H "Content-Type: application/json" \
+      -d "{\"node_ip\":\"${NODE_IP}\",\"port\":8443,\"cluster_id\":\"{{.ctx.cluster_id}}\",\"user_email\":\"{{.ctx.user_email}}\",\"template_id\":\"dcv-desktop\"}" \
+      "${CLUSTERRA_API}/v1/internal/sessions/${SLURM_JOB_ID}/ready" \
+      || echo "ready callback failed (continuing; .dcv emit will 409 until retry)" >&2
+
+  # Hold the job open while dcvserver is alive. /proc is universally
+  # readable so pgrep works from the slurm-job-user; `dcv describe-session`
+  # would not (DBus access is root-only in our cap-pod setup).
+  echo "dcv-desktop: session job-${SLURM_JOB_ID} ready on ${NODE_IP}:8443"
+  while pgrep -f /usr/lib/x86_64-linux-gnu/dcv/dcvserver >/dev/null 2>&1; do
+      sleep 60
+  done
+  echo "dcv-desktop: dcvserver gone; exiting"

@@ -1,0 +1,245 @@
+id: relion
+name: RELION (CPU 2D/3D classification + refinement)
+description: |
+  Cryo-EM single-particle reconstruction with RELION (Regularised Likelihood
+  Optimisation). Single-node CPU build via the bioconda biocontainer —
+  333 MB, no GPU codepath, but covers the full relion_refine pipeline
+  (2D/3D classification, 3D auto-refine, polishing, post-processing). For
+  GPU acceleration build a SIF from upstream 3dem/relion against CUDA and
+  override the runtime image (see runtime.notes).
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [RELION]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: quay.io/biocontainers/relion:5.1.0--h4fe8dad_0
+  notes: |
+    Pinned to the verified biocontainers build (333 MB SIF, CPU only, see
+    MEMORY: template_image_uri_lessons.md). The upstream relion/relion
+    Docker Hub image is community-maintained and inconsistently published;
+    swap to a private /mnt/efs/sifs/relion-*-cuda.sif by overriding
+    runtime.image when GPU is required.
+
+    Apptainer cap-pod gotcha: the default cluster-wide cache
+    /mnt/efs/_apptainer-cache is owned by uid=slurm and NOT writable by the
+    job's runtime uid. We point APPTAINER_CACHEDIR at a per-job TMPDIR
+    location so first-pull succeeds; the SIF is materialised under
+    /mnt/efs/sifs/ on first job so subsequent jobs skip the 5-min OCI->SIF
+    convert. See script body.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=32G
+  #SBATCH --time=4:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: input_star
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Particles STAR file (output of relion_preprocess / Extract). Empty =
+      SMOKE_MODE — runs `relion_refine --help` only to validate plumbing.
+      For the β-galactosidase tutorial smoke this is
+      /mnt/efs/relion-tutorial/relion30_tutorial_precalculated_results/Extract/job007/particles.star
+      (~1500 particles, references Extract/job007/Movies/*.mrcs relative
+      to the project root, which the template auto-detects).
+
+parameters:
+  - key: subcommand
+    label: RELION binary
+    widget: enum
+    options: [relion_refine, relion_refine_mpi]
+    default: relion_refine
+    description: |
+      relion_refine is the single-process driver used by 2D/3D classification
+      and auto-refine. relion_refine_mpi is the MPI variant — it MUST run
+      under mpirun with >=2 ranks (1 master + >=1 worker) or RELION aborts.
+      When selected, the template wraps it in a local-mpirun launch
+      (mpi_ranks ranks, OpenMPI forking locally in the pod) — see the
+      mpi_ranks parameter.
+  - key: mpi_ranks
+    label: MPI ranks (relion_refine_mpi only)
+    widget: number
+    default: 3
+    min: 2
+    max: 64
+    description: |
+      Number of MPI ranks for relion_refine_mpi (1 master + N workers).
+      Ignored when subcommand=relion_refine. RELION's MPI binary needs
+      >=2 ranks. Keep ranks * threads <= cpus-per-task headroom.
+  - key: n_classes_k
+    label: Number of 2D classes (K)
+    widget: number
+    default: 4
+    min: 1
+    max: 200
+  - key: pool
+    label: Pool size (particles per orientation pass)
+    widget: number
+    default: 30
+    min: 1
+    max: 200
+  - key: iter
+    label: Iterations
+    widget: number
+    default: 25
+    min: 1
+    max: 100
+  - key: particle_diameter
+    label: Particle mask diameter (Angstroms)
+    widget: number
+    default: 200
+    min: 10
+    max: 1000
+    description: |
+      Diameter of the circular mask applied to experimental images. Tutorial
+      β-galactosidase default is 200 A.
+  - key: time_limit
+    label: Wall-clock cap seconds (0=off, uses coreutils timeout(1))
+    widget: number
+    default: 0
+    min: 0
+    max: 86400
+    description: |
+      RELION 5.1 has no built-in wall-clock cap (no --abort_after / --maxtime).
+      We wrap the apptainer exec with coreutils timeout(1) when this is > 0;
+      SIGTERM is sent, which RELION catches at the next iteration boundary
+      so the latest run_it{NNN}_*.star files are preserved.
+  - key: output_prefix
+    label: Output rootname (passed to relion_refine -o)
+    widget: text
+    default: ""
+    description: |
+      Optional. Empty = use generated /mnt/efs/.../Class2D/run. RELION writes
+      run_it{NNN}_classes.mrcs (one stack containing K class slices),
+      run_it{NNN}_data.star, run_it{NNN}_model.star, run_it{NNN}_optimiser.star,
+      and run.log to this prefix.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/relion-{{.ctx.run_id}}"
+  artifacts:
+    - key: classes_mrcs
+      path: "{{.outputs.dir}}/Class2D/run_it025_classes.mrcs"
+      role: primary_output
+      description: |
+        Final-iteration class averages stack. Filename uses iter=25 by
+        default; if you change the iter parameter the actual file is
+        run_it{NNN}_classes.mrcs where NNN is the chosen iteration count
+        zero-padded.
+    - key: data_star
+      path: "{{.outputs.dir}}/Class2D/run_it025_data.star"
+      role: primary_output
+      description: Per-particle class assignments + alignment parameters.
+    - key: log
+      path: "{{.outputs.dir}}/Class2D/run.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  IMG="docker://{{.runtime.image}}"
+  INPUT_STAR={{.inputs.input_star | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  OUTPUT_PREFIX={{.params.output_prefix | quote}}
+  SUBCMD={{.params.subcommand | quote}}
+
+  mkdir -p "$OUTPUT_DIR/Class2D"
+
+  # --- apptainer cache wrangling ----------------------------------------
+  # Cluster-shared /mnt/efs/_apptainer-cache is owned by uid=slurm and NOT
+  # writable by the runtime uid (verified clusde74 job 2703, 2026-05-27).
+  # Use per-job TMPDIR for the OCI->SIF convert; promote the SIF to a
+  # writable EFS sif store so the next job's apptainer exec skips the pull.
+  SIF_STORE=/mnt/efs/sifs
+  mkdir -p "$SIF_STORE" || true
+  SIF_NAME="relion_5.1.0--h4fe8dad_0.sif"
+  SIF_PATH="$SIF_STORE/$SIF_NAME"
+  export APPTAINER_CACHEDIR="$TMPDIR/apptainer-cache"
+  export APPTAINER_TMPDIR="$TMPDIR/apptainer-tmp"
+  mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
+
+  if [ ! -s "$SIF_PATH" ]; then
+    echo "[relion] pulling $IMG -> $SIF_PATH (first job on this cluster pays this cost)"
+    if ! apptainer pull --force "$SIF_PATH" "$IMG" 2>&1; then
+      echo "[relion] SIF promote to $SIF_PATH failed (likely read-only EFS perms); falling back to docker:// per-job pull"
+      SIF_PATH="$IMG"
+    fi
+  fi
+
+  # --- local-mpirun launcher for the relion_refine_mpi subcommand -------
+  # relion_refine_mpi MUST run under mpirun with >=2 ranks or RELION aborts
+  # ("you need to use at least 2 MPI processes"). The original template
+  # offered the subcommand but invoked it bare (1 rank) — that always
+  # errored. Wrap it here. CPU build: no --gpu, no --nv. The
+  # --mca plm ^slurm --mca ras ^slurm pair stops OpenMPI from reaching for
+  # Slurm's unconfigured PMI launcher and forks ranks locally in the pod;
+  # --bind "$TMPDIR:$TMPDIR" keeps the ORTE session dir inside the bound
+  # NVMe scratch.
+  MPI_PREFIX=()
+  if [ "$SUBCMD" = "relion_refine_mpi" ]; then
+    MPI_PREFIX=( mpirun --mca plm ^slurm --mca ras ^slurm --oversubscribe --bind-to none -np {{.params.mpi_ranks}} )
+  fi
+
+  # --- SMOKE_MODE: no input_star -> help only ---------------------------
+  if [ "${RELION_SMOKE:-0}" = "1" ] || [ -z "$INPUT_STAR" ]; then
+    echo "[relion] SMOKE_MODE: $SUBCMD --help (set RELION_SMOKE=0 + provide input_star for real classification)"
+    # --help needs no MPI; run the bare binary even for the mpi subcommand.
+    exec apptainer exec --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+      "$SIF_PATH" "$SUBCMD" --help
+  fi
+
+  # --- real 2D classification -------------------------------------------
+  [ -r "$INPUT_STAR" ] || { echo "input_star not readable: $INPUT_STAR" >&2; exit 1; }
+
+  if [ -z "$OUTPUT_PREFIX" ]; then
+    OUTPUT_PREFIX="$OUTPUT_DIR/Class2D/run"
+  fi
+  mkdir -p "$(dirname "$OUTPUT_PREFIX")"
+
+  # RELION resolves relative image paths in the STAR file against cwd; cd
+  # into the project root so it can find the .mrcs stacks the STAR
+  # references.
+  PROJECT_DIR="$(dirname "$INPUT_STAR")"
+  while [ "$PROJECT_DIR" != "/" ] && [ ! -d "$PROJECT_DIR/Schemes" ] && [ ! -d "$PROJECT_DIR/Extract" ] && [ ! -d "$PROJECT_DIR/Select" ] && [ ! -d "$PROJECT_DIR/Class2D" ]; do
+    PROJECT_DIR="$(dirname "$PROJECT_DIR")"
+  done
+  [ "$PROJECT_DIR" = "/" ] && PROJECT_DIR="$(dirname "$INPUT_STAR")"
+  echo "[relion] PROJECT_DIR=$PROJECT_DIR"
+  cd "$PROJECT_DIR"
+
+  ARGS=(
+    --i              "$INPUT_STAR"
+    --o              "$OUTPUT_PREFIX"
+    --iter           {{.params.iter}}
+    --K              {{.params.n_classes_k}}
+    --pool           {{.params.pool}}
+    --particle_diameter {{.params.particle_diameter}}
+    --tau2_fudge     2
+    --psi_step       12
+    --offset_range   5
+    --offset_step    2
+    --norm
+    --scale
+    --flatten_solvent
+    --zero_mask
+    --oversampling   1
+    --strict_highres_exp -1
+    --j              "${SLURM_CPUS_PER_TASK:-4}"
+  )
+
+  # RELION 5.1 has no built-in wall-clock cap; wrap with coreutils timeout(1)
+  # when params.time_limit > 0 so SIGTERM lands at the next iteration boundary.
+  TIMEOUT_PREFIX=()
+  {{if gt (.params.time_limit | int) 0}}TIMEOUT_PREFIX=( timeout --signal=TERM {{.params.time_limit}} ){{end}}
+
+  echo "[relion] launching: ${TIMEOUT_PREFIX[*]} ${MPI_PREFIX[*]} $SUBCMD ${ARGS[*]}"
+  exec "${TIMEOUT_PREFIX[@]}" apptainer exec --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+    "$SIF_PATH" "${MPI_PREFIX[@]}" "$SUBCMD" "${ARGS[@]}"

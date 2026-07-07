@@ -1,0 +1,801 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clusterra.cloud/schemas/template.v2.schema.json",
+  "title": "Clusterra Template v2",
+  "description": "Frozen v2 contract for Clusterra job templates. Top-level reject-unknown.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "description",
+    "vertical",
+    "category",
+    "workload_group",
+    "modality",
+    "tools",
+    "ready",
+    "kind"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "vertical": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workload_group": {
+      "type": "string",
+      "minLength": 1
+    },
+    "modality": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "ready": {
+      "type": "boolean"
+    },
+    "kind": {
+      "enum": [
+        "batch",
+        "interactive",
+        "preset",
+        "workflow"
+      ]
+    },
+    "display": {
+      "comment": "Strip-render hint for this template when wired into a workflow. 'step' (default) renders a full tile in the strip; 'connector' renders as a fat pill between its upstream/downstream tiles (used by bridge templates whose role is to adapt one step's output into the next step's input). Has no effect on standalone launches.",
+      "enum": [
+        "step",
+        "connector"
+      ]
+    },
+    "tier": {
+      "comment": "Curation tier for kind=preset. validated = Clusterra-tested end-to-end; borrowed = passthrough of an upstream test profile.",
+      "enum": [
+        "validated",
+        "borrowed"
+      ]
+    },
+    "pipeline_repo": {
+      "comment": "Top-level pipeline_repo for kind=preset. Used to filter presets by the BYO Nextflow target repo (GET /v1/launchables?kind=preset&pipeline_repo=...).",
+      "type": "string"
+    },
+    "revision": {
+      "comment": "Top-level revision pin for kind=preset (mirrors runtime.revision; presets may omit a full runtime block).",
+      "type": "string"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeBlock"
+    },
+    "sbatch": {
+      "comment": "Raw #SBATCH directive block (Slurm passthrough). Templated string; pasted verbatim into the rendered script after substitution. Subject to the static denylist at internal/products/templates/security/sbatch.go on every load + every render.",
+      "type": "string",
+      "minLength": 1
+    },
+    "schedule": {
+      "comment": "Optional cron expression. When set on a kind=batch template, the submit handler wraps the rendered #SBATCH script in a fixed-shape K8s CronJob in the customer namespace (image=clusterra-agent, command=sbatch /mnt/efs/scheduled/<run_id>.sh, restartPolicy=OnFailure, concurrencyPolicy=Forbid). Author surface is exactly one cron expression — no manifest fields are reachable. Minimum interval 5 minutes (no per-second / per-minute crons).",
+      "type": "string",
+      "pattern": "^([*0-9,/-]+\\s+){4}[*0-9,/-]+$"
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/InputDecl"
+      }
+    },
+    "parameters": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ParamDecl"
+      }
+    },
+    "outputs": {
+      "$ref": "#/$defs/OutputsBlock"
+    },
+    "script": {
+      "type": "string"
+    },
+    "routing": {
+      "$ref": "#/$defs/RoutingBlock"
+    },
+    "policy": {
+      "$ref": "#/$defs/PolicyBlock"
+    },
+    "cost_anchor": {},
+    "validation": {
+      "type": "object"
+    },
+    "config": {
+      "type": "string"
+    },
+    "steps": {
+      "comment": "Workflow chain step list (kind=workflow only). Catalog-only — the server returns this verbatim; the console unfolds steps[] into a StepStrip (one tile per step) and fires N independent /jobs/submit calls on Launch with --dependency=afterok wiring derived from each step's depends_on. Step-level param_overrides / input_overrides prefill the per-step launch form. No server-side renderer. Substrate Passthrough Authoring Plan §5d.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/StepDecl"
+      }
+    },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "name",
+          "kind"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "allOf": [
+    {
+      "comment": "batch + interactive kinds require the full chassis: runtime + inputs + parameters + sbatch passthrough block. kind=preset overlays the BYO Nextflow chassis at render time; kind=workflow is a catalog-only steps[] passthrough that the console orchestrator reads.",
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "batch"
+              }
+            },
+            "required": ["kind"]
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "interactive"
+              }
+            },
+            "required": ["kind"]
+          }
+        ]
+      },
+      "then": {
+        "required": [
+          "runtime",
+          "inputs",
+          "parameters",
+          "sbatch"
+        ]
+      }
+    },
+    {
+      "comment": "kind=workflow requires steps[] only. No runtime/sbatch/script/parameters/inputs at the top level — each child step has its own. Step-level param_overrides / input_overrides prefill the strip's per-step drafts on unfold (catalog-only; the orchestrator fires per-step submits client-side).",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "workflow"
+          }
+        },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": [
+          "steps"
+        ],
+        "not": {
+          "anyOf": [
+            { "required": ["runtime"] },
+            { "required": ["sbatch"] },
+            { "required": ["script"] }
+          ]
+        }
+      }
+    },
+    {
+      "comment": "interactive requires routing and forbids config",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "interactive"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "routing"
+        ],
+        "not": {
+          "required": [
+            "config"
+          ]
+        }
+      }
+    },
+    {
+      "comment": "batch requires outputs + script",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "batch"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "outputs",
+          "script"
+        ]
+      }
+    },
+    {
+      "comment": "config: only allowed for runtime.kind=nextflow",
+      "if": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "kind": {
+                "const": "nextflow"
+              }
+            }
+          }
+        },
+        "required": [
+          "runtime"
+        ]
+      },
+      "then": {},
+      "else": {
+        "not": {
+          "required": [
+            "config"
+          ]
+        }
+      }
+    },
+    {
+      "comment": "preset requires tier + pipeline_repo; overlays the BYO Nextflow chassis at runtime",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "preset"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "tier",
+          "pipeline_repo"
+        ]
+      }
+    },
+    {
+      "comment": "schedule: is only allowed on kind=batch. Substrate Passthrough Authoring Plan §4b — scheduled CronJob emit is a batch variant.",
+      "if": {
+        "not": {
+          "properties": {
+            "kind": {
+              "const": "batch"
+            }
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "schedule"
+          ]
+        }
+      }
+    },
+    {
+      "comment": "routing forbidden unless kind=interactive",
+      "if": {
+        "not": {
+          "properties": {
+            "kind": {
+              "const": "interactive"
+            }
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "routing"
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "RuntimeBlock": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "docker_image",
+            "host_binary",
+            "venv",
+            "host_system",
+            "nextflow",
+            "interactive_image"
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "image"
+          ],
+          "properties": {
+            "kind": {
+              "const": "docker_image"
+            },
+            "image": {
+              "type": "string",
+              "minLength": 1
+            },
+            "registry_auth": {
+              "type": "string"
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "build_image",
+            "binary_path",
+            "build_command"
+          ],
+          "properties": {
+            "kind": {
+              "const": "host_binary"
+            },
+            "build_image": {
+              "type": "string",
+              "minLength": 1
+            },
+            "binary_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "build_command": {
+              "type": "string",
+              "minLength": 1
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "python_version",
+            "cache_dir"
+          ],
+          "properties": {
+            "kind": {
+              "const": "venv"
+            },
+            "python_version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "requirements": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "requirements_file": {
+              "type": "string"
+            },
+            "cache_dir": {
+              "type": "string",
+              "minLength": 1
+            },
+            "entrypoint": {
+              "type": "string"
+            },
+            "base_image": {
+              "type": "string"
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "binary"
+          ],
+          "properties": {
+            "kind": {
+              "const": "host_system"
+            },
+            "binary": {
+              "type": "string",
+              "minLength": 1
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "pipeline_repo",
+            "revision",
+            "nxf_version"
+          ],
+          "properties": {
+            "kind": {
+              "const": "nextflow"
+            },
+            "pipeline_repo": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "nxf_version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "schema_source": {
+              "enum": [
+                "auto",
+                "none",
+                "url"
+              ],
+              "default": "auto"
+            },
+            "schema_url": {
+              "type": "string"
+            },
+            "notes": {
+              "type": "string"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "schema_source": {
+                    "const": "url"
+                  }
+                },
+                "required": [
+                  "schema_source"
+                ]
+              },
+              "then": {
+                "required": [
+                  "schema_url"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "image"
+          ],
+          "properties": {
+            "kind": {
+              "const": "interactive_image"
+            },
+            "image": {
+              "type": "string",
+              "minLength": 1
+            },
+            "registry_auth": {
+              "type": "string"
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "InputDecl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "role",
+        "required"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "role": {
+          "enum": [
+            "fastq_r1",
+            "fastq_r2",
+            "bam",
+            "cram",
+            "fasta",
+            "reference_fasta",
+            "samplesheet",
+            "config_xml",
+            "config_json",
+            "mdp",
+            "prmtop",
+            "inpcrd",
+            "pdb",
+            "pdbqt",
+            "sdf",
+            "mol2",
+            "mgf",
+            "mzml",
+            "hmm_db",
+            "fasta_db",
+            "generic_path",
+            "raw_text",
+            "sample_id",
+            "license_id",
+            "env_map"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "default": {},
+        "format": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "columns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "columns"
+          ]
+        }
+      }
+    },
+    "ParamDecl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "widget"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "widget": {
+          "enum": [
+            "text",
+            "textarea",
+            "number",
+            "enum",
+            "bool",
+            "env_map",
+            "nextflow_schema",
+            "json_textarea"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "default": {},
+        "options": {
+          "type": "array"
+        },
+        "min": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "advanced": {
+          "type": "boolean",
+          "default": false
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "widget": {
+                "const": "enum"
+              }
+            },
+            "required": [
+              "widget"
+            ]
+          },
+          "then": {
+            "required": [
+              "options"
+            ]
+          }
+        }
+      ]
+    },
+    "OutputsBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dir",
+        "artifacts"
+      ],
+      "properties": {
+        "dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "key",
+              "path",
+              "role"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "role": {
+                "enum": [
+                  "metrics_file",
+                  "primary_output",
+                  "log",
+                  "generic"
+                ]
+              },
+              "description": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "RoutingBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path_prefix",
+        "port_param"
+      ],
+      "properties": {
+        "path_prefix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port_param": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ready_callback": {
+          "type": "boolean",
+          "default": true
+        },
+        "idle_cull_min": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "PolicyBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prefer_on_demand": {
+          "type": "boolean",
+          "default": false
+        },
+        "prefer_arm64": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "StepDecl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step_id", "template_id"],
+      "properties": {
+        "step_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "template_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "param_overrides": {
+          "type": "object"
+        },
+        "input_overrides": {
+          "type": "object"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "display_name": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

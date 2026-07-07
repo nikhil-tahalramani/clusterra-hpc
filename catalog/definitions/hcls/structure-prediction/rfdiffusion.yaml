@@ -1,0 +1,253 @@
+id: rfdiffusion
+name: RFdiffusion (protein backbone design)
+description: |
+  De novo protein backbone generation via RFdiffusion (RosettaCommons /
+  Baker Lab — https://github.com/RosettaCommons/RFdiffusion). Supports
+  unconditional monomer design, motif scaffolding, binder design,
+  symmetric oligomer design, and partial diffusion. GPU mandatory
+  (SE(3)-Transformer + PyTorch); a single A10G handles a 100-residue
+  design in well under a minute once warm.
+
+  Driven off the official `rosettacommons/rfdiffusion` Docker image
+  (CUDA 11.6 base) so we avoid the brittle from-source SE3-Transformer
+  build. Weights (~3.8 GB across 8 .pt files) are cached at
+  /mnt/efs/_rfdiffusion-cache/models so the first job pays the download
+  and every subsequent job reuses them. The IGSO3 schedule is also
+  cached at /mnt/efs/_rfdiffusion-cache/schedules.
+
+  Output is one PDB per requested design plus a Hydra config dump.
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+cost_anchor: ~$0.10 / 100-residue unconditional design (A10G spot, warm)
+modality: form
+tools: [RFdiffusion]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: rosettacommons/rfdiffusion@sha256:b88dc5d7ccd166557fb9b922bbaeb15bdf8d0568907c50405a8bf282e67254fe
+  notes: |
+    Official Rosetta Commons image, CUDA 11.6 base on ubuntu 20.04.
+    apptainer --nv mounts the host CUDA userspace from the DL AMI; the
+    host driver is forward compatible with the image's CUDA 11.6 client
+    libs (verified on clusde74 g5.16xlarge spot, jobs 2741/2752/2754,
+    2026-05-27).
+
+    The image declares an ENTRYPOINT (`python3.9 scripts/run_inference.py`),
+    which `apptainer exec` ignores. The image's python is NOT at
+    `/usr/bin/python3.9` — it lives inside an `.venv` at
+    `/app/RFdiffusion/.venv/bin/python3.9` (built with uv at image-build
+    time). We call this absolute path explicitly below.
+    See MEMORY apptainer_skips_docker_entrypoint.md.
+
+    Hydra default `hydra.run.dir=outputs/<date>/<time>` is created relative
+    to CWD. The SIF root + /app/RFdiffusion are read-only under apptainer
+    so we must pin `hydra.run.dir` into the per-job OUTPUT_DIR (writable
+    EFS) and set `hydra.output_subdir=null` to suppress the auto-created
+    `.hydra/` sidecar.
+
+    Schedule cache: RFdiffusion writes the IGSO3 schedule pickle on the
+    first run. Default path is `/app/RFdiffusion/schedules` — also
+    read-only. We bind a writable EFS dir to `/schedules` and pass
+    `inference.schedule_directory_path=/schedules` so warm runs skip the
+    ~5-8s IGSO3 compute.
+
+    No pip venv on EFS: the SE3-Transformer wheel is built into the image
+    and pip-installing it from source on a stock python:3.11 base requires
+    a matching CUDA toolchain that the DL AMI doesn't expose (only the
+    runtime libs). Going via the upstream image trades ~3 GB of SIF pull
+    on first use for zero install pain.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:1
+  # Untyped gpu:1 (not gpu:a10g:1) — RFdiffusion is not VRAM-bound for
+  # the 50-500aa designs that cover ~95% of customer use, and pinning to
+  # a10g caused PENDING/CANCEL on dev-demo when us-east-1 a10g spot was
+  # squeezed and Karpenter provisioned a t4 instead (smoke 2812 hit this
+  # 2026-05-28). See MEMORY gpu_typed_gres_spot_squeeze.md. Bump to
+  # gpu:l40s:1 manually via sbatch_override if you're doing >300aa
+  # multi-state designs where the activation tensor crosses 16 GB.
+
+inputs:
+  - key: input_pdb
+    role: pdb
+    required: false
+    default: ""
+    description: |
+      Optional target PDB for motif scaffolding, binder design, partial
+      diffusion, or symmetric motif scaffolding. Empty = unconditional
+      monomer design (no PDB needed).
+  - key: ppi_scaffolds_dir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Optional directory of fold-conditioned binder scaffold .pt files
+      (output of `helper_scripts/make_secstruc_adj.py`). Required only
+      for fold-conditioned binder design.
+
+parameters:
+  - key: contigs
+    widget: text
+    label: Contig map (contigmap.contigs)
+    default: "[50-50]"
+    required: true
+    description: |
+      Hydra contig string. Examples:
+        - Unconditional 50aa monomer:           [50-50]
+        - 100-150aa monomer:                    [100-150]
+        - Scaffold motif A10-25 with 5-15/30-40 flanks:
+                                                [5-15/A10-25/30-40]
+        - Binder design against chain A target: [A/0 50-100]
+      Square brackets MANDATORY. See README §Contigs for the full grammar.
+  - key: num_designs
+    widget: number
+    label: Designs (inference.num_designs)
+    default: 1
+    min: 1
+    max: 1000
+    description: Independent diffusion trajectories. Each writes one PDB.
+  - key: diffuser_t
+    widget: number
+    label: Diffusion timesteps (diffuser.T)
+    default: 50
+    min: 15
+    max: 200
+    advanced: true
+    description: |
+      Total denoising steps. Upstream default = 50; smoke runs go as low
+      as 15 with modest quality loss. Wall-clock scales roughly linear.
+  - key: symmetry
+    widget: enum
+    options: ["none", "c2", "c3", "c4", "c5", "c6", "d2", "d3", "d4", "tetrahedral"]
+    default: "none"
+    advanced: true
+    description: |
+      Symmetric oligomer design. `none` = no symmetry constraint.
+      Anything else binds `--config-name symmetry` and sets
+      `inference.symmetry`.
+  - key: extra_args
+    widget: text
+    default: ""
+    advanced: true
+    description: |
+      Free-form Hydra overrides appended verbatim, e.g.
+      `'contigmap.length=55-55' inference.final_step=48`. Use sparingly.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/rfdiff-{{.ctx.run_id}}"
+  artifacts:
+    - key: designs
+      path: "{{.outputs.dir}}"
+      role: primary_output
+      description: One PDB per requested design, plus Hydra config dump.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+
+  # Persistent EFS cache: ~3.8 GB of model weights + the IGSO3 schedule
+  # the first run computes. Shared across all users & jobs.
+  CACHE_ROOT=/mnt/efs/_rfdiffusion-cache
+  MODELS_DIR="$CACHE_ROOT/models"
+  SIF_PATH="$CACHE_ROOT/rfdiffusion.sif"
+  SCHEDULES_DIR="$CACHE_ROOT/schedules"
+  mkdir -p "$MODELS_DIR" "$SCHEDULES_DIR" "$(dirname "$SIF_PATH")"
+
+  IMAGE_URI="docker://{{.runtime.image}}"
+
+  # ---- Stage 1: SIF pull (flock-guarded) ----
+  # apptainer exec can run docker:// inline, but the SIF re-resolves per
+  # job. Pulling once to EFS makes warm jobs start in seconds.
+  (
+    flock -x 9
+    if [ ! -s "$SIF_PATH" ]; then
+      echo "[rfdiff] pulling SIF (one-time, ~3 GB) → $SIF_PATH"
+      apptainer pull --force "$SIF_PATH" "$IMAGE_URI"
+    fi
+  ) 9>"$SIF_PATH.lock"
+
+  # ---- Stage 2: model weight cache (flock-guarded) ----
+  # 8 mandatory .pt files from files.ipd.uw.edu (Baker lab CDN), ~3.8 GB
+  # total. wget is present in the rfdiffusion image; we run it inside the
+  # SIF so the cap-pod host doesn't need wget.
+  (
+    flock -x 9
+    if [ ! -f "$MODELS_DIR/Base_ckpt.pt" ] \
+       || [ ! -f "$MODELS_DIR/Complex_base_ckpt.pt" ] \
+       || [ ! -f "$MODELS_DIR/Base_epoch8_ckpt.pt" ]; then
+      echo "[rfdiff] downloading model weights (one-time, ~3.8 GB)"
+      apptainer exec --bind "$MODELS_DIR:/models" "$SIF_PATH" \
+        bash /app/RFdiffusion/scripts/download_models.sh /models
+    fi
+  ) 9>"$MODELS_DIR/.lock"
+
+  # ---- Stage 3: assemble hydra overrides ----
+  CONTIGS={{.params.contigs | quote}}
+  INPUT_PDB={{.inputs.input_pdb | quote}}
+  SYMMETRY={{.params.symmetry | quote}}
+  EXTRA={{.params.extra_args | quote}}
+
+  ARGS=(
+    "inference.output_prefix=$OUTPUT_DIR/design"
+    "inference.model_directory_path=/models"
+    "inference.schedule_directory_path=/schedules"
+    "inference.num_designs={{.params.num_designs}}"
+    "diffuser.T={{.params.diffuser_t}}"
+    "contigmap.contigs=$CONTIGS"
+    "hydra.run.dir=$OUTPUT_DIR/hydra"
+    "hydra.output_subdir=null"
+  )
+
+  # SCHEDULES_DIR binds to /schedules (NOT /app/RFdiffusion/schedules) —
+  # the SIF puts /app/RFdiffusion on a read-only overlay, so apptainer
+  # rejects nested binds under it. We pass the path explicitly via
+  # `inference.schedule_directory_path` instead.
+  BIND_ARGS=( --nv
+              --bind "$MODELS_DIR:/models"
+              --bind "$SCHEDULES_DIR:/schedules"
+              --bind "$OUTPUT_DIR:$OUTPUT_DIR" )
+
+  if [ -n "$INPUT_PDB" ]; then
+    [ -r "$INPUT_PDB" ] || { echo "input_pdb not readable: $INPUT_PDB" >&2; exit 1; }
+    BIND_ARGS+=( --bind "$(dirname "$INPUT_PDB"):$(dirname "$INPUT_PDB")" )
+    ARGS+=( "inference.input_pdb=$INPUT_PDB" )
+  fi
+
+  PPI_SCAFFOLDS={{.inputs.ppi_scaffolds_dir | quote}}
+  if [ -n "$PPI_SCAFFOLDS" ]; then
+    [ -d "$PPI_SCAFFOLDS" ] || { echo "ppi_scaffolds_dir missing: $PPI_SCAFFOLDS" >&2; exit 1; }
+    BIND_ARGS+=( --bind "$PPI_SCAFFOLDS:$PPI_SCAFFOLDS" )
+    ARGS+=( "scaffoldguided.scaffoldguided=True"
+            "scaffoldguided.scaffold_dir=$PPI_SCAFFOLDS" )
+  fi
+
+  if [ "$SYMMETRY" != "none" ] && [ -n "$SYMMETRY" ]; then
+    ARGS=( "--config-name=symmetry" "${ARGS[@]}" "inference.symmetry=$SYMMETRY" )
+  fi
+
+  # ---- Stage 4: run ----
+  # apptainer exec SKIPS the image's ENTRYPOINT (python3.9 scripts/run_inference.py).
+  # Python lives in a uv-built venv at /app/RFdiffusion/.venv (NOT /usr/bin).
+  # cd into the writable OUTPUT_DIR so any hydra side-effects land on EFS;
+  # hydra's @hydra.main(config_path="../config/inference") is resolved
+  # relative to the script's __file__, not CWD, so this is safe.
+  cd "$OUTPUT_DIR"
+  if [ -n "$EXTRA" ]; then
+    # shellcheck disable=SC2086
+    exec apptainer exec "${BIND_ARGS[@]}" "$SIF_PATH" \
+      bash -lc "cd '$OUTPUT_DIR' && /app/RFdiffusion/.venv/bin/python3.9 /app/RFdiffusion/scripts/run_inference.py ${ARGS[*]@Q} $EXTRA"
+  else
+    exec apptainer exec "${BIND_ARGS[@]}" "$SIF_PATH" \
+      bash -lc "cd '$OUTPUT_DIR' && /app/RFdiffusion/.venv/bin/python3.9 /app/RFdiffusion/scripts/run_inference.py ${ARGS[*]@Q}"
+  fi

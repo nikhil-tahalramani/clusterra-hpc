@@ -1,0 +1,195 @@
+id: casanovo
+name: Casanovo de novo Peptide Sequencing (GPU)
+description: |
+  GPU-accelerated de novo peptide sequencing from MS/MS spectra using Casanovo
+  (Noble Lab). Transformer model trained on MassIVE-KB; predicts peptide
+  sequences directly from MGF spectra without a reference protein database —
+  complement to library-search (DIA-NN) and database-search (Comet/MSGF+) tools
+  for novel peptides, immunopeptidomics, metaproteomics, and antibody discovery.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [Casanovo]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: condaforge/miniforge3@sha256:e005c6b132774b4093b96af586fe46a2464efec691ebbeefd1b710d291f8a67e
+  requirements: ["casanovo==5.0.0"]
+  cache_dir: /mnt/efs/_casanovo-venv/5.0.0-cu121
+  entrypoint: python -m casanovo.casanovo
+  notes: |
+    No upstream Casanovo container exists on GHCR, Docker Hub, Quay/biocontainers
+    (verified May 7 2026). We use condaforge/miniforge3 (~300MB) so we can install
+    rdkit from conda-forge — that build bundles libXrender / libSM / libXext as
+    conda-managed sibling libs, which is the only way to get them on cap-pod
+    apptainer (uid 401, no subuid → apt-get install inside the container fails).
+    See cap_pod_apptainer_build_blocked memory (May 7 2026). casanovo + torch
+    cu121 still come from pip into a persistent EFS site-packages cache.
+    nvcr.io/nvidia/pytorch:24.01-py3 (~25GB) filled /tmp on g5 cap-pods (job 1767).
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:1
+inputs:
+  - key: input_mgf
+    role: mgf
+    required: true
+    description: Path to an .mgf file containing MS/MS spectra.
+  - key: model_path
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Optional Casanovo .ckpt checkpoint on /mnt/efs. Empty = auto-download
+      official Casanovo v5 weights on first run.
+
+parameters:
+  - key: mode
+    widget: enum
+    options: [sequence, evaluate]
+    default: sequence
+    description: |
+      sequence = de novo inference. evaluate = benchmark against annotated
+      MGFs and emit precision/coverage curves.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/casanovo-{{.ctx.run_id}}"
+  artifacts:
+    - key: mztab
+      path: "{{.outputs.dir}}/casanovo.mztab"
+      role: primary_output
+    - key: log
+      path: "{{.outputs.dir}}/casanovo.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_MGF={{.inputs.input_mgf | quote}}
+  MODEL_PATH={{.inputs.model_path | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  MODE={{.params.mode | quote}}
+
+  mkdir -p "$OUTPUT_DIR"
+
+  # URL convenience: if input_mgf looks like an http(s) URL, fetch into the
+  # output dir and use the local copy. Keeps smoke tests one-shot without
+  # requiring a pre-staged file on EFS.
+  case "$INPUT_MGF" in
+    http://*|https://*)
+      LOCAL="$OUTPUT_DIR/$(basename "$INPUT_MGF")"
+      echo "staging input_mgf from URL: $INPUT_MGF -> $LOCAL"
+      curl -sSL --fail -o "$LOCAL" "$INPUT_MGF"
+      INPUT_MGF="$LOCAL"
+      ;;
+  esac
+
+  [ -r "$INPUT_MGF" ] || { echo "input_mgf not readable: $INPUT_MGF" >&2; exit 1; }
+  if [ -n "$MODEL_PATH" ]; then
+    [ -r "$MODEL_PATH" ] || { echo "model_path not readable: $MODEL_PATH" >&2; exit 1; }
+  fi
+  mkdir -p "$OUTPUT_DIR"
+  cd "$OUTPUT_DIR"
+
+  # NOTE: runtime.cache_dir does not pass through Go-template substitution (it
+  # comes from runtimeMap projection in render.go). Build the per-user path in
+  # the script instead so each user gets their own writable site-packages cache.
+  CASANOVO_VENV="/mnt/efs/{{.ctx.user_email}}/_casanovo-venv/5.0.0-cu121"
+  CASANOVO_CACHE="/mnt/efs/{{.ctx.user_email}}/_casanovo-cache"
+  mkdir -p "$CASANOVO_VENV" "$CASANOVO_CACHE"
+  export TORCH_HOME="$CASANOVO_CACHE/torch"
+  export XDG_CACHE_HOME="$CASANOVO_CACHE/xdg"
+  export PYTHONUSERBASE="$CASANOVO_VENV"
+  mkdir -p "$TORCH_HOME" "$XDG_CACHE_HOME"
+
+  # Casanovo 5.0 CLI: `sequence --output_dir DIR --output_root NAME PEAK_PATH...`
+  # (the older --output single-file flag was removed in 5.0).
+  ARGS=( "$MODE" --output_dir "$OUTPUT_DIR" --output_root casanovo )
+  [ -n "$MODEL_PATH" ] && ARGS+=( --model "$MODEL_PATH" )
+  ARGS+=( "$INPUT_MGF" )
+
+  PIP_CACHE_DIR="/mnt/efs/{{.ctx.user_email}}/_casanovo-pip-cache"
+  mkdir -p "$PIP_CACHE_DIR"
+
+  # Persistent conda env on EFS — created once via `conda create -p` so the
+  # rdkit/libXrender stack lands as a conda-managed sibling lib (the only way
+  # to get those .so files on cap-pod apptainer without subuid/--fakeroot).
+  # casanovo + cu121 torch go in on top via pip --user.
+  CASANOVO_CONDA_ENV="/mnt/efs/{{.ctx.user_email}}/_casanovo-conda-env"
+
+  # If a prior bad install left literal '{{.ctx.user_email}}' dirs from the
+  # old runtime.cache_dir bug, ignore them — we use the per-user paths above.
+  # If the venv is stale (pre-rdkit-conda), wipe it so pip --user reinstalls.
+  if [ -d "$CASANOVO_VENV" ] && [ ! -d "$CASANOVO_CONDA_ENV" ]; then
+    echo "wiping stale pip-only venv at $CASANOVO_VENV (predates conda fix)"
+    rm -rf "$CASANOVO_VENV"
+    mkdir -p "$CASANOVO_VENV"
+  fi
+
+  # miniforge3's apptainer image runs as a user with HOME=/nonexistent, so mamba's
+  # default cache dir ($HOME/.mamba/pkgs/cache) is unwritable. Point HOME +
+  # MAMBA_ROOT_PREFIX at a writable EFS dir so libmamba can persist its repodata
+  # cache between runs (huge wall-clock win on warm runs).
+  MAMBA_ROOT="/mnt/efs/{{.ctx.user_email}}/_casanovo-mamba-root"
+  mkdir -p "$MAMBA_ROOT"
+
+  # Use a per-user scratch under EFS (always writable) instead of $TMPDIR — the
+  # latter can land on /tmp which is owned by an earlier job's user on shared
+  # slurmd shapes.
+  RUNNER_DIR="/mnt/efs/{{.ctx.user_email}}/_casanovo-tmp"
+  mkdir -p "$RUNNER_DIR"
+  RUNNER="$RUNNER_DIR/casanovo-runner-$$.sh"
+  {
+    printf '#!/bin/bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'CONDA_ENV=%q\n' "$CASANOVO_CONDA_ENV"
+    printf 'PIP_CACHE_DIR=%q\n' "$PIP_CACHE_DIR"
+    printf 'export HOME=%q\n' "$MAMBA_ROOT"
+    printf 'export MAMBA_ROOT_PREFIX=%q\n' "$MAMBA_ROOT"
+    printf 'export CONDA_PKGS_DIRS=%q\n' "$MAMBA_ROOT/pkgs"
+    # One-time: create the conda env with rdkit + python from conda-forge.
+    # rdkit's conda-forge build bundles libXrender / libSM / libXext / libICE.
+    printf 'if [ ! -x "$CONDA_ENV/bin/python" ]; then\n'
+    printf '  echo "creating conda env at $CONDA_ENV (one-time, ~3-5 min)"\n'
+    printf '  mamba create -y -p "$CONDA_ENV" -c conda-forge python=3.11 rdkit pip\n'
+    printf 'fi\n'
+    # Activate the env: prepend to PATH and set CONDA_PREFIX so its libs are found.
+    printf 'export PATH="$CONDA_ENV/bin:$PATH"\n'
+    printf 'export CONDA_PREFIX="$CONDA_ENV"\n'
+    printf 'export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"\n'
+    # casanovo + torch via pip --user into the writable PYTHONUSERBASE on EFS.
+    # PYTHONUSERBASE wins over conda env site-packages for user installs.
+    printf 'if ! "$CONDA_ENV/bin/python" -c "import casanovo, torch" 2>/dev/null; then\n'
+    printf '  echo "installing casanovo + cu121 torch into pip --user cache"\n'
+    printf '  "$CONDA_ENV/bin/pip" install --user --quiet torch --index-url https://download.pytorch.org/whl/cu121 --cache-dir "$PIP_CACHE_DIR"\n'
+    printf '  "$CONDA_ENV/bin/pip" install --user --quiet casanovo==5.0.0 --cache-dir "$PIP_CACHE_DIR"\n'
+    printf 'fi\n'
+    printf 'echo "==== rdkit import smoke ===="\n'
+    printf '"$CONDA_ENV/bin/python" -c "from rdkit.Chem import Draw; print(\\"rdkit OK\\")"\n'
+    printf 'exec "$CONDA_ENV/bin/python" -m casanovo.casanovo'
+    for a in "${ARGS[@]}"; do printf ' %q' "$a"; done
+    printf '\n'
+  } > "$RUNNER"
+  chmod +x "$RUNNER"
+
+  # Fallback if TaskProlog didn't export TMPDIR (e.g. fresh node, prolog raced).
+  if [ -z "${TMPDIR:-}" ]; then
+    TMPDIR="/mnt/efs/tmp/job-${SLURM_JOB_ID:-$$}"
+    mkdir -p "$TMPDIR"
+  fi
+
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs:/mnt/efs \
+    --env "PYTHONUSERBASE=$PYTHONUSERBASE" \
+    --env "TORCH_HOME=$TORCH_HOME" \
+    --env "XDG_CACHE_HOME=$XDG_CACHE_HOME" \
+    "docker://{{.runtime.base_image}}" \
+    bash "$RUNNER"

@@ -1,0 +1,93 @@
+[
+    {
+        "id": "clusterra-hello-tab",
+        "type": "tab",
+        "label": "Hello Clusterra job",
+        "disabled": false,
+        "info": "Submits a tiny `sleep 30` job, polls until it finishes, and prints the result.\n\nReads the API URL + bearer token from `clusterra-creds.json` in the userDir (seeded by the entrypoint)."
+    },
+    {
+        "id": "load-creds",
+        "type": "function",
+        "z": "clusterra-hello-tab",
+        "name": "load creds",
+        "func": "const fs = global.get('fs') || require('fs');\nconst path = (process.env.NODE_RED_USER_DIR || '/data') + '/clusterra-creds.json';\nconst c = JSON.parse(fs.readFileSync(path, 'utf8'));\nmsg.headers = { 'Authorization': 'Bearer ' + c.auth_token, 'Content-Type': 'application/json' };\nmsg.url = c.api_url + '/v1/clusters/' + c.cluster_id + '/jobs/submit';\nmsg.payload = {\n    template_id: 'custom-slurm',\n    params: {\n        job_name: 'nodered-hello',\n        script_body: '#!/bin/bash\\necho hello from node-red\\nsleep 30',\n        cpus: 1\n    }\n};\nflow.set('cluster_id', c.cluster_id);\nflow.set('api_url', c.api_url);\nflow.set('auth', msg.headers.Authorization);\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 220,
+        "y": 100,
+        "wires": [["submit"]]
+    },
+    {
+        "id": "trigger",
+        "type": "inject",
+        "z": "clusterra-hello-tab",
+        "name": "submit hello-job",
+        "props": [{ "p": "payload" }],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "topic": "",
+        "x": 100,
+        "y": 60,
+        "wires": [["load-creds"]]
+    },
+    {
+        "id": "submit",
+        "type": "http request",
+        "z": "clusterra-hello-tab",
+        "name": "POST /jobs/submit",
+        "method": "POST",
+        "ret": "obj",
+        "url": "",
+        "x": 460,
+        "y": 100,
+        "wires": [["wait"]]
+    },
+    {
+        "id": "wait",
+        "type": "delay",
+        "z": "clusterra-hello-tab",
+        "name": "wait 5s",
+        "pauseType": "delay",
+        "timeout": "5",
+        "timeoutUnits": "seconds",
+        "x": 660,
+        "y": 100,
+        "wires": [["build-status-url"]]
+    },
+    {
+        "id": "build-status-url",
+        "type": "function",
+        "z": "clusterra-hello-tab",
+        "name": "build status url",
+        "func": "msg.url = flow.get('api_url') + '/v1/clusters/' + flow.get('cluster_id') + '/jobs/' + msg.payload.job_id;\nmsg.method = 'GET';\nmsg.headers = { 'Authorization': flow.get('auth') };\nreturn msg;",
+        "outputs": 1,
+        "x": 860,
+        "y": 100,
+        "wires": [["status"]]
+    },
+    {
+        "id": "status",
+        "type": "http request",
+        "z": "clusterra-hello-tab",
+        "name": "GET /jobs/{id}",
+        "method": "use",
+        "ret": "obj",
+        "url": "",
+        "x": 1060,
+        "y": 100,
+        "wires": [["debug"]]
+    },
+    {
+        "id": "debug",
+        "type": "debug",
+        "z": "clusterra-hello-tab",
+        "name": "result",
+        "active": true,
+        "complete": "payload",
+        "x": 1230,
+        "y": 100,
+        "wires": []
+    }
+]

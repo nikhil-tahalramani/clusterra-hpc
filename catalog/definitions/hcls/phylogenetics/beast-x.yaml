@@ -1,0 +1,93 @@
+id: beast-x
+name: BEAST X + BEAGLE (GPU Bayesian phylogenetics)
+description: |
+  Bayesian phylogenetic inference with the GPU likelihood backend. BEAST X
+  (beast-dev/beast-mcmc, 242 stars) calls into BEAGLE-lib (145 stars) for
+  the per-site likelihood compute that dominates wall-clock; the GPU build
+  is 10–100× faster than the CPU path on large alignments. Wedge report
+  § 5 trust signal: adoption gap is "ship the GPU build, default-on BEAGLE
+  flags", not a tool swap.
+vertical: hcls
+category: phylogenetics
+workload_group: phylogenetics
+modality: form
+tools: [BEAST, BEAGLE]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://quay.io/biocontainers/beast@sha256:495457986e5809739ed2ff3ac3d40fda6a76afdc965abeb8df3813d40063033c
+  notes: |
+    quay.io/biocontainers/beast:1.10.4--0 — BEAST X (beast-dev/beast-mcmc
+    1.10.4) with BEAGLE-lib bundled. Pass `-beagle_gpu -beagle_double` to
+    activate the CUDA likelihood backend when /dev/nvidia* is bound via
+    apptainer --nv. Falls back to CPU BEAGLE on nodes without GPU (so
+    SMOKE_MODE works anywhere).
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=8G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: xml_input
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      BEAST XML input (analysis spec + alignment). Empty = SMOKE_MODE
+      (beast -help only).
+
+parameters:
+  - key: chain_length
+    label: MCMC chain length override (0 = use XML default)
+    widget: number
+    default: 0
+    min: 0
+    max: 1000000000
+  - key: beagle_precision
+    widget: enum
+    options: [single, double]
+    default: double
+    description: BEAGLE GPU precision. double = numerically stable on large alignments.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/beast-{{.ctx.run_id}}"
+  artifacts:
+    - key: trees
+      path: "{{.outputs.dir}}/output.trees"
+      role: primary_output
+      description: Posterior tree sample (Nexus format).
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+
+  # SMOKE_MODE: `beast -help` exercises BEAGLE-lib JVM + JNI load.
+  if [ "${BEAST_SMOKE:-1}" = "1" ] || [ -z {{.inputs.xml_input | quote}} ]; then
+    echo "[beast-x] SMOKE_MODE: beast -help (set BEAST_SMOKE=0 + provide xml_input for real inference)"
+    exec apptainer exec --nv --bind /mnt/efs \
+      "{{.runtime.image}}" \
+      beast -help
+  fi
+
+  XML={{.inputs.xml_input | quote}}
+  [ -f "$XML" ] || { echo "xml_input not readable: $XML" >&2; exit 1; }
+
+  CHAIN_FLAG=()
+  {{if gt .params.chain_length 0}}
+  CHAIN_FLAG=(-overwrite -seed 42 -mc3_steps {{.params.chain_length}})
+  {{end}}
+
+  PRECISION_FLAG=(-beagle_gpu)
+  [ {{.params.beagle_precision | quote}} = "double" ] && PRECISION_FLAG+=(-beagle_double)
+
+  cd "$OUTPUT_DIR"
+  exec apptainer exec --nv --bind /mnt/efs \
+    "{{.runtime.image}}" \
+    beast "${PRECISION_FLAG[@]}" "${CHAIN_FLAG[@]}" "$XML"

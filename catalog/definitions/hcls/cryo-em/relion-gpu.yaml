@@ -1,0 +1,389 @@
+id: relion-gpu
+name: RELION (GPU 2D/3D classification + auto-refine)
+description: |
+  GPU-accelerated cryo-EM single-particle reconstruction with RELION 5.0
+  (CUDA 12.6). Drives 2D classification, 3D classification, and 3D
+  auto-refine through `relion_refine_mpi` under a local OpenMPI launch
+  (1 master + N GPU-worker ranks, the MRC-LMB convention). Single- and
+  multi-GPU on one node; right-sized so a 1-GPU job lands the cheap
+  g5.xlarge. Spot-safe: on a Slurm requeue after a spot reclaim it
+  resumes (`--continue`) from the last checkpointed iteration instead of
+  restarting from iteration 0.
+
+  Pairs with the CPU `relion` template — same parameter surface and
+  project-root auto-detection — but adds `--gpu`, NVMe `--scratch_dir`,
+  and the local-mpirun launch the GPU codepath needs. Validated on
+  EMPIAR-10028 (Plasmodium ribosome) 3D classification, jobs 2983/2986
+  (clusde74, 2026-06-02).
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [RELION]
+ready: true
+kind: batch
+
+cost_anchor: ~$1.65 right-sized (1x A10G g5.xlarge spot) / ~$4 as-run (g5.4xlarge); 3D-class K=6 25-iter EMPIAR-10028 ~3h18m
+
+runtime:
+  kind: docker_image
+  image: jidaniel/relion:5.0-cuda12.6
+  notes: |
+    RELION 5.0 + CUDA 12.6, GUI OFF. Ships both `relion_refine` and
+    `relion_refine_mpi`. Verified jobs 2983/2986 (clusde74, 2026-06-02).
+    Pulled to a cluster-cached SIF at
+    /mnt/efs/sifs/relion_5.0-cuda12.6.sif (~11.7 GB) under a flock so the
+    first job on the cluster pays the one-time OCI->SIF convert and every
+    later job skips it.
+
+    The DL-AMI on cap-pods ships CUDA + drivers; `apptainer exec --nv`
+    mounts the host CUDA userspace, so no in-image driver is needed.
+    Direct `apptainer exec --nv` works — no conda/bash-lc wrapper.
+
+    Cap-pod apptainer cache gotcha (see MEMORY: template_image_uri_lessons,
+    cap_pod_apptainer_build_blocked): the cluster-shared cache is owned by
+    uid=slurm and not writable by the runtime uid, so we point
+    APPTAINER_CACHEDIR at per-job TMPDIR for the convert and promote the
+    SIF to /mnt/efs/sifs afterwards.
+
+    The local-mpirun recipe (`--mca plm ^slurm --mca ras ^slurm
+    --oversubscribe --bind-to none`) stops OpenMPI from reaching for
+    Slurm's unconfigured PMI launcher and forks ranks locally in the pod.
+    The `--bind "$TMPDIR:$TMPDIR"` is REQUIRED — OpenMPI's ORTE session
+    dir lands under $TMPDIR (/mnt/scratch) which is not in the image's
+    default bind list, and without it mpirun dies with
+    `orte_session_dir failed`.
+
+# NOTE: the gres / cpus / mem / threads below are Go-templated off the
+# parameters so a 1-GPU run lands g5.xlarge and a 4-GPU run can be requested
+# from the same template. sbatch IS rendered through the same Go-template
+# engine as the script body (renderString), so these conditionals are valid.
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task={{.params.cpus_per_task}}
+  #SBATCH --mem={{.params.mem_gb}}G
+  #SBATCH --time=8:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:{{.params.gpu_model}}:{{.params.n_gpus}}
+  #SBATCH --requeue
+inputs:
+  - key: input_star
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Particles STAR file (output of relion_preprocess / Extract /
+      Select). Empty = SMOKE_MODE — runs `relion_refine --help` only to
+      validate plumbing. Project root is auto-detected from this path so
+      the relative .mrcs stack references in the STAR file resolve.
+  - key: reference_map
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      3D reference map (.mrc) for 3D classification / 3D auto-refine.
+      Passed as `--ref <map>:mrc`. Leave empty for 2D classification
+      (job_type=class2d). REQUIRED for class3d / refine3d.
+
+parameters:
+  - key: job_type
+    label: RELION task
+    widget: enum
+    options: [class2d, class3d, refine3d]
+    default: class2d
+    description: |
+      class2d = 2D classification (no reference). class3d = 3D
+      classification (needs reference_map). refine3d = 3D gold-standard
+      auto-refine (needs reference_map; uses --auto_refine --split_random_halves).
+  - key: n_gpus
+    label: GPUs (ranks = n_gpus + 1)
+    widget: number
+    default: 1
+    min: 1
+    max: 8
+    description: |
+      Single-node GPU count. mpirun launches n_gpus + 1 ranks (1 master +
+      N GPU workers, MRC-LMB convention). RELION GPU scaling is roughly
+      flat past 4 GPUs for small-lab particle counts. For n_gpus>1 raise
+      cpus_per_task / mem_gb / gpu_model to a multi-GPU shape (e.g.
+      gpu_model=a10g, n_gpus=4, cpus_per_task=15 lands g5.12xlarge).
+  - key: gpu_model
+    label: GPU model (Slurm gres type)
+    widget: enum
+    options: [a10g, a100, l40s]
+    default: a10g
+    description: |
+      Typed gres pins the EC2 family (a10g -> g5; see MEMORY
+      gpu_typed_gres_spot_squeeze). a10g (24 GB) suffices for most
+      single-particle boxes; pin l40s/a100 only as a VRAM floor.
+  - key: cpus_per_task
+    label: CPUs per task
+    widget: number
+    default: 3
+    min: 2
+    max: 64
+    description: |
+      Single-GPU RELION is GPU-bound. Keep cpus <= instance_vCPU - ~1 so
+      the allocation fits the node allocatable: cpus=3 lands the cheap
+      g5.xlarge (~3.45 allocatable vCPU); cpus=4 would NOT fit. Raise in
+      step with n_gpus for multi-GPU shapes.
+  - key: mem_gb
+    label: Memory (GiB)
+    widget: number
+    default: 14
+    min: 8
+    max: 480
+    description: |
+      14 GiB fits g5.xlarge allocatable for a 1-GPU run. Particles are
+      streamed off the NVMe scratch_dir, not held in RAM, so this is the
+      RELION working-set headroom, not the dataset size.
+  - key: threads
+    label: RELION threads (--j)
+    widget: number
+    default: 3
+    min: 1
+    max: 32
+    description: |
+      Per-rank pooling threads (RELION --j). Default 3 for a single GPU.
+      With --bind-to none the threads spread across the allocated cores.
+  - key: n_classes_k
+    label: Number of classes (K)
+    widget: number
+    default: 4
+    min: 1
+    max: 200
+    description: |
+      K for 2D/3D classification. Ignored for refine3d (gold-standard
+      auto-refine is single-class).
+  - key: pool
+    label: Pool size (particles per orientation pass)
+    widget: number
+    default: 30
+    min: 1
+    max: 200
+  - key: iter
+    label: Iterations
+    widget: number
+    default: 25
+    min: 1
+    max: 100
+    description: |
+      Classification iterations. For refine3d this is the cap before
+      auto-refine convergence; auto-refine usually converges earlier.
+  - key: particle_diameter
+    label: Particle mask diameter (Angstroms)
+    widget: number
+    default: 200
+    min: 10
+    max: 1000
+  - key: output_prefix
+    label: Output rootname (passed to relion_refine -o)
+    widget: text
+    default: ""
+    description: |
+      Optional. Empty = generated /mnt/efs/.../<JobDir>/run where JobDir
+      is Class2D / Class3D / Refine3D per job_type. RELION writes
+      run_it{NNN}_*.star + run.log to this prefix.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/relion-gpu-{{.ctx.run_id}}"
+  artifacts:
+    - key: data_star
+      path: "{{.outputs.dir}}/run_it025_data.star"
+      role: primary_output
+      description: |
+        Final-iteration per-particle assignments + alignment parameters.
+        Filename uses iter=25 by default; the real file is
+        run_it{NNN}_data.star where NNN is the chosen iteration count
+        zero-padded. For refine3d the converged file is run_data.star.
+    - key: model_star
+      path: "{{.outputs.dir}}/run_it025_model.star"
+      role: primary_output
+      description: Refined references + per-class resolution / FSC stats.
+    - key: classes_mrcs
+      path: "{{.outputs.dir}}/run_it025_classes.mrcs"
+      role: primary_output
+      description: |
+        2D/3D class averages stack (one stack, K slices). Absent for
+        refine3d (which emits run_class001.mrc instead).
+    - key: log
+      path: "{{.outputs.dir}}/run.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  # TMPDIR is exported by Slurm's TaskProlog (NVMe via /mnt/scratch on
+  # NVMe-bearing nodes; EFS fallback otherwise). Epilog cleans it up.
+
+  IMG="docker://{{.runtime.image}}"
+  INPUT_STAR={{.inputs.input_star | quote}}
+  REFERENCE_MAP={{.inputs.reference_map | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  OUTPUT_PREFIX={{.params.output_prefix | quote}}
+  JOB_TYPE={{.params.job_type | quote}}
+  NGPU={{.params.n_gpus}}
+  THREADS={{.params.threads}}
+  NRANK=$((NGPU + 1))   # 1 master + N GPU workers (MRC-LMB convention)
+
+  # validate job_type (JobDir nesting intentionally omitted so the declared
+  # output artifacts at {{.outputs.dir}}/run_it025_* resolve to real files).
+  case "$JOB_TYPE" in
+    class2d|class3d|refine3d) : ;;
+    *) echo "unknown job_type: $JOB_TYPE" >&2; exit 1 ;;
+  esac
+  mkdir -p "$OUTPUT_DIR"
+
+  # --- one-time, flock-guarded SIF pull (~11.7 GB) ----------------------
+  # Cluster-shared cache is owned by uid=slurm and not writable by the
+  # runtime uid, so convert in per-job TMPDIR and promote to /mnt/efs/sifs.
+  SIF_STORE=/mnt/efs/sifs
+  mkdir -p "$SIF_STORE" || true
+  SIF_NAME="relion_5.0-cuda12.6.sif"
+  SIF_PATH="$SIF_STORE/$SIF_NAME"
+  export APPTAINER_CACHEDIR="$TMPDIR/apptainer-cache"
+  export APPTAINER_TMPDIR="$TMPDIR/apptainer-tmp"
+  mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
+
+  if [ ! -s "$SIF_PATH" ]; then
+    # flock so concurrent jobs on a fresh cluster don't double-pull 11.7 GB.
+    exec 9>"$SIF_STORE/.${SIF_NAME}.lock" || true
+    if flock -w 1800 9 2>/dev/null; then
+      if [ ! -s "$SIF_PATH" ]; then
+        echo "[relion-gpu] pulling $IMG -> $SIF_PATH (first job on this cluster pays this ~11.7 GB convert)"
+        if ! apptainer pull --force "$SIF_PATH" "$IMG" 2>&1; then
+          echo "[relion-gpu] SIF promote failed (read-only EFS perms?); falling back to docker:// per-job pull"
+          SIF_PATH="$IMG"
+        fi
+      fi
+      flock -u 9 2>/dev/null || true
+    else
+      echo "[relion-gpu] could not acquire SIF lock in 1800s; falling back to docker:// per-job pull"
+      SIF_PATH="$IMG"
+    fi
+  fi
+
+  # --- SMOKE_MODE: no input_star -> help only ---------------------------
+  if [ "${RELION_SMOKE:-0}" = "1" ] || [ -z "$INPUT_STAR" ]; then
+    echo "[relion-gpu] SMOKE_MODE: relion_refine --help (provide input_star for a real run)"
+    exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+      "$SIF_PATH" relion_refine --help
+  fi
+
+  [ -r "$INPUT_STAR" ] || { echo "input_star not readable: $INPUT_STAR" >&2; exit 1; }
+
+  if [ -z "$OUTPUT_PREFIX" ]; then
+    OUTPUT_PREFIX="$OUTPUT_DIR/run"
+  fi
+  mkdir -p "$(dirname "$OUTPUT_PREFIX")"
+
+  # NVMe scratch — load-bearing. RELION copies particles off EFS once here.
+  SCRATCH="$TMPDIR/relion_scratch"
+  mkdir -p "$SCRATCH"
+
+  # RELION resolves relative image paths in the STAR file against cwd; cd
+  # into the auto-detected project root so it finds the .mrcs stacks.
+  PROJECT_DIR="$(dirname "$INPUT_STAR")"
+  while [ "$PROJECT_DIR" != "/" ] && [ ! -d "$PROJECT_DIR/Schemes" ] && [ ! -d "$PROJECT_DIR/Extract" ] && [ ! -d "$PROJECT_DIR/Select" ] && [ ! -d "$PROJECT_DIR/Class2D" ]; do
+    PROJECT_DIR="$(dirname "$PROJECT_DIR")"
+  done
+  [ "$PROJECT_DIR" = "/" ] && PROJECT_DIR="$(dirname "$INPUT_STAR")"
+  echo "[relion-gpu] PROJECT_DIR=$PROJECT_DIR JOB_TYPE=$JOB_TYPE NGPU=$NGPU NRANK=$NRANK"
+  cd "$PROJECT_DIR"
+
+  # --- the local-mpirun launcher (the critical recipe) ------------------
+  # --mca plm ^slurm --mca ras ^slurm : don't reach for Slurm's unconfigured
+  #   PMI launcher; fork ranks locally in the pod.
+  # --oversubscribe --bind-to none : let RELION's --j threads spread.
+  # --bind "$TMPDIR:$TMPDIR" : REQUIRED — ORTE session dir lives under
+  #   /mnt/scratch which isn't in the image's default bind list.
+  MPIRUN=( mpirun --mca plm ^slurm --mca ras ^slurm --oversubscribe --bind-to none -np "$NRANK" )
+
+  # --- spot-resume: scan for the highest run_it*_optimiser.star ---------
+  # On a requeue after a spot reclaim, resume from the last checkpoint
+  # instead of restarting at iteration 0.
+  LATEST_OPT=""
+  shopt -s nullglob
+  for f in "$(dirname "$OUTPUT_PREFIX")"/$(basename "$OUTPUT_PREFIX")_it*_optimiser.star; do
+    LATEST_OPT="$f"   # glob expands in lexical order; highest it{NNN} sorts last
+  done
+  shopt -u nullglob
+
+  if [ -n "$LATEST_OPT" ] && [ -s "$LATEST_OPT" ]; then
+    echo "[relion-gpu] RESUME path: found checkpoint $LATEST_OPT — continuing (spot requeue)"
+    # RELION reads the rest of the run parameters from the optimiser file.
+    RELION_ARGS=(
+      --continue       "$LATEST_OPT"
+      --o              "$OUTPUT_PREFIX"
+      --iter           {{.params.iter}}
+      --gpu
+      --j              "$THREADS"
+      --scratch_dir    "$SCRATCH"
+    )
+  else
+    echo "[relion-gpu] FRESH path: no checkpoint found — starting from iteration 0"
+    RELION_ARGS=(
+      --i              "$INPUT_STAR"
+      --o              "$OUTPUT_PREFIX"
+      --particle_diameter {{.params.particle_diameter}}
+      --pool           {{.params.pool}}
+      --oversampling   1
+      --norm
+      --scale
+      --flatten_solvent
+      --zero_mask
+      --gpu
+      --j              "$THREADS"
+      --scratch_dir    "$SCRATCH"
+    )
+    case "$JOB_TYPE" in
+      class2d)
+        RELION_ARGS+=(
+          --K              {{.params.n_classes_k}}
+          --iter           {{.params.iter}}
+          --tau2_fudge     2
+          --psi_step       12
+          --offset_range   5
+          --offset_step    2
+          --strict_highres_exp -1
+        )
+        ;;
+      class3d)
+        [ -r "$REFERENCE_MAP" ] || { echo "class3d needs a readable reference_map (.mrc); got: $REFERENCE_MAP" >&2; exit 1; }
+        RELION_ARGS+=(
+          --ref            "${REFERENCE_MAP}:mrc"
+          --K              {{.params.n_classes_k}}
+          --iter           {{.params.iter}}
+          --ini_high       60
+          --ctf
+          --tau2_fudge     4
+          --healpix_order  2
+          --offset_range   5
+          --offset_step    2
+          --sym            C1
+        )
+        ;;
+      refine3d)
+        [ -r "$REFERENCE_MAP" ] || { echo "refine3d needs a readable reference_map (.mrc); got: $REFERENCE_MAP" >&2; exit 1; }
+        RELION_ARGS+=(
+          --ref            "${REFERENCE_MAP}:mrc"
+          --auto_refine
+          --split_random_halves
+          --ini_high       60
+          --ctf
+          --healpix_order  2
+          --auto_local_healpix_order 4
+          --offset_range   5
+          --offset_step    2
+          --low_resol_join_halves 40
+          --sym            C1
+        )
+        ;;
+    esac
+  fi
+
+  echo "[relion-gpu] launching: ${MPIRUN[*]} relion_refine_mpi ${RELION_ARGS[*]}"
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+    "$SIF_PATH" \
+    "${MPIRUN[@]}" relion_refine_mpi "${RELION_ARGS[@]}"

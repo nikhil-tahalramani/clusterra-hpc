@@ -1,0 +1,198 @@
+id: metamorpheus-o-pair
+name: MetaMorpheus O-PairSearchTask (tumor O-glycopeptides)
+description: |
+  Step 3b of the `glyco-mapps-complete` chain. O-glycopeptide localization
+  search using MetaMorpheus 1.1.7 O-PairSearchTask
+  (Lu et al. *Nat Methods* 2020; MIT). Designed for HCD-trigger / EThcD
+  product-dependent acquisition where the glycan and the peptide
+  backbone fragment in separate spectra.
+
+  **Wedge dataset:** ships an opinionated 22-entry tumor-O-glycan library
+  (Tn, sTn, T antigen, sT, di-sTn, core-1/core-2 disialyl variants — the
+  Tarp / Brockhausen 2015 review) at
+  `/mnt/efs/refs/glyco/tumor_o_glycans.gdb`. This is the differentiator
+  vs the stock MetaMorpheus mucin core-1/core-2 default — without
+  Tn/sTn/T entries the search misses every truncated O-glycan PSM.
+
+  License: MIT.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [MetaMorpheus]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://ghcr.io/smith-chem-wisc/metamorpheus:1.1.7
+  notes: |
+    Same image + same EFS-build fallback as metamorpheus-n-glyco.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=64G
+  #SBATCH --time=4:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: mzml_dir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Directory of .mzML files. If empty, auto-discovers
+      `step-prep/mzml/` from the workflow run dir.
+  - key: protein_fasta
+    role: fasta_db
+    required: false
+    default: /mnt/efs/glyco-mapps-complete/datasets/uniprot-human/human_sprot_iso_td.fasta
+    description: |
+      Search database (target + decoy concat).
+
+parameters:
+  - key: o_glycan_db
+    widget: enum
+    options: [tumor_aberrant_22, core1_core2, mucin_repeat, custom]
+    default: tumor_aberrant_22
+    description: |
+      tumor_aberrant_22 = 22-entry tumor library (Tn, sTn, T, sT, di-sTn,
+      core1/2 disialyl) — the wedge for MUC1+/COSMC-mut samples.
+      core1_core2 = MetaMorpheus stock mucin panel.
+      mucin_repeat = larger repeating mucin library.
+      custom = use the file at .inputs.custom_glycan_gdb.
+  - key: custom_glycan_gdb
+    widget: text
+    default: ""
+    description: |
+      Absolute /mnt/efs path to a user-supplied .gdb file. Only consulted
+      when o_glycan_db = custom.
+  - key: instrument_class
+    widget: enum
+    options: [orbitrap_hcd, orbitrap_ethcd, timstof_pasef]
+    default: orbitrap_ethcd
+    description: |
+      O-Pair was designed for HCD-trigger/EThcD product-dependent
+      acquisition. Defaulting to ethcd reflects best-practice; orbitrap_hcd
+      runs but localization confidence is lower.
+  - key: fdr_threshold
+    widget: number
+    default: 0.01
+    min: 0.001
+    max: 0.10
+    description: PSM-level FDR cutoff (q-value) for the filtered output.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-{{.ctx.step_id}}"
+  artifacts:
+    - key: psms
+      path: "{{.outputs.dir}}/Task1-OGlycoSearchTask/AllPSMs.psmtsv"
+      role: primary_output
+    - key: localization
+      path: "{{.outputs.dir}}/Task1-OGlycoSearchTask/seen_localization.tsv"
+      role: generic
+    - key: results_txt
+      path: "{{.outputs.dir}}/Task1-OGlycoSearchTask/results.txt"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  MZML_DIR_IN={{.inputs.mzml_dir | quote}}
+  FASTA={{.inputs.protein_fasta | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  GDB_CHOICE={{.params.o_glycan_db | quote}}
+  CUSTOM_GDB={{.params.custom_glycan_gdb | quote}}
+  INSTRUMENT={{.params.instrument_class | quote}}
+  FDR={{.params.fdr_threshold}}
+
+  mkdir -p "$OUTPUT_DIR"
+  WORKFLOW_DIR=$(dirname "$OUTPUT_DIR")
+  if [ -z "$MZML_DIR_IN" ]; then
+    MZML_DIR_IN=$(find "$WORKFLOW_DIR" -maxdepth 2 -type d -name 'mzml' 2>/dev/null | head -1)
+  fi
+  [ -d "$MZML_DIR_IN" ] || { echo "mzml_dir not found: $MZML_DIR_IN" >&2; exit 1; }
+  [ -r "$FASTA" ] || { echo "protein_fasta not readable: $FASTA" >&2; exit 1; }
+
+  # Resolve .gdb path (curated libraries live under /mnt/efs/refs/glyco/).
+  case "$GDB_CHOICE" in
+    tumor_aberrant_22) GDB=/mnt/efs/refs/glyco/tumor_o_glycans.gdb ;;
+    core1_core2)       GDB=/mnt/efs/refs/glyco/o_core1_core2.gdb ;;
+    mucin_repeat)      GDB=/mnt/efs/refs/glyco/o_mucin_repeat.gdb ;;
+    custom)            GDB="$CUSTOM_GDB" ;;
+    *)                 GDB=/mnt/efs/refs/glyco/tumor_o_glycans.gdb ;;
+  esac
+  [ -r "$GDB" ] || { echo "[o-pair] glycan .gdb not readable: $GDB" >&2; exit 1; }
+
+  # Stage FASTA to a job-private dir so parallel MM tasks (N-glyco + O-pair)
+  # don't collide on MM's `DatabaseIndex/` sibling directory.
+  FASTA_WORKDIR="$OUTPUT_DIR/fasta-workdir"
+  mkdir -p "$FASTA_WORKDIR"
+  STAGED_FASTA="$FASTA_WORKDIR/$(basename "$FASTA")"
+  if [ ! -e "$STAGED_FASTA" ]; then
+    ln "$FASTA" "$STAGED_FASTA" 2>/dev/null || cp "$FASTA" "$STAGED_FASTA"
+  fi
+  FASTA="$STAGED_FASTA"
+
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"
+  mkdir -p "$APPTAINER_CACHEDIR"
+
+  PRIMARY_IMAGE="docker://ghcr.io/smith-chem-wisc/metamorpheus:1.1.7"
+  FALLBACK_BIN_TOP=/mnt/efs/refs/metamorpheus/1.1.7/CMD.dll
+  FALLBACK_BIN_SUB=/mnt/efs/refs/metamorpheus/1.1.7/bin/CMD.dll
+  if [ -f "$FALLBACK_BIN_TOP" ]; then FALLBACK_BIN="$FALLBACK_BIN_TOP"; else FALLBACK_BIN="$FALLBACK_BIN_SUB"; fi
+  SDK_SIF=/mnt/efs/_apt-sifs/dotnet-sdk-8.0.sif
+
+  MM_PATH=""
+  if apptainer exec "$PRIMARY_IMAGE" CMD.dll --version >/dev/null 2>&1; then
+    MM_PATH=container
+  elif apptainer exec "$PRIMARY_IMAGE" CmdMetaMorpheus --version >/dev/null 2>&1; then
+    MM_PATH=container_legacy
+  elif [ -f "$FALLBACK_BIN" ]; then
+    MM_PATH=efs_build
+  else
+    echo "[o-pair] no MetaMorpheus binary available — run metamorpheus-n-glyco first to trigger the EFS build, or pre-stage via the build helper" >&2
+    exit 70
+  fi
+
+  TASKDIR="$OUTPUT_DIR/tasks"
+  mkdir -p "$TASKDIR"
+  TOML="$TASKDIR/OGlycoSearchTask.toml"
+  case "$INSTRUMENT" in
+    orbitrap_hcd)    DISS=HCD ;;
+    orbitrap_ethcd)  DISS=EThcD ;;
+    timstof_pasef)   DISS=HCD ;;
+    *)               DISS=EThcD ;;
+  esac
+  cat > "$TOML" <<TOMLEOF
+  TaskType = "GlycoSearch"
+  [GlycoSearchParameters]
+  GlycoSearchType = "OGlyco"
+  OGlycanDatabasefile = "$GDB"
+  NGlycanDatabasefile = ""
+  GlycoSearchTopNum = 50
+  MaximumOGlycanAllowed = 3
+  MaximumNGlycanAllowed = 0
+  OxoniumIonFilt = true
+  [CommonParameters]
+  TaskDescriptor = "OGlycoSearch_Tumor"
+  DissociationType = "$DISS"
+  PrecursorMassTolerance = "10.0 PPM"
+  ProductMassTolerance = "20.0 PPM"
+  TOMLEOF
+
+  case "$MM_PATH" in
+    container)
+      exec apptainer exec --bind /mnt/efs "$PRIMARY_IMAGE" \
+        CMD.dll -t "$TOML" -s "$MZML_DIR_IN" -d "$FASTA" -o "$OUTPUT_DIR"
+      ;;
+    container_legacy)
+      exec apptainer exec --bind /mnt/efs "$PRIMARY_IMAGE" \
+        CmdMetaMorpheus -t "$TOML" -s "$MZML_DIR_IN" -d "$FASTA" -o "$OUTPUT_DIR"
+      ;;
+    efs_build)
+      exec apptainer exec --bind /mnt/efs "$SDK_SIF" \
+        dotnet "$FALLBACK_BIN" -t "$TOML" -s "$MZML_DIR_IN" -d "$FASTA" -o "$OUTPUT_DIR"
+      ;;
+  esac

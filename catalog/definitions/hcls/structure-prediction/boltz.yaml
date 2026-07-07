@@ -1,0 +1,134 @@
+id: boltz
+name: Boltz — library-scale prediction
+description: |
+  Batched structure and complex prediction across ligand libraries via Boltz
+  (https://github.com/jwohlwend/boltz). Spot-priced with a reproducibility
+  bundle per shard. Installed into a persistent EFS venv on first use; the
+  ~5 min pip cost amortizes across every subsequent shard.
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+cost_anchor: ~$80 / 1000 predictions
+tools: [Boltz]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  # Stock python:3.11 (~140 MB) instead of the 25 GB nvcr.io/nvidia/pytorch
+  # image. Per Clusterra's DL-AMI policy: cap-pod hosts already ship CUDA +
+  # NVIDIA drivers, and `apptainer exec --nv` mounts the host CUDA userspace
+  # into the container. Boltz's pip extras (torch, triton, flash-attn) pull
+  # the matching CUDA wheels themselves on first install. See MEMORY:
+  # dl_ami_skip_pytorch_base.md.
+  #
+  # NOT python:3.11-slim — Boltz depends on triton, which JIT-compiles CUDA
+  # kernels at runtime via gcc. The slim variant strips the compiler and
+  # inference fails with `RuntimeError: Failed to find C compiler` once it
+  # hits the first triangle-attention kernel (verified on clusde74 job 1785,
+  # 2026-05-08). Full `python:3.11` ships gcc/g++/make in the same APT base.
+  base_image: python:3.11
+  requirements: ["boltz==1.0.0"]
+  cache_dir: /mnt/efs/_boltz-venv
+  entrypoint: boltz
+  notes: |
+    Upstream ships no maintained Docker image. We layer pip install on top of
+    a slim Python base into a persistent EFS venv (flock-guarded, idempotent
+    on every subsequent job). Weights download to a shared
+    /mnt/efs/_boltz-cache so they're reused across jobs.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: input_fasta
+    role: fasta
+    required: true
+    description: FASTA with the protein sequence(s) to predict.
+  - key: ligand_sdf
+    role: sdf
+    required: false
+    default: ""
+    description: Optional ligand SDF for protein-ligand complex prediction.
+
+parameters:
+  - key: recycling_steps
+    label: Recycling steps
+    widget: number
+    default: 3
+  - key: diffusion_samples
+    label: Diffusion samples per target
+    widget: number
+    default: 1
+  - key: use_msa_server
+    label: Use ColabFold MSA server
+    widget: bool
+    default: true
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/boltz-{{.ctx.run_id}}"
+  artifacts:
+    - key: predictions
+      path: "{{.outputs.dir}}/predictions"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_FASTA={{.inputs.input_fasta | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  [ -r "$INPUT_FASTA" ] || { echo "input_fasta not readable: $INPUT_FASTA" >&2; exit 1; }
+  mkdir -p "$OUTPUT_DIR"
+
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  WEIGHTS_CACHE=/mnt/efs/_boltz-cache
+  export PIP_CACHE_DIR=/mnt/efs/_boltz-venv-cache
+  mkdir -p "$PIP_CACHE_DIR" "$WEIGHTS_CACHE" "$(dirname "$VENV_DIR")"
+
+  IMAGE="docker://{{.runtime.base_image}}"
+
+  # Provision venv on EFS once, flock-guarded so concurrent first-time jobs
+  # don't race. apptainer exec --nv mounts the host CUDA userspace; pip
+  # pulls torch + CUDA wheels into the venv on first install.
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/boltz" ]; then
+      apptainer exec --nv "$IMAGE" bash -c "
+        set -euo pipefail
+        python{{.runtime.python_version}} -m venv --system-site-packages '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' boltz=={{index .runtime.requirements 0 | replace "boltz==" ""}}
+      "
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  # Per-diffusion-step intermediates land on NVMe; only the final
+  # predictions/ tree moves back to EFS at the end.
+  WORK_DIR="${TMPDIR}/boltz-work"
+  mkdir -p "$WORK_DIR"
+
+  ARGS=( predict "$INPUT_FASTA"
+         --out_dir            "$WORK_DIR"
+         --cache              "$WEIGHTS_CACHE"
+         --recycling_steps    {{.params.recycling_steps}}
+         --diffusion_samples  {{.params.diffusion_samples}} )
+  {{- if .params.use_msa_server }}
+  ARGS+=( --use_msa_server )
+  {{- end }}
+
+  cd /tmp
+  apptainer exec --nv --bind "$TMPDIR:$TMPDIR" \
+    "$IMAGE" \
+    "$VENV_DIR/bin/{{.runtime.entrypoint}}" "${ARGS[@]}"
+
+  # Boltz writes final predictions to <out_dir>/boltz_results_<input_basename>/.
+  # Move only that final tree back to EFS; the rest dies with the node.
+  mv "$WORK_DIR"/boltz_results_* "$OUTPUT_DIR"/ 2>/dev/null || \
+    mv "$WORK_DIR"/* "$OUTPUT_DIR"/

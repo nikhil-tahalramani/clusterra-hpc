@@ -1,0 +1,43 @@
+id: nf-core-sarek-giab-germline
+name: "GIAB germline benchmark (Sarek)"
+description: |
+  nf-core/sarek 3.6.1 against the NIST GIAB HG002 30x WGS reference sample —
+  the canonical Clusterra end-to-end germline-validation run. Designed to
+  surface infra issues (NVMe scratch, EFS hardlink ceilings, BWA cache races)
+  on a known dataset where expected outputs are public.
+
+  Renders inside the BYO Nextflow launch page when pipeline_repo =
+  nf-core/sarek. Pre-fills `extra_profiles: test_full_germline` so the run
+  picks up NIST's bundled samplesheet + reference pack from ngi-igenomes.
+vertical: hcls
+category: nextflow
+workload_group: genomics
+modality: form
+tools: [Sarek]
+ready: true
+kind: preset
+tier: validated
+pipeline_repo: nf-core/sarek
+revision: "3.6.1"
+parameters:
+  - key: pipeline_repo
+    widget: text
+    default: "nf-core/sarek"
+  - key: revision
+    widget: text
+    default: "3.6.1"
+  - key: profile
+    widget: enum
+    options: [docker, singularity, apptainer, conda, none]
+    default: apptainer
+  - key: extra_profiles
+    widget: text
+    default: "test_full_germline"
+    description: |
+      nf-core/sarek's bundled GIAB HG002 30x germline samplesheet + reference
+      pack. Pulls inputs from ngi-igenomes (s3://ngi-igenomes/test-data/sarek/);
+      no user samplesheet required.
+  - key: pipeline_params_json
+    widget: nextflow_schema
+    default: ""
+    description: Optional JSON params overlay (advanced).

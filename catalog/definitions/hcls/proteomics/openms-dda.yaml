@@ -1,0 +1,271 @@
+id: openms-dda
+name: OpenMS DDA Database Search (CometAdapter + PercolatorAdapter)
+description: |
+  Fully BSD/permissive DDA database search using the OpenMS TOPP suite —
+  CometAdapter wraps the Comet search engine, PercolatorAdapter rescores
+  PSMs with the Percolator semi-supervised SVM. Output is OpenMS idXML
+  with q-value-filtered, target/decoy-annotated PSMs.
+
+  Positioning: this is Clusterra's BSD-licensed fallback when a customer
+  rejects the MaxQuant freeware EULA or wants a fully redistributable
+  toolchain. OpenMS itself is BSD-3 (TUM / FU-Berlin / Univ. Tübingen);
+  Comet is Apache-2.0; Percolator is Apache-2.0. Compare to:
+    - MaxQuant (freeware EULA, not OSS)
+    - FragPipe / MSFragger (academic license + nag screens)
+    - DIA-NN (academic license)
+  Sage is the other fully BSD answer in the catalog — pick OpenMS-DDA when
+  you want Percolator rescoring + the broader TOPP toolchain post-search
+  (Epifany protein inference, FeatureFinderIdentification quant, etc.).
+
+  Input is mzML (use the FileConverter TOPP utility to convert MGF / RAW
+  first — there's a one-liner in the SMOKE.md). The Comet binary itself is
+  NOT bundled in the bioconda OpenMS biocontainer (the CometAdapter is just
+  a wrapper); you point at a host-cached `comet.linux.exe` via
+  `comet_executable_path`. We ship a known-good comet at
+  `/mnt/efs/nikhil@clusterra.io/comet-dbsearch/comet.linux.exe` on dev-demo.
+
+  CRITICAL APPTAINER NOTE: every `apptainer exec` in this template uses
+  `--no-home --writable-tmpfs`. Without these, OpenMS adapters (CometAdapter,
+  MSGFPlusAdapter, etc.) misleadingly error with "Process failed to start"
+  / "Could not remove directory" because they collide with the slurmd
+  cap-pod's host HOME mount. Documented in MEMORY:openms_cometadapter_apptainer_fix.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [OpenMS, Comet, Percolator]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://quay.io/biocontainers/openms:3.5.0--h78fb946_0
+  notes: |
+    Bioconda biocontainer for OpenMS 3.5.0 (released 2025-12-14). Single-arch
+    x86_64 — matches the dev-demo g5/g6/m4 worker shapes.
+
+    The upstream `ghcr.io/openms/openms-executables:3.5.0` image was
+    arm64-only (verified May 2026) so we use the bioconda mirror.
+
+    Comet itself ships as a *wrapper*, not a bundled binary — the user
+    supplies a host-cached `comet.linux.exe` via the `comet_executable_path`
+    parameter. Percolator is similarly wrapper-only and dynamically linked
+    against conda-shipped libxerces-c, boost, icu, etc. The script stages
+    BOTH the percolator binary AND its /usr/local/lib directory from the
+    bioconda biocontainer (quay.io/biocontainers/percolator:3.7.1--h3b5f4bd_2)
+    onto EFS once at /mnt/efs/_percolator-v3.7.1/, then wraps invocations
+    with LD_LIBRARY_PATH so PercolatorAdapter sees a working binary at
+    /mnt/efs/bin/percolator-v3.7.1 (a small shell wrapper that sets the
+    library path).
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: input_mzml
+    role: mzml
+    required: false
+    default: /mnt/efs/n52h53@gmail.com/openms-smoke-cometadapter/input.mzML
+    description: |
+      Input mzML spectrum file on EFS. If you have MGF or vendor .raw,
+      convert via FileConverter first (see SMOKE.md §1). Default is the
+      Casanovo / Comet benchmark 128-spectrum mzML staged for the OpenMS
+      smoke.
+  - key: fasta_db
+    role: fasta_db
+    required: false
+    default: /mnt/efs/nikhil@clusterra.io/comet-dbsearch/human_sprot_td.fasta
+    description: |
+      Target-decoy FASTA with DECOY_-prefixed reversed entries. Default =
+      UniProt Swiss-Prot human + reversed-decoy (~85k entries) shared with
+      the Sage / Casanovo benchmarks.
+
+parameters:
+  - key: comet_executable_path
+    widget: text
+    default: /mnt/efs/nikhil@clusterra.io/comet-dbsearch/comet.linux.exe
+    description: |
+      Host-cached Comet binary (Apache-2.0). CometAdapter is just a wrapper —
+      the Comet executable itself is NOT in the bioconda OpenMS biocontainer.
+      Default points at a pre-staged comet.linux.exe on /mnt/efs that any
+      user can read. Customers replace this with their own staged binary.
+  - key: precursor_mass_tolerance_ppm
+    widget: number
+    default: 20
+    min: 1
+    max: 100
+    description: Precursor mass tolerance (± ppm). Default mirrors the Sage/Comet benchmark.
+  - key: fragment_mass_tolerance
+    widget: number
+    default: 0.02
+    min: 0.001
+    max: 1.0
+    description: |
+      Fragment ion tolerance, in Th (Da). For high-res Orbitrap / TOF use
+      0.02; for low-res ion-trap use 0.50.
+  - key: enzyme
+    widget: enum
+    options: [Trypsin, "Trypsin/P", LysC, AspN, GluC, Chymotrypsin, "unspecific cleavage"]
+    default: Trypsin
+    description: Cleavage enzyme. "unspecific cleavage" = non-tryptic / immunopeptidomics.
+  - key: missed_cleavages
+    widget: number
+    default: 1
+    min: 0
+    max: 5
+    description: Maximum missed cleavages.
+  - key: rescore_with_percolator
+    widget: bool
+    default: true
+    description: |
+      Run PercolatorAdapter on the CometAdapter idXML to compute
+      semi-supervised q-values. Disable for a Comet-raw idXML output (useful
+      when feeding into a different rescorer like MS²Rescore / DeepGP).
+  - key: fdr_threshold
+    widget: number
+    default: 0.01
+    min: 0.001
+    max: 0.10
+    description: |
+      Target PSM q-value cutoff. Applied via FalseDiscoveryRate after
+      Percolator. 0.01 = 1% FDR (matches the Sage / Comet benchmarks).
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openms-dda-{{.ctx.run_id}}"
+  artifacts:
+    - key: comet_idxml
+      path: "{{.outputs.dir}}/comet.idXML"
+      role: primary_output
+    - key: percolator_idxml
+      path: "{{.outputs.dir}}/comet.perc.idXML"
+      role: generic
+    - key: filtered_idxml
+      path: "{{.outputs.dir}}/comet.perc.fdr.idXML"
+      role: generic
+    - key: log
+      path: "{{.outputs.dir}}/openms-dda.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_MZML={{.inputs.input_mzml | quote}}
+  FASTA_DB={{.inputs.fasta_db | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  COMET_BIN={{.params.comet_executable_path | quote}}
+  PREC_TOL={{.params.precursor_mass_tolerance_ppm}}
+  FRAG_TOL={{.params.fragment_mass_tolerance}}
+  ENZYME={{.params.enzyme | quote}}
+  MISSED={{.params.missed_cleavages}}
+  USE_PERC="{{.params.rescore_with_percolator}}"
+  FDR={{.params.fdr_threshold}}
+  THREADS=8
+  IMG="{{.runtime.image}}"
+  LOG="$OUTPUT_DIR/openms-dda.log"
+
+  mkdir -p "$OUTPUT_DIR"
+  exec > >(tee -a "$LOG") 2>&1
+
+  [ -r "$INPUT_MZML" ] || { echo "input_mzml not readable: $INPUT_MZML" >&2; exit 1; }
+  [ -r "$FASTA_DB" ]   || { echo "fasta_db not readable: $FASTA_DB"     >&2; exit 1; }
+  [ -x "$COMET_BIN" ]  || { echo "comet_executable_path not executable: $COMET_BIN" >&2; exit 1; }
+
+  # Apptainer flags: --no-home --writable-tmpfs is LOAD-BEARING for OpenMS
+  # adapters. Without them, CometAdapter / PercolatorAdapter trip the host-
+  # HOME mount conflict and fail with the misleading "Process failed to
+  # start" / "Could not remove directory" error. See
+  # MEMORY:openms_cometadapter_apptainer_fix.
+  APPT="apptainer exec --no-home --writable-tmpfs --bind /mnt/efs"
+
+  echo "===== STEP 1: CometAdapter search ====="
+  $APPT "$IMG" CometAdapter \
+    -in "$INPUT_MZML" \
+    -out "$OUTPUT_DIR/comet.idXML" \
+    -database "$FASTA_DB" \
+    -comet_executable "$COMET_BIN" \
+    -precursor_mass_tolerance "$PREC_TOL" \
+    -precursor_error_units ppm \
+    -fragment_mass_tolerance "$FRAG_TOL" \
+    -fragment_bin_offset 0 \
+    -enzyme "$ENZYME" \
+    -missed_cleavages "$MISSED" \
+    -fixed_modifications "Carbamidomethyl (C)" \
+    -variable_modifications "Oxidation (M)" \
+    -PeptideIndexing:decoy_string "DECOY_" \
+    -PeptideIndexing:decoy_string_position prefix \
+    -threads "$THREADS"
+
+  [ -s "$OUTPUT_DIR/comet.idXML" ] || { echo "CometAdapter produced empty idXML" >&2; exit 1; }
+
+  if [ "$USE_PERC" != "true" ]; then
+    echo "rescore_with_percolator=false — skipping PercolatorAdapter + FDR filter."
+    echo "Outputs at: $OUTPUT_DIR"
+    exit 0
+  fi
+
+  # Stage percolator binary onto EFS once. The OpenMS biocontainer doesn't
+  # ship percolator; we pull the upstream bioconda image and exec the
+  # binary directly into a host directory we can re-use across jobs.
+  # Caching by version path keeps this lock-free across concurrent jobs.
+  # Stage percolator + its conda-shipped shared libs onto EFS, then wrap
+  # with a shell launcher that sets LD_LIBRARY_PATH. Percolator's binary
+  # in the bioconda biocontainer is dynamically linked against libxerces,
+  # boost, icu (all under /usr/local/lib inside the container) — a bare
+  # binary copy is non-functional.
+  PERC_VERSION="3.7.1"
+  PERC_TAG="${PERC_VERSION}--h3b5f4bd_2"
+  PERC_ROOT="/mnt/efs/_percolator-v${PERC_VERSION}"
+  PERC_BIN="/mnt/efs/bin/percolator-v${PERC_VERSION}"
+  mkdir -p /mnt/efs/bin
+  if [ ! -x "$PERC_ROOT/bin/percolator" ]; then
+    echo "Staging percolator v${PERC_VERSION} (binary + libs) from biocontainer..."
+    PERC_IMG="docker://quay.io/biocontainers/percolator:${PERC_TAG}"
+    mkdir -p "$PERC_ROOT/bin" "$PERC_ROOT/lib"
+    apptainer exec --no-home --writable-tmpfs --bind /mnt/efs "$PERC_IMG" \
+      bash -c "cp /usr/local/bin/percolator $PERC_ROOT/bin/percolator && cp -a /usr/local/lib/. $PERC_ROOT/lib/"
+  fi
+  # Wrapper script — PercolatorAdapter shells out to this; it sets the
+  # library path and execs the staged binary.
+  if [ ! -x "$PERC_BIN" ] || [ "$PERC_BIN" -ot "$PERC_ROOT/bin/percolator" ]; then
+    cat > "$PERC_BIN" <<EOF
+  #!/bin/bash
+  export LD_LIBRARY_PATH="$PERC_ROOT/lib:\${LD_LIBRARY_PATH:-}"
+  exec "$PERC_ROOT/bin/percolator" "\$@"
+  EOF
+    chmod +x "$PERC_BIN"
+  fi
+  "$PERC_BIN" -h >/dev/null 2>&1 && echo "percolator wrapper OK at $PERC_BIN" || true
+
+  echo "===== STEP 2: PercolatorAdapter rescore ====="
+  $APPT "$IMG" PercolatorAdapter \
+    -in "$OUTPUT_DIR/comet.idXML" \
+    -out "$OUTPUT_DIR/comet.perc.idXML" \
+    -percolator_executable "$PERC_BIN" \
+    -score_type q-value \
+    -threads "$THREADS"
+
+  [ -s "$OUTPUT_DIR/comet.perc.idXML" ] || { echo "PercolatorAdapter produced empty idXML" >&2; exit 1; }
+
+  echo "===== STEP 3: IDFilter at q <= $FDR ====="
+  # PercolatorAdapter writes score_type="q-value" with higher_score_better=false,
+  # so IDFilter's `-score:psm <thr>` keeps PSMs with q-value <= thr. Note: only
+  # `-score:psm` / `-score:peptide` / `-score:protein` are valid (NOT `-score:pep`).
+  $APPT "$IMG" IDFilter \
+    -in "$OUTPUT_DIR/comet.perc.idXML" \
+    -out "$OUTPUT_DIR/comet.perc.fdr.idXML" \
+    -score:psm "$FDR" \
+    -threads "$THREADS"
+
+  # Summary: count PSMs at each stage.
+  CRAW=$(grep -c "<PeptideIdentification" "$OUTPUT_DIR/comet.idXML" || echo 0)
+  CPER=$(grep -c "<PeptideIdentification" "$OUTPUT_DIR/comet.perc.idXML" || echo 0)
+  CFDR=$(grep -c "<PeptideIdentification" "$OUTPUT_DIR/comet.perc.fdr.idXML" || echo 0)
+  echo "===== Summary ====="
+  echo "Comet PSMs (pre-rescore):      $CRAW"
+  echo "Percolator-rescored PSMs:      $CPER"
+  echo "Filtered at q<=$FDR:            $CFDR"
+  echo "Outputs at: $OUTPUT_DIR"

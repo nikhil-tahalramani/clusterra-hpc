@@ -1,0 +1,35 @@
+# Defaults — every tenant's values.yaml is merged on top of this.
+# Required fields (no sensible default): cluster.name, slurm.controller.nodePort,
+# slurm.efs.mountTargetIp.
+
+cluster:
+  name: ""
+  # Git ref the per-tenant child Applications (mariadb-*) track. Trunk-only;
+  # overridable via Helm param if a tenant needs to pin a SHA.
+  targetRevision: main
+
+slurm:
+  chart:
+    repoURL: ghcr.io/slinkyproject/charts
+    version: "1.1.0"
+  controller:
+    replicas: 1
+    storageClass: local-path
+    nodePort: 0  # required per-tenant
+    slurmctld:
+      # Env-scoped pointer tag; set by clusters ApplicationSet via the root
+      # `apps` chart values (envs/{env}/use1/argocd-apps-values.yaml).
+      # dev → :dev (moves on every main build). prod → :prod (only moves
+      # via the "Promote Images to Prod" workflow).
+      imageTag: dev
+  accounting:
+    replicas: 1
+  restapi:
+    replicas: 1
+  efs:
+    mountTargetIp: ""
+
+mariadb:
+  storage:
+    size: 2Gi
+    storageClass: local-path

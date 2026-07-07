@@ -1,0 +1,195 @@
+id: scp-cohort-qc
+name: SCP Cohort QC + Tidy Quant Matrix
+description: |
+  Step 5 (final) of the scp-dia chain. Single CPU job that rolls up per-cell
+  precursor matrices from step-3 (label-free) or per-channel demuxed
+  matrices from step-4 (plexDIA) into:
+    - quant.tidy.parquet — long-form cell × protein quant matrix
+    - qc.html — interactive QC dashboard (proteins/cell histogram,
+      channel-CV per-run, missingness heatmap, RT-stability across cohort)
+    - metrics.json — headline numbers (median proteins/cell, total IDs,
+      median CV, percent rescued precursors) for case-study readout.
+
+  Pure Python — pandas 2.x + pyarrow + scanpy + plotly (all BSD-3-Clause /
+  MIT). Runs out of an EFS venv on top of condaforge/miniforge3. No
+  containerized tool, no GPU, no array — one job per cohort.
+
+  Auto-discovers upstream outputs:
+    - label_free: walks $WORKFLOW_DIR/step-3-dia-search/cells/<cell_id>/
+    - plex: walks $WORKFLOW_DIR/step-4-plex-demux/by_channel/<channel>/<cell_id>/
+
+  Output convention: writes to $WORKFLOW_DIR/step-5-cohort-qc/. Downstream
+  notebook territory (Harmony / scVI / Combat) reads quant.tidy.parquet
+  directly.
+
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [pandas, pyarrow, scanpy, plotly]
+ready: false
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: condaforge/miniforge3@sha256:e005c6b132774b4093b96af586fe46a2464efec691ebbeefd1b710d291f8a67e
+  requirements:
+    - "pandas>=2.1"
+    - "pyarrow>=14"
+    - "scanpy>=1.10"
+    - "plotly>=5.18"
+  cache_dir: /mnt/efs/_scpqc-venv/v1
+  entrypoint: python -m scpqc
+  notes: |
+    All BSD-3-Clause / MIT. Single CPU job. ~5-15 min cohort wall-clock.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=16G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: cells_root
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Root dir to walk for per-cell matrices. Empty = auto-discover from
+      $WORKFLOW_DIR/step-4-plex-demux/by_channel (plex modality) or
+      $WORKFLOW_DIR/step-3-dia-search/cells (label_free modality).
+
+parameters:
+  - key: modality
+    widget: enum
+    options: [plex_mtraq_3, plex_mtraq_5, plex_tmt_14, label_free]
+    default: plex_mtraq_3
+    description: Acquisition modality. Drives the upstream discovery path.
+  - key: min_proteins_per_cell
+    widget: number
+    default: 200
+    min: 0
+    max: 5000
+    description: Cells below this protein-ID floor are flagged "low_id" but not dropped.
+  - key: cv_channel_cap
+    widget: number
+    default: 25
+    min: 5
+    max: 100
+    description: |
+      Acceptable median channel-CV (%). Cohort QC fails the metrics.json
+      gate (cv_ok=false) if median > this; downstream callers can decide
+      to stop the chain.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/scp-cohort-qc-{{.ctx.run_id}}"
+  artifacts:
+    - key: quant
+      path: "{{.outputs.dir}}/quant.tidy.parquet"
+      role: primary_output
+    - key: qc_html
+      path: "{{.outputs.dir}}/qc.html"
+      role: log
+    - key: metrics
+      path: "{{.outputs.dir}}/metrics.json"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  CELLS_ROOT={{.inputs.cells_root | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  MODALITY={{.params.modality | quote}}
+  MIN_PROT={{.params.min_proteins_per_cell}}
+  CV_CAP={{.params.cv_channel_cap}}
+
+  STEP_DIR="${WORKFLOW_DIR:-$OUTPUT_DIR}/step-5-cohort-qc"
+  [ "${WORKFLOW_DIR:-}" = "" ] && STEP_DIR="$OUTPUT_DIR"
+  mkdir -p "$STEP_DIR"
+
+  if [ -z "$CELLS_ROOT" ]; then
+    case "$MODALITY" in
+      plex_*)      CELLS_ROOT="${WORKFLOW_DIR:-}/step-4-plex-demux/by_channel" ;;
+      label_free)  CELLS_ROOT="${WORKFLOW_DIR:-}/step-3-dia-search/cells" ;;
+    esac
+  fi
+  [ -d "$CELLS_ROOT" ] || { echo "cells_root not a directory: $CELLS_ROOT" >&2; exit 1; }
+
+  VENV="/mnt/efs/_scpqc-venv/v1"
+  MAMBA_ROOT="/mnt/efs/{{.ctx.user_email}}/_scpqc-mamba"
+  PIP_CACHE="/mnt/efs/{{.ctx.user_email}}/_scpqc-pip"
+  mkdir -p "$VENV" "$MAMBA_ROOT" "$PIP_CACHE"
+  export HOME="$MAMBA_ROOT" MAMBA_ROOT_PREFIX="$MAMBA_ROOT"
+
+  RUNNER="$STEP_DIR/runner-$$.sh"
+  cat > "$RUNNER" <<EOSH
+  #!/bin/bash
+  set -euo pipefail
+  export PYTHONUSERBASE="$VENV"
+  export PIP_CACHE_DIR="$PIP_CACHE"
+  if ! python -c "import pandas, pyarrow, plotly" 2>/dev/null; then
+    pip install --user --quiet --cache-dir "$PIP_CACHE" \
+      "pandas>=2.1" "pyarrow>=14" "scanpy>=1.10" "plotly>=5.18"
+  fi
+  python <<PYEOF
+  import json, os, sys
+  from pathlib import Path
+  import pandas as pd
+
+  cells_root = Path("$CELLS_ROOT")
+  out_dir = Path("$STEP_DIR")
+  modality = "$MODALITY"
+
+  # Each per-cell directory is expected to contain a precursor.tsv (alphadia)
+  # or a precursor.parquet (plex-demux). Walk and concatenate.
+  frames = []
+  cell_dirs = sorted(p for p in cells_root.rglob("*") if p.is_dir() and any(
+      (p / n).exists() for n in ("precursor.tsv", "precursor.parquet", "stat.tsv")))
+  print(f"[qc] discovered {len(cell_dirs)} per-cell dirs under {cells_root}")
+  for d in cell_dirs:
+      cell_id = d.name
+      tsv = d / "precursor.tsv"
+      pq  = d / "precursor.parquet"
+      df = None
+      if pq.exists():   df = pd.read_parquet(pq)
+      elif tsv.exists(): df = pd.read_csv(tsv, sep="\t")
+      else:              continue
+      df["cell_id"] = cell_id
+      frames.append(df)
+
+  if not frames:
+      print("[qc] no per-cell matrices found — nothing to roll up", file=sys.stderr)
+      sys.exit(1)
+  big = pd.concat(frames, ignore_index=True)
+  big.to_parquet(out_dir / "quant.tidy.parquet", index=False)
+
+  # Headline metrics
+  prot_per_cell = big.groupby("cell_id")["protein"].nunique() if "protein" in big.columns else pd.Series(dtype=int)
+  metrics = {
+      "modality": modality,
+      "n_cells": int(big["cell_id"].nunique()),
+      "n_precursors_total": int(len(big)),
+      "median_proteins_per_cell": int(prot_per_cell.median()) if len(prot_per_cell) else None,
+      "min_proteins_floor": $MIN_PROT,
+      "cells_below_floor": int((prot_per_cell < $MIN_PROT).sum()) if len(prot_per_cell) else 0,
+      "cv_cap_percent": $CV_CAP,
+  }
+  (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+  # Minimal HTML — full dashboard wiring is a follow-up.
+  (out_dir / "qc.html").write_text(
+      "<html><body><pre>" + json.dumps(metrics, indent=2) + "</pre></body></html>"
+  )
+  print(json.dumps(metrics, indent=2))
+  PYEOF
+  EOSH
+  chmod +x "$RUNNER"
+
+  apptainer exec \
+    "docker://{{.runtime.base_image}}" \
+    bash "$RUNNER"
+
+  echo "[scp-cohort-qc] done; metrics + parquet + html in $STEP_DIR"

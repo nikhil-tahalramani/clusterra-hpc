@@ -1,0 +1,60 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: clusters
+  namespace: argocd
+  annotations:
+    # After cluster-api (wave 2): the plugin generator below calls it.
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    # Plugin generator: polls cluster-api's /internal/argocd/tenants endpoint.
+    # DDB is the sole source of truth for the active tenant set — no per-tenant
+    # git files. requeueAfterSeconds aligns with the ~30s onboarding SLA.
+    - plugin:
+        configMapRef:
+          name: argocd-tenants-plugin
+        requeueAfterSeconds: 30
+  template:
+    metadata:
+      name: 'tenant-{{`{{.cluster_id}}`}}'
+      namespace: argocd
+      labels:
+        clusterra.io/cluster: '{{`{{.cluster_id}}`}}'
+    spec:
+      project: default
+      # Multi-source: cluster chart + envs/{env}/{regionShort}/images.yaml via
+      # $values overlay (same pattern as cluster-api.yaml). slurmctld image is
+      # pinned by tag from images.yaml; every build produces a fresh
+      # :sha-<short>, so values changes recreate slurmctld pods deterministically.
+      sources:
+        - repoURL: {{ .Values.repoURL | squote }}
+          targetRevision: {{ .Values.targetRevision }}
+          ref: values
+        - repoURL: {{ .Values.repoURL | squote }}
+          targetRevision: {{ .Values.targetRevision }}
+          path: core/fleet/charts/cluster
+          helm:
+            valueFiles:
+              - values.yaml
+              - $values/envs/{{ .Values.env }}/{{ .Values.regionShort }}/images.yaml
+            parameters:
+              - name: cluster.name
+                value: '{{`{{.namespace}}`}}'
+              - name: slurm.controller.nodePort
+                value: '{{`{{.node_port}}`}}'
+              - name: slurm.efs.mountTargetIp
+                value: '{{`{{.efs_mount_target_ip}}`}}'
+              - name: slurm.chart.version
+                value: '{{`{{.slurm_chart_version}}`}}'
+      destination:
+        server: 'https://kubernetes.default.svc'
+        namespace: '{{`{{.namespace}}`}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true

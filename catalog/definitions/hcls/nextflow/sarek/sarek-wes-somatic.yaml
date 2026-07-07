@@ -1,0 +1,240 @@
+id: sarek-wes-somatic
+name: Sarek — WES Somatic Prep (GPU Parabricks fq2bam)
+description: |
+  nf-core/sarek 3.6.1 running whole-exome sequencing somatic preprocessing on a
+  tumor-normal pair, with GPU-accelerated alignment via NVIDIA Parabricks fq2bam
+  (`aligner: parabricks`). Stops at the recalibrated tumor + normal BAMs and
+  hands off to a chained Parabricks DeepSomatic job for GPU variant calling —
+  same two-stage pattern as the sarek-parabricks germline case study, adapted
+  for somatic tumor-normal.
+
+  Step 1 of the MAPPs Complete immunopeptidomics workflow
+  (Sarek prep → Parabricks DeepSomatic → epitopeprediction → Casanovo).
+  Also usable standalone — chain `parabricks-deepsomatic` against the recal BAMs
+  this template produces.
+
+  Samplesheet format (CSV, paste into the field):
+    patient,sample,lane,fastq_1,fastq_2,status
+    PATIENT01,NORMAL,1,/mnt/efs/path/normal_R1.fastq.gz,/mnt/efs/path/normal_R2.fastq.gz,0
+    PATIENT01,TUMOR,1,/mnt/efs/path/tumor_R1.fastq.gz,/mnt/efs/path/tumor_R2.fastq.gz,1
+
+  status=0 = normal, status=1 = tumor. patient must match across both rows.
+  Recal BAMs land at: <outdir>/preprocessing/recalibrated/<SAMPLE>/recal.bam
+  (one per sample; the tumor BAM is the one with status=1).
+vertical: hcls
+category: nextflow
+workload_group: genomics
+modality: form
+tools: [Sarek, Parabricks, fq2bam]
+ready: true
+kind: batch
+
+runtime:
+  kind: nextflow
+  pipeline_repo: nf-core/sarek
+  revision: "3.6.1"
+  nxf_version: "25.10.2"
+  schema_source: auto
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=64G
+  #SBATCH --time=8:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: samplesheet_csv
+    role: samplesheet
+    required: true
+    description: |
+      Tumor-normal samplesheet CSV. Must have columns:
+      patient,sample,lane,fastq_1,fastq_2,status
+      where status=0 is normal and status=1 is tumor. FASTQs must be on /mnt/efs.
+  - key: resume_workdir
+    role: generic_path
+    required: false
+    default: ""
+    description: Existing Nextflow workdir on EFS to resume from. Empty = fresh run.
+
+parameters:
+  - key: genome
+    widget: enum
+    options: [GRCh38, GRCh37, hg38, hg19]
+    default: GRCh38
+    description: Reference genome. GRCh38 for human WES (recommended).
+  - key: aligner
+    widget: enum
+    options: [parabricks, bwa-mem, bwa-mem2, dragmap]
+    default: parabricks
+    description: |
+      BWA aligner. `parabricks` routes the alignment + dedup + BQSR step
+      through NVIDIA Parabricks `pbrun fq2bam` on a GPU cap-pod (default,
+      ~5-10x faster than CPU bwa-mem2). bwa-mem / bwa-mem2 / dragmap stay CPU.
+  - key: tools
+    widget: text
+    default: ""
+    description: |
+      Comma-separated in-pipeline variant callers/annotators. Empty = stop at
+      recalibrated BAM and let a chained Parabricks DeepSomatic step do the
+      variant calling on GPU (recommended). Set to "strelka,vep" for the
+      CPU-only somatic Strelka2 + VEP path (fallback if no GPU is available).
+  - key: skip_tools
+    widget: text
+    default: "fastqc,samtools,mosdepth,multiqc"
+    description: |
+      Comma-separated Sarek QC tools to skip. FASTP (run by default) already
+      covers FASTQC's signal; Parabricks fq2bam emits its own coverage and
+      dup-rate metrics. Skipping these duplicate-QC modules saves ~2h+ on the
+      head wall-clock for no information gain.
+  - key: intervals
+    widget: text
+    default: ""
+    description: |
+      Optional BED or interval_list restricting alignment + (if enabled)
+      variant calling to exome capture regions. Empty = use the genome's
+      default iGenomes WES interval list. Required for clinical-grade WES
+      coverage stats; not required for hand-off to Parabricks DeepSomatic.
+  - key: profile
+    widget: enum
+    options: [apptainer, docker, singularity]
+    default: apptainer
+    description: Container engine profile. apptainer matches the cluster default.
+  - key: extra_profiles
+    widget: text
+    default: ""
+    description: |
+      Optional comma-separated extra Nextflow profiles appended to `-profile`.
+      Use `test` to run with the bundled nf-core test fixtures (chr21 subset
+      pulled by Nextflow's downloader, which sidesteps the samplesheet HTTPS
+      validator). Leave empty for production runs against a user samplesheet.
+  - key: pipeline_params_json
+    widget: nextflow_schema
+    default: ""
+    description: Additional Sarek parameters as JSON (advanced).
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/sarek-wes-{{.ctx.run_id}}"
+  artifacts:
+    - key: outdir
+      path: "{{.outputs.dir}}"
+      role: primary_output
+    - key: recal_bam_dir
+      path: "{{.outputs.dir}}/preprocessing/recalibrated"
+      role: generic
+
+policy:
+  prefer_on_demand: false
+  prefer_arm64: false
+
+config: |
+  process {
+    executor      = 'slurm'
+    queue         = { task.accelerator?.request > 0 ? 'gpu' : 'cpu' }
+    clusterOptions = "--comment 'clusterra:nf_parent=${SLURM_JOB_ID}'"
+    // Cluster-side cap on per-process memory. Without this, Sarek's BWAMEM_INDEX
+    // etc. fall through to Slurm's partition default (mem=4T) and pend forever
+    // on cap-pods sized at 16-64 GB. The test profile already caps at 15.GB.
+    resourceLimits = [ memory: 60.GB, cpus: 14, time: 8.h ]
+  }
+  apptainer {
+    enabled  = true
+    cacheDir = '/mnt/efs/nxf-cache/_lib'
+    autoMounts = true
+  }
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  RESUME_WORKDIR={{.inputs.resume_workdir | quote}}
+  if [ -n "$RESUME_WORKDIR" ]; then
+    WORKDIR="$RESUME_WORKDIR"
+    RESUME_FLAG=(-resume)
+  else
+    WORKDIR=/mnt/efs/work-$SLURM_JOB_ID
+    RESUME_FLAG=()
+  fi
+
+  export NXF_VER={{.runtime.nxf_version}}
+  export NXF_SINGULARITY_CACHEDIR=/mnt/efs/nxf-cache/_lib
+  # Bug fix: 3+ parallel sarek heads racing on a shared NXF_HOME corrupt the
+  # nf-core/sarek asset cache via concurrent `git pull`. Shard by SLURM_JOB_ID so
+  # each head clones its own assets. ~10s extra per run for the asset clone.
+  export NXF_HOME=/mnt/efs/nxf-cache/_home-$SLURM_JOB_ID
+  mkdir -p "$NXF_HOME"
+
+  SAMPLESHEET=/mnt/efs/samplesheet-$SLURM_JOB_ID.csv
+  cat > "$SAMPLESHEET" <<'EOF'
+  {{.inputs.samplesheet_csv}}
+  EOF
+
+  CONFIG_FILE=/mnt/efs/nextflow-$SLURM_JOB_ID.config
+  cat > "$CONFIG_FILE" <<'EOF'
+  {{.config}}
+  EOF
+  sed -i "s|\${SLURM_JOB_ID}|$SLURM_JOB_ID|g" "$CONFIG_FILE"
+
+  INTERVALS={{.params.intervals | quote}}
+  PARAMS_FILE=/mnt/efs/sarek-params-$SLURM_JOB_ID.json
+  python3 - <<PYEOF > "$PARAMS_FILE"
+  import json
+  params = {
+      "genome": {{.params.genome | quote}},
+      "aligner": {{.params.aligner | quote}},
+      "tools": {{.params.tools | quote}},
+      "skip_tools": {{.params.skip_tools | quote}},
+      "wes": True,
+      "outdir": {{.outputs.dir | quote}},
+      "igenomes_base": "/mnt/s3-refs/igenomes",
+  }
+  intervals = "$INTERVALS"
+  if intervals:
+      params["intervals"] = intervals
+  print(json.dumps(params, indent=2))
+  PYEOF
+
+  {{if .params.pipeline_params_json}}
+  EXTRA_PARAMS_FILE=/mnt/efs/sarek-extra-params-$SLURM_JOB_ID.json
+  cat > "$EXTRA_PARAMS_FILE" <<'EOF'
+  {{.params.pipeline_params_json}}
+  EOF
+  # Merge extra params (last writer wins) via python
+  python3 -c "
+  import json, sys
+  base = json.load(open('$PARAMS_FILE'))
+  extra = json.load(open('$EXTRA_PARAMS_FILE'))
+  base.update(extra)
+  json.dump(base, open('$PARAMS_FILE', 'w'))
+  "
+  {{end}}
+
+  chmod -R a+rX "$NXF_HOME" 2>/dev/null || true
+
+  PROFILES={{.params.profile | quote}}
+  EXTRA_PROFILES={{.params.extra_profiles | quote}}
+  if [ -n "$EXTRA_PROFILES" ]; then
+    PROFILES="$PROFILES,$EXTRA_PROFILES"
+  fi
+
+  # When the bundled `test` profile is active, sarek's own samplesheet (with
+  # URL paths) is used and the user-provided one is ignored. The test profile
+  # also sets its own genome (`testdata.nf-core.sarek`) and aligner, so we
+  # skip our --params-file entirely (genome=GRCh38 from the form clashes).
+  # We still pass --outdir so the run lands under the workflow dir.
+  INPUT_FLAGS=( --input "$SAMPLESHEET" )
+  PARAMS_FLAGS=( -params-file "$PARAMS_FILE" )
+  case ",$EXTRA_PROFILES," in
+    *,test,*)
+      INPUT_FLAGS=()
+      PARAMS_FLAGS=( --outdir {{.outputs.dir | quote}} )
+      ;;
+  esac
+
+  nextflow run {{.runtime.pipeline_repo | quote}} \
+    -r {{.runtime.revision | quote}} \
+    -profile "$PROFILES" \
+    -c "$CONFIG_FILE" \
+    -work-dir "$WORKDIR" \
+    "${RESUME_FLAG[@]}" \
+    "${PARAMS_FLAGS[@]}" \
+    "${INPUT_FLAGS[@]}"

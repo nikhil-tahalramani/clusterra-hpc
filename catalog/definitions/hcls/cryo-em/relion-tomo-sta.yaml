@@ -1,0 +1,337 @@
+id: relion-tomo-sta
+name: RELION cryo-ET subtomogram averaging (extract + refine + postprocess)
+description: |
+  GPU subtomogram averaging (STA) for cryo-electron tomography with
+  RELION 5.0. Regenerates CTF-pre-multiplied 2D pseudo-subtomograms from
+  the reconstructed tomograms + particle positions (`relion_tomo_subtomo`),
+  runs a gold-standard 3D auto-refine (`relion_refine_mpi --gpu` via the
+  tomo `--ios` optimisation-set path), and sharpens + measures resolution
+  with `relion_postprocess`.
+
+  This is the tomography sibling of the single-particle `relion-gpu`
+  template — same `relion_refine_mpi` engine, same local-mpirun launch
+  (1 leader + N GPU-worker ranks), same NVMe `--scratch_dir` and spot
+  `--requeue` resume. The tomo difference is the `--ios optimisation_set`
+  input (not `--i particles`) and the extract step in front of it.
+
+  Validated on EMPIAR-10164 (immature HIV-1 Gag VLPs): 9,442 particles,
+  box 512 / crop 192, C6 -> 3.99 A gold-standard FSC, 17 iters, ~1.6 h on
+  4x T4 (~$2.30 spot). See relion-tomo-sta.SMOKE.md.
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [RELION]
+ready: true
+kind: batch
+
+cost_anchor: ~$2.30 (4x T4 g4dn.12xlarge spot, ~1.6h, EMPIAR-10164 9.4k particles, box192 crop, C6 -> 3.99A); ~$1.65 single-GPU class of work
+
+runtime:
+  kind: docker_image
+  image: jidaniel/relion:5.0-cuda12.6
+  notes: |
+    RELION 5.0 + CUDA 12.6, GUI OFF. Ships relion_tomo_subtomo_mpi,
+    relion_refine_mpi, relion_postprocess. Pulled once to the cluster-cached
+    SIF at /mnt/efs/sifs/relion_5.0-cuda12.6.sif (~10.6 GB) under a flock so
+    the first job on the cluster pays the OCI->SIF convert and later jobs
+    skip it. `apptainer exec --nv` mounts the host CUDA userspace; no
+    in-image driver needed and no conda/bash-lc wrapper.
+
+    The local-mpirun recipe (`--mca plm ^slurm --mca ras ^slurm
+    --oversubscribe --bind-to none`) forks ranks locally inside the pod
+    instead of reaching for Slurm's unconfigured PMI launcher. The
+    `--bind "$TMPDIR:$TMPDIR"` is REQUIRED — OpenMPI's ORTE session dir
+    lands under /mnt/scratch which isn't in the image's default bind list.
+
+# gres/cpus/mem/threads are Go-templated off the parameters so a 1-GPU run
+# lands a small node and a 4-GPU run can be requested from the same template.
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task={{.params.cpus_per_task}}
+  #SBATCH --mem={{.params.mem_gb}}G
+  #SBATCH --time={{.params.time_limit}}
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:{{.params.n_gpus}}
+  #SBATCH --requeue
+
+inputs:
+  - key: optimisation_set
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      A RELION tomo optimisation_set.star (output of a Picks or Extract
+      job) referencing the particle set + tomograms set. If the referenced
+      subtomogram stacks are already present, the extract step is skipped.
+      Empty = SMOKE_MODE (prints relion_refine --version and exits).
+  - key: tomograms_star
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      tomograms.star (output of Reconstruct/Denoise) used by the extract
+      step. Required when do_extract=yes. The reconstructed tomograms it
+      references must be readable (e.g. from relion-tomo-align).
+  - key: particles_star
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Particle positions STAR (the picks/select output) consumed by the
+      extract step. Required when do_extract=yes.
+  - key: reference_map
+    role: generic_path
+    required: true
+    description: |
+      Starting 3D reference (.mrc), e.g. a Reconstruct half-map or an
+      initial model. Passed as `--ref <map>`. Must match the cropped box.
+  - key: solvent_mask
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Soft solvent mask (.mrc) for `--solvent_mask` + `--solvent_correct_fsc`
+      during refine, and as the FSC mask in postprocess. Strongly
+      recommended for a meaningful gold-standard resolution.
+
+parameters:
+  - key: do_extract
+    label: Regenerate subtomograms first
+    widget: enum
+    options: [yes, no]
+    default: "yes"
+    description: |
+      yes = run relion_tomo_subtomo to (re)generate the CTF-pre-multiplied
+      2D pseudo-subtomogram stacks from tomograms_star + particles_star
+      before refining (RELION tomo workspaces and published archives often
+      ship the metadata but not the heavy stacks). no = the stacks the
+      optimisation_set references already exist on disk.
+  - key: n_gpus
+    label: GPUs (ranks = n_gpus + 1)
+    widget: number
+    default: 4
+    min: 1
+    max: 8
+    description: |
+      Single-node GPU count. mpirun launches n_gpus + 1 ranks (1 leader +
+      N GPU workers). Gold-standard auto-refine REQUIRES at least 2 GPU
+      workers (-np >= 3); a 1-GPU run still launches 3 ranks sharing the
+      one device. STA is GPU-bound and the per-iteration cost grows with
+      resolution, so multi-GPU is the difference between converging and
+      timing out for real datasets.
+  - key: box
+    label: Extract box size (binned px)
+    widget: number
+    default: 512
+    min: 64
+    max: 1024
+    description: Extraction box (relion_tomo_subtomo --b). Ignored if do_extract=no.
+  - key: crop
+    label: Extract cropped box (binned px)
+    widget: number
+    default: 192
+    min: 32
+    max: 768
+    description: |
+      Cropped 2D-stack box (relion_tomo_subtomo --crop). This is the box the
+      refine runs at — it must match reference_map's box. Ignored if do_extract=no.
+  - key: bin
+    label: Extract binning
+    widget: number
+    default: 1
+    min: 1
+    max: 8
+    description: Tomogram binning for extraction (relion_tomo_subtomo --bin). Ignored if do_extract=no.
+  - key: max_dose
+    label: Max dose (e/A^2)
+    widget: number
+    default: 50
+    min: 1
+    max: 200
+    description: Per-tilt dose cutoff for extraction (relion_tomo_subtomo --max_dose).
+  - key: sym
+    label: Point-group symmetry
+    widget: text
+    default: C1
+    description: |
+      Symmetry for auto-refine (--sym). C6 for the immature HIV-1 Gag
+      lattice; C1 for an asymmetric complex.
+  - key: particle_diameter
+    label: Particle mask diameter (A)
+    widget: number
+    default: 230
+    min: 10
+    max: 2000
+  - key: ini_high
+    label: Initial low-pass (A)
+    widget: number
+    default: 30
+    min: 1
+    max: 200
+    description: |
+      Starting reference low-pass (--ini_high). Use a value near the
+      reference's real resolution (e.g. 5.5 when continuing from a good
+      bin1 reference, higher for a fresh initial model).
+  - key: healpix_order
+    label: Angular sampling (healpix order)
+    widget: number
+    default: 4
+    min: 0
+    max: 7
+    description: Global angular sampling for auto-refine (--healpix_order).
+  - key: cpus_per_task
+    label: CPUs per task
+    widget: number
+    default: 20
+    min: 2
+    max: 64
+    description: |
+      Feed threads for the GPU workers + the extract MPI. For a 4-GPU run
+      ~20 fits a 4-GPU node; for 1 GPU drop to ~3 so it lands a small node.
+  - key: mem_gb
+    label: Memory (GiB)
+    widget: number
+    default: 64
+    min: 8
+    max: 480
+  - key: threads
+    label: RELION threads per rank (--j)
+    widget: number
+    default: 4
+    min: 1
+    max: 32
+  - key: time_limit
+    label: Wall-clock limit (HH:MM:SS)
+    widget: text
+    default: "8:00:00"
+    description: |
+      STA auto-refine gets slower per iteration as resolution improves;
+      give generous headroom. On a spot requeue the run resumes from the
+      last checkpoint (--continue), so this is a ceiling, not a budget.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/relion-tomo-sta-{{.ctx.run_id}}"
+  artifacts:
+    - key: refined_map
+      path: "{{.outputs.dir}}/Refine3D/run_class001.mrc"
+      role: primary_output
+      description: Final auto-refined subtomogram average (the lattice/complex density).
+    - key: postprocess_map
+      path: "{{.outputs.dir}}/PostProcess/postprocess.mrc"
+      role: primary_output
+      description: Sharpened, masked map from relion_postprocess.
+    - key: postprocess_star
+      path: "{{.outputs.dir}}/PostProcess/postprocess.star"
+      role: primary_output
+      description: FSC table + final resolution + B-factor.
+    - key: log
+      path: "{{.outputs.dir}}/run.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -uo pipefail
+
+  IMG="docker://{{.runtime.image}}"
+  OPT_SET={{.inputs.optimisation_set | quote}}
+  TOMO_STAR={{.inputs.tomograms_star | quote}}
+  PART_STAR={{.inputs.particles_star | quote}}
+  REF={{.inputs.reference_map | quote}}
+  MASK={{.inputs.solvent_mask | quote}}
+  OUTDIR={{.outputs.dir | quote}}
+  DO_EXTRACT={{.params.do_extract | quote}}
+  NGPU={{.params.n_gpus}}
+  THREADS={{.params.threads}}
+  NRANK=$((NGPU + 1)); [ "$NRANK" -lt 3 ] && NRANK=3   # gold-standard refine needs >=3 ranks
+  mkdir -p "$OUTDIR"
+
+  # --- one-time, flock-guarded SIF pull --------------------------------
+  SIF_STORE=/mnt/efs/sifs; mkdir -p "$SIF_STORE" || true
+  SIF_PATH="$SIF_STORE/relion_5.0-cuda12.6.sif"
+  export APPTAINER_CACHEDIR="$TMPDIR/apptainer-cache" APPTAINER_TMPDIR="$TMPDIR/apptainer-tmp"
+  mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
+  if [ ! -s "$SIF_PATH" ]; then
+    exec 9>"$SIF_STORE/.relion_5.0-cuda12.6.sif.lock" || true
+    if flock -w 1800 9 2>/dev/null; then
+      [ -s "$SIF_PATH" ] || { echo "[tomo-sta] pulling $IMG -> $SIF_PATH"; apptainer pull --force "$SIF_PATH" "$IMG" 2>&1 || SIF_PATH="$IMG"; }
+      flock -u 9 2>/dev/null || true
+    else SIF_PATH="$IMG"; fi
+  fi
+
+  RUN() { apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs "$SIF_PATH" "$@"; }
+  MPI=( mpirun --mca plm ^slurm --mca ras ^slurm --oversubscribe --bind-to none )
+
+  # --- SMOKE_MODE ------------------------------------------------------
+  if [ -z "$OPT_SET" ] && [ -z "$PART_STAR" ]; then
+    echo "[tomo-sta] SMOKE_MODE: relion_refine --version"
+    exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs "$SIF_PATH" relion_refine --version
+  fi
+
+  SCRATCH="$TMPDIR/relion_scratch"; mkdir -p "$SCRATCH"
+
+  # RELION resolves relative STAR references against cwd; cd into the
+  # project root (the dir holding the Extract/Reconstruct/Denoise trees).
+  ANCHOR="${OPT_SET:-$PART_STAR}"
+  PROJ="$(dirname "$ANCHOR")"
+  while [ "$PROJ" != "/" ] && [ ! -d "$PROJ/Extract" ] && [ ! -d "$PROJ/Reconstruct" ] && [ ! -d "$PROJ/Denoise" ] && [ ! -d "$PROJ/Tomograms" ]; do
+    PROJ="$(dirname "$PROJ")"
+  done
+  [ "$PROJ" = "/" ] && PROJ="$(dirname "$ANCHOR")"
+  cd "$PROJ"
+  echo "[tomo-sta] PROJ=$PROJ NGPU=$NGPU NRANK=$NRANK do_extract=$DO_EXTRACT"
+
+  # --- (1) regenerate pseudo-subtomograms ------------------------------
+  EXTRACT_OUT="$OUTDIR/Extract"
+  if [ "$DO_EXTRACT" = "yes" ]; then
+    [ -r "$TOMO_STAR" ] || { echo "do_extract=yes needs a readable tomograms_star" >&2; exit 1; }
+    [ -r "$PART_STAR" ] || { echo "do_extract=yes needs a readable particles_star" >&2; exit 1; }
+    mkdir -p "$EXTRACT_OUT"
+    echo "[tomo-sta] extracting subtomograms -> $EXTRACT_OUT"
+    RUN "${MPI[@]}" -np "$NRANK" relion_tomo_subtomo_mpi \
+      --p "$PART_STAR" --t "$TOMO_STAR" --theme classic --o "$EXTRACT_OUT/" \
+      --b {{.params.box}} --crop {{.params.crop}} --bin {{.params.bin}} \
+      --max_dose {{.params.max_dose}} --min_frames 1 --float16 --stack2d --j "$THREADS"
+    IOS="$EXTRACT_OUT/optimisation_set.star"
+  else
+    IOS="$OPT_SET"
+  fi
+  [ -r "$IOS" ] || { echo "no readable optimisation_set ($IOS)" >&2; exit 1; }
+
+  # --- (2) gold-standard auto-refine (spot-resume aware) ----------------
+  REFINE_OUT="$OUTDIR/Refine3D"; mkdir -p "$REFINE_OUT"
+  LATEST=""; shopt -s nullglob
+  for f in "$REFINE_OUT"/run_it*_optimiser.star; do LATEST="$f"; done
+  shopt -u nullglob
+
+  MASK_ARGS=(); [ -n "$MASK" ] && [ -r "$MASK" ] && MASK_ARGS=( --solvent_mask "$MASK" --solvent_correct_fsc )
+
+  if [ -n "$LATEST" ] && [ -s "$LATEST" ]; then
+    echo "[tomo-sta] RESUME refine from $LATEST"
+    RUN "${MPI[@]}" -np "$NRANK" relion_refine_mpi --continue "$LATEST" \
+      --o "$REFINE_OUT/run" --scratch_dir "$SCRATCH" --j "$THREADS" --gpu ""
+  else
+    echo "[tomo-sta] FRESH refine"
+    RUN "${MPI[@]}" -np "$NRANK" relion_refine_mpi \
+      --o "$REFINE_OUT/run" --auto_refine --split_random_halves \
+      --ios "$IOS" --ref "$REF" --trust_ref_size --ini_high {{.params.ini_high}} \
+      --dont_combine_weights_via_disc --scratch_dir "$SCRATCH" --pool 30 --pad 2 \
+      --ctf --particle_diameter {{.params.particle_diameter}} --flatten_solvent --zero_mask \
+      "${MASK_ARGS[@]}" --oversampling 1 --healpix_order {{.params.healpix_order}} \
+      --auto_local_healpix_order 4 --offset_range 5 --offset_step 2 \
+      --sym {{.params.sym | quote}} --low_resol_join_halves 40 --norm --scale \
+      --sigma_tilt 10 --j "$THREADS" --gpu ""
+  fi
+
+  # --- (3) postprocess: sharpen + measure resolution -------------------
+  POST_OUT="$OUTDIR/PostProcess"; mkdir -p "$POST_OUT"
+  HALF1="$REFINE_OUT/run_half1_class001_unfil.mrc"
+  if [ -r "$HALF1" ]; then
+    echo "[tomo-sta] postprocess"
+    PP_MASK=(); [ -n "$MASK" ] && [ -r "$MASK" ] && PP_MASK=( --mask "$MASK" )
+    RUN relion_postprocess --i "$HALF1" --o "$POST_OUT/postprocess" \
+      "${PP_MASK[@]}" --auto_bfac true --autob_lowres 10 2>&1 | tail -20
+  else
+    echo "[tomo-sta] no unfiltered half-map ($HALF1); skipping postprocess"
+  fi
+  echo "[tomo-sta] done"

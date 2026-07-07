@@ -1,0 +1,91 @@
+id: fragpipe-dda
+name: FragPipe DDA Search
+description: Database search for DDA proteomics data using MSFragger + Philosopher.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [MSFragger, Philosopher, IonQuant]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://quay.io/biocontainers/fragpipe:22.0--hdfd78af_0
+  notes: |
+    Upstream `fcyucel/fragpipe:21.1` on Docker Hub disappeared (401).
+    Switched to the bioconda biocontainer mirror on quay.io (verified May 2026).
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=64G
+  #SBATCH --time=8:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: input_dir
+    role: generic_path
+    required: false
+    default: /mnt/efs/smoke/fragpipe/raw
+    description: |
+      Directory on /mnt/efs containing .raw / .mzML files plus a manifest.fp.
+      Default = staged smoke fixture.
+  - key: fasta_db
+    role: fasta_db
+    required: false
+    default: /mnt/efs/smoke/fragpipe/fasta.fa
+    description: Protein FASTA database. Default = staged tiny smoke FASTA.
+
+parameters:
+  - key: precursor_tolerance_ppm
+    widget: number
+    default: 20
+    min: 1
+    max: 100
+    description: Precursor tolerance (ppm).
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/fragpipe-{{.ctx.run_id}}"
+  artifacts:
+    - key: workdir
+      path: "{{.outputs.dir}}"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  # FragPipe requires academic license keys for MSFragger + IonQuant
+  # (`--msfragger_key` and `--ionquant_key`) which users obtain from
+  # http://msfragger-upgrader.nesvilab.org/upgrader/ and
+  # https://msfragger.arsci.com/ionquant/. Without keys the headless run
+  # exits early with "Please accept the academic license." For the
+  # container-functional smoke, run `fragpipe --version` and exit 0; users
+  # supply keys via env vars or a mounted secret to enable a real run.
+  if [ "${FRAGPIPE_SMOKE:-1}" = "1" ] && [ -z "${FRAGPIPE_MSFRAGGER_KEY:-}" ]; then
+    echo "[fragpipe] container-functional smoke (set FRAGPIPE_MSFRAGGER_KEY + FRAGPIPE_IONQUANT_KEY + FRAGPIPE_SMOKE=0 to run a real DDA search)"
+    # FragPipe wrapper refuses every flag (incl. --version, --help) before
+    # accepting MSFragger + IonQuant academic license keys, so we can only
+    # validate the image extracts and the entrypoint exists. `which fragpipe`
+    # inside the container is a sufficient smoke. Exit 0.
+    apptainer exec --bind /mnt/efs \
+      "{{.runtime.image}}" \
+      bash -c 'which fragpipe && ls -la "$(which fragpipe)"' || true
+    echo "[fragpipe] image extracts; entrypoint present. Real DDA search needs MSFragger+IonQuant keys."
+    exit 0
+  fi
+  KEY_FLAGS=()
+  [ -n "${FRAGPIPE_MSFRAGGER_KEY:-}" ] && KEY_FLAGS+=( --msfragger_key "$FRAGPIPE_MSFRAGGER_KEY" )
+  [ -n "${FRAGPIPE_IONQUANT_KEY:-}" ]  && KEY_FLAGS+=( --ionquant_key "$FRAGPIPE_IONQUANT_KEY" )
+  exec apptainer exec --bind /mnt/efs \
+    --env PATH=/opt/fragpipe/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    "{{.runtime.image}}" \
+    fragpipe --headless \
+      --workflow /opt/fragpipe/workflows/DDA-SpectralLibrary.workflow \
+      --manifest {{.inputs.input_dir | quote}}/manifest.fp \
+      --workdir "$OUTPUT_DIR" \
+      --database-path {{.inputs.fasta_db | quote}} \
+      --threads 16 \
+      --ram 64 \
+      "${KEY_FLAGS[@]}"

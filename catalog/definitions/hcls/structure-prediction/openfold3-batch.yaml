@@ -1,0 +1,233 @@
+id: openfold3-batch
+name: OpenFold3 (array — batch fold)
+description: |
+  Array-fanout sibling of openfold3.yaml. Takes a directory of
+  pre-staged InferenceQuerySet JSONs (one per complex) and fans out as a
+  Slurm array — task N reads <input_dir>/<row_N>.json where the row index
+  is computed from a manifest CSV (column `pdb_id` or `complex_id`).
+
+  Use when you need to fold ~10-100 distinct complexes in parallel rather
+  than rerunning the single-target openfold3 template that many times by
+  hand. Each array task runs the same OpenFold3 CLI invocation as the
+  single-complex template; only the input path + output subdir change.
+
+  Per-task output layout:
+    <outputs.dir>/<COMPLEX_ID>/predicted.cif
+    <outputs.dir>/<COMPLEX_ID>/confidence.json
+    <outputs.dir>/<COMPLEX_ID>/ranking.json
+
+  Cost-stamping is per-array-task (admin_comment is set by the
+  scaling/worker.go stamper on each task independently), so the case study
+  can report a real per-complex spot cost rather than an averaged total.
+
+  Pre-staged SIF on EFS (same path as openfold3.yaml). Inherits the
+  weights cache at /mnt/efs/_openfold3-cache so concurrent array tasks
+  don't all re-download the 5 GB weights.
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [OpenFold3]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: /mnt/efs/_sifs/openfold3-0.4.0.sif
+  notes: |
+    Same SIF as openfold3.yaml — pre-staged from
+    openfoldconsortium/openfold3:0.4.0 (~12 GB). The first array task to
+    hit the weights cache populates it; subsequent tasks read from EFS.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=12
+  #SBATCH --mem={{.params.mem_gb}}G
+  #SBATCH --time={{.params.time_min}}
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:{{.params.gpu_type}}:1
+  {{- if gt (int .params.batch_count) 1 }}
+  #SBATCH --array=1-{{.params.batch_count}}%{{.params.array_concurrency}}
+  {{- end }}
+
+inputs:
+  - key: manifest_csv
+    role: generic_path
+    required: true
+    description: |
+      CSV with a header row and either a `pdb_id` or `complex_id` column.
+      Array task N reads the value at row N and locates
+      <input_dir>/<value>.json as the OpenFold3 query. Lines beyond
+      batch_count are ignored.
+
+  - key: input_dir
+    role: generic_path
+    required: true
+    description: |
+      Directory holding the per-complex InferenceQuerySet JSONs.
+      tcr-pmhc-bench-prep stages this at
+      /mnt/efs/bench/tcr-pmhc/of3-inputs/.
+
+parameters:
+  - key: batch_count
+    label: Number of complexes (array size)
+    widget: number
+    default: 5
+    min: 1
+    max: 100
+    description: |
+      Truncate the manifest to the first N rows and emit
+      `#SBATCH --array=1-N%array_concurrency`. Set this equal to the
+      number of complexes prepared by the upstream prep step.
+
+  - key: array_concurrency
+    label: Max concurrent array tasks
+    widget: number
+    default: 8
+    min: 1
+    max: 50
+    advanced: true
+    description: |
+      `%K` slurm array throttle: at most K of the N tasks run at once.
+      Caps Karpenter burst — keep small (~5-10) on dev to avoid spinning
+      up 50 g5.xlarge nodes simultaneously; raise on prod when burst is
+      cheap relative to wall-clock.
+
+  - key: num_diffusion_samples
+    label: Diffusion samples (ensemble size)
+    widget: number
+    default: 5
+    min: 1
+    max: 25
+
+  - key: gpu_type
+    label: GPU type
+    widget: enum
+    options: [a10g, l4, l40s]
+    default: a10g
+    advanced: true
+    description: |
+      a10g (24 GB, sm_86): default, fits ~1000 aa complexes comfortably.
+      l4   (24 GB, sm_89): use when bf16 is required (OF3 0.4+ rejects
+                           sm_75/T4 with "Unsupported GPU and data type").
+      l40s (48 GB, sm_89): use for >1500 aa multi-chain inputs that OOM
+                           on 24 GB cards (e.g. AAV trimer+receptor).
+
+  - key: mem_gb
+    label: Host memory (GB)
+    widget: number
+    default: 64
+    min: 16
+    max: 512
+    advanced: true
+    description: Host RAM allocation. Bump for >1000-aa inputs.
+
+  - key: time_min
+    label: Wall-clock limit (minutes)
+    widget: number
+    default: 120
+    min: 10
+    max: 1440
+    advanced: true
+    description: Per-array-task time limit, in minutes.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openfold3-batch-{{.ctx.run_id}}"
+  artifacts:
+    - key: predictions
+      path: "{{.outputs.dir}}"
+      role: primary_output
+      description: |
+        Per-complex subdirectory under the run dir, each containing
+        predicted.cif + confidence.json. The downstream metrics step
+        walks this tree to compute DockQ / TM-score vs the crystal.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  # Array-mode is mandatory for this template — even N=1 should use array
+  # so output paths are consistent. We still tolerate "no SLURM_ARRAY_TASK_ID"
+  # by defaulting to 1 (debug submit from CLI without `--array`).
+  TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
+  MANIFEST_CSV={{.inputs.manifest_csv | quote}}
+  INPUT_DIR={{.inputs.input_dir | quote}}
+  RUN_DIR={{.outputs.dir | quote}}
+
+  [ -f "$MANIFEST_CSV" ] || { echo "manifest CSV not found: $MANIFEST_CSV" >&2; exit 1; }
+  [ -d "$INPUT_DIR" ]    || { echo "input dir not found: $INPUT_DIR"      >&2; exit 1; }
+
+  # Resolve the complex ID for this array task. We use awk to find the
+  # pdb_id (or complex_id) column and pull the N-th non-header row. Skipping
+  # rows where status != "ok" so prep parse failures don't poison the array.
+  ROW_N="$TASK_ID"
+  COMPLEX_ID=$(awk -F',' -v target="$ROW_N" '
+    NR==1 {
+      for (i=1; i<=NF; i++) {
+        if ($i == "pdb_id" || $i == "complex_id") id_col = i
+        if ($i == "status") status_col = i
+      }
+      next
+    }
+    {
+      if (status_col && $status_col != "ok" && $status_col != "") next
+      n++
+      if (n == target) { print $id_col; exit }
+    }
+  ' "$MANIFEST_CSV")
+
+  if [ -z "$COMPLEX_ID" ]; then
+    echo "FATAL: array task $TASK_ID has no matching row in $MANIFEST_CSV" >&2
+    exit 1
+  fi
+  echo "[task $TASK_ID] complex_id=$COMPLEX_ID"
+
+  QUERY_JSON="$INPUT_DIR/$COMPLEX_ID.json"
+  [ -f "$QUERY_JSON" ] || { echo "expected query JSON missing: $QUERY_JSON" >&2; exit 1; }
+
+  OUTPUT_DIR="$RUN_DIR/$COMPLEX_ID"
+  mkdir -p "$OUTPUT_DIR"
+
+  # Diffusion intermediates land on NVMe; only the final artifacts move back
+  # to EFS once predict finishes. Avoids the EFS bloat seen on heavy arrays.
+  WORK_DIR="${TMPDIR}/of3-work-${TASK_ID}"
+  mkdir -p "$WORK_DIR"
+
+  # OF3 CLI inside the SIF. See openfold3.yaml for the lineage / caveats:
+  # the conda env's run_openfold lives at /opt/conda/envs/openfold3/bin
+  # (apptainer exec skips Docker ENTRYPOINT, so we call the full path);
+  # OPENFOLD_CACHE points at EFS so the 5 GB weights are downloaded once
+  # across the entire array; /dev/shm gets a per-task bind mount because
+  # K8s 64 MB shm crashes the DataLoader workers.
+  OF3_BIN=/opt/conda/envs/openfold3/bin/run_openfold
+  CACHE=/mnt/efs/_openfold3-cache
+  mkdir -p "$CACHE"
+  SHM_DIR=$(mktemp -d -t of3b-shm-XXXXX)
+  trap 'rm -rf "$SHM_DIR"' EXIT
+
+  set +o pipefail
+  yes 2>/dev/null | apptainer exec --nv \
+    --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs --bind "$SHM_DIR:/dev/shm" \
+    --env "HOME=$CACHE" --env "OPENFOLD_CACHE=$CACHE" \
+    "{{.runtime.image}}" \
+    "$OF3_BIN" predict \
+      --query-json "$QUERY_JSON" \
+      --output-dir "$WORK_DIR" \
+      --num-diffusion-samples {{.params.num_diffusion_samples}}
+  RC=${PIPESTATUS[1]}
+  set -o pipefail
+
+  # Move final artifacts to EFS so downstream metrics step can walk the tree.
+  # Per the artifact contract: predicted.cif + confidence.json + any sibling
+  # files OF3 emits at the output root. Done even on RC!=0 so partial outputs
+  # are inspectable.
+  mv "$WORK_DIR"/* "$OUTPUT_DIR"/ 2>/dev/null || true
+
+  # Surface a one-line summary for the slurm stdout so the case-study
+  # collator can sacct -j <task> -o State and find the complex_id easily.
+  if [ "$RC" -eq 0 ]; then
+    echo "=== OK: $COMPLEX_ID predicted (output: $OUTPUT_DIR) ==="
+  else
+    echo "=== FAIL: $COMPLEX_ID exited $RC ==="
+  fi
+  exit "$RC"

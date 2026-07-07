@@ -1,0 +1,48 @@
+id: custom-slurm
+name: Custom Slurm Job
+description: Submit any script with custom resource requirements.
+vertical: general
+category: general
+workload_group: general
+modality: cli
+tools: [sbatch]
+ready: true
+kind: batch
+
+runtime:
+  kind: host_system
+  binary: bash
+  notes: |
+    Runs the user-supplied script body directly on the slurmd cap-pod —
+    no container indirection. Use this template when you've already wrapped
+    your tool in apptainer/conda yourself and just need raw sbatch.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=4G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: working_directory
+    role: generic_path
+    required: false
+    default: /mnt/efs
+    description: cwd for the rendered sbatch.
+
+parameters:
+  - key: job_name
+    widget: text
+    default: my-run
+    description: Slurm job name.
+  - key: script_body
+    widget: textarea
+    required: true
+    description: Full shebang script body (e.g. `#!/bin/bash ...`).
+
+outputs:
+  dir: "{{.inputs.working_directory}}"
+  artifacts: []
+
+script: |
+  {{.params.script_body}}

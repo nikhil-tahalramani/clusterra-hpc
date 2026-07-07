@@ -1,0 +1,293 @@
+id: glycounter-qc
+name: GlyCounter oxonium QC + scan filter
+description: |
+  Step 2 of the `glyco-mapps-complete` chain. Scans MS2 spectra for
+  glyco-diagnostic oxonium ions (HexNAc 204.087, 138.055, 366.140 Tn-marker,
+  NeuAc 274.092 / 292.103, Hex 163.060, etc.), emits a per-scan summary
+  TSV and writes `passing_scans.mgf` containing only scans with >=N
+  oxonium hits at >=1% base-peak intensity.
+
+  This is the "customer protection" gate: if <0.5% of MS2 scans pass,
+  the chain exits 65 ("enrichment failed — re-run lectin/HILIC before
+  paying for search"). For Casanovo (Step 4), the filtered MGF cuts
+  GPU wall-time 5-10x.
+
+  GlyCounter (MIT, RyanAlMcCl/GlyCounter) is not pip-published — we
+  clone + `pip install -e .` into an EFS venv on first run, then reuse.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [GlyCounter]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://python:3.11
+  notes: |
+    GlyCounter is a Python tool with no upstream container (verified May
+    2026). We pull docker://python:3.11 (~140 MB; full not slim — pip-cache
+    extension modules need gcc), clone the repo into an EFS venv at
+    /mnt/efs/_glycounter-venv/<sha>, install with -e, and shell into it
+    from each subsequent run via apptainer exec. The repo HEAD is pinned
+    to a SHA in the script body to avoid silent drift.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=8G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+inputs:
+  - key: mzml_dir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Directory of .mzML files to QC. If empty, auto-discovers the upstream
+      `step-prep/mzml/` directory inside the workflow run dir.
+  - key: mgf_dir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Directory of .mgf files to subset. If empty, auto-discovers
+      `step-prep/mgf/` from the workflow run.
+
+parameters:
+  - key: oxonium_min_hits
+    widget: number
+    default: 2
+    min: 1
+    max: 10
+    description: |
+      Minimum number of diagnostic oxonium ions present in a scan at
+      >=1% base-peak intensity for the scan to be retained.
+  - key: hard_gate_pct
+    widget: number
+    default: 0.5
+    min: 0.0
+    max: 100.0
+    description: |
+      If the fraction of passing scans is below this percentage of total
+      MS2 scans, the step exits 65 (customer-protection gate). Set 0 to
+      disable the gate.
+  - key: qc_mode
+    widget: enum
+    options: [general, tn-only, o-glyco, n-glyco]
+    default: general
+    description: |
+      Which oxonium panel to gate on. "general" = full diagnostic panel
+      (HexNAc + Hex + HexNAc fragments + Hex-HexNAc + NeuAc/NeuGc/Fuc;
+      appropriate for any glycoprotein sample). "tn-only" = HexNAc-only
+      ions (204.087, 138.055, 168.066, 186.076) for Tn-enriched samples;
+      NeuAc/Hex/Fuc panels are incorrect for a Tn-specific QC because
+      Tn = GalNAc with no sialic acid or galactose. "o-glyco" = HexNAc +
+      Hex-HexNAc + NeuAc (mucin-type O-glycans, including core 1-4).
+      "n-glyco" = HexNAc + Hex + NeuAc + Fuc (classical N-glycans).
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-{{.ctx.step_id}}"
+  artifacts:
+    - key: oxonium_summary
+      path: "{{.outputs.dir}}/oxonium_summary.tsv"
+      role: primary_output
+    - key: passing_mgf
+      path: "{{.outputs.dir}}/passing_scans.mgf"
+      role: generic
+    - key: qc_json
+      path: "{{.outputs.dir}}/qc.json"
+      role: metrics_file
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  MZML_DIR_IN={{.inputs.mzml_dir | quote}}
+  MGF_DIR_IN={{.inputs.mgf_dir | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  MIN_HITS={{.params.oxonium_min_hits}}
+  HARD_GATE={{.params.hard_gate_pct}}
+  QC_MODE={{.params.qc_mode | quote}}
+
+  mkdir -p "$OUTPUT_DIR"
+
+  # Auto-discover upstream prep step outputs when the user didn't pass paths.
+  WORKFLOW_DIR=$(dirname "$OUTPUT_DIR")
+  if [ -z "$MZML_DIR_IN" ]; then
+    # Find any step-*-prep or step-prep dir under workflow root.
+    MZML_DIR_IN=$(find "$WORKFLOW_DIR" -maxdepth 2 -type d -name 'mzml' 2>/dev/null | head -1)
+  fi
+  if [ -z "$MGF_DIR_IN" ]; then
+    MGF_DIR_IN=$(find "$WORKFLOW_DIR" -maxdepth 2 -type d -name 'mgf' 2>/dev/null | head -1)
+  fi
+
+  [ -d "$MZML_DIR_IN" ] || { echo "[qc] mzml_dir not found (input=$MZML_DIR_IN, workflow=$WORKFLOW_DIR)" >&2; exit 1; }
+
+  # Persistent EFS venv with pyteomics + numpy. We use pyteomics directly to
+  # scan oxonium ions because GlyCounter HEAD is a TUI-targeted CLI and its
+  # batch mode signature shifted across releases; pyteomics is stable.
+  VENV=/mnt/efs/_glyco-qc-venv/v1
+  PYTHON_SIF=/mnt/efs/_apt-sifs/python-3.11.sif
+  mkdir -p "$(dirname "$PYTHON_SIF")" "$(dirname "$VENV")"
+  [ -f "$PYTHON_SIF" ] || apptainer pull "$PYTHON_SIF" docker://python:3.11 2>&1 | head -3
+
+  (
+    flock -x 9
+    if [ ! -x "$VENV/bin/python" ]; then
+      echo "[qc] provisioning pyteomics venv on EFS (one-time, ~2 min)"
+      apptainer exec "$PYTHON_SIF" bash -c "
+        set -euo pipefail
+        python3.11 -m venv '$VENV'
+        '$VENV/bin/pip' install --quiet --upgrade pip
+        '$VENV/bin/pip' install --quiet pyteomics 'numpy<2' lxml
+      "
+    fi
+  ) 9>"$VENV.lock"
+
+  # Inline pyteomics-based oxonium scanner. Outputs:
+  #   oxonium_summary.tsv (scan_id, n_oxonium_hits, hit_list)
+  #   passing_scans.mgf   (only scans with >=MIN_HITS hits; from MGF_DIR_IN)
+  #   qc.json             (counts + pass fraction)
+  cat > "$OUTPUT_DIR/scan_oxonium.py" <<'PYEOF'
+  import os, sys, json, glob
+  from pyteomics import mzml, mgf
+
+  # Glyco-diagnostic oxoniums (m/z, +/- 0.02 Da tolerance, monoisotopic).
+  # Source: Pett et al. 2018, Reiding et al. 2019, MetaMorpheus glyco panel.
+  # The 366.140 Hex-HexNAc dimer is NOT a Tn marker (Tn = HexNAc-only); it
+  # signals T-antigen / core 1 extended O-glycans. Including NeuAc/Fuc/Hex
+  # in a Tn-specific QC inflates the pass rate with non-Tn glycopeptides.
+  PANELS = {
+      "general": [
+          ('HexNAc-fragment', 138.055),
+          ('HexNAc-fragment', 168.066),
+          ('HexNAc-2H2O',     186.076),
+          ('HexNAc',          204.087),
+          ('Hex',             163.060),
+          ('Hex-HexNAc',      366.140),
+          ('NeuAc-H2O',       274.092),
+          ('NeuAc',           292.103),
+          ('NeuGc',           308.098),
+          ('Fuc',             147.065),
+      ],
+      "tn-only": [
+          ('HexNAc-fragment', 138.055),
+          ('HexNAc-fragment', 168.066),
+          ('HexNAc-2H2O',     186.076),
+          ('HexNAc',          204.087),
+      ],
+      "o-glyco": [
+          ('HexNAc-fragment', 138.055),
+          ('HexNAc-fragment', 168.066),
+          ('HexNAc-2H2O',     186.076),
+          ('HexNAc',          204.087),
+          ('Hex-HexNAc',      366.140),
+          ('NeuAc-H2O',       274.092),
+          ('NeuAc',           292.103),
+      ],
+      "n-glyco": [
+          ('HexNAc-fragment', 138.055),
+          ('HexNAc-fragment', 168.066),
+          ('HexNAc',          204.087),
+          ('Hex',             163.060),
+          ('Hex-HexNAc',      366.140),
+          ('NeuAc-H2O',       274.092),
+          ('NeuAc',           292.103),
+          ('Fuc',             147.065),
+      ],
+  }
+  qc_mode = sys.argv[6] if len(sys.argv) > 6 else "general"
+  OXONIA = PANELS.get(qc_mode, PANELS["general"])
+  TOL = 0.02
+
+  mzml_dir = sys.argv[1]
+  mgf_dir = sys.argv[2]
+  output_dir = sys.argv[3]
+  min_hits = int(sys.argv[4])
+  hard_gate_pct = float(sys.argv[5])
+
+  rows = []
+  total_ms2 = 0
+  passing = set()  # scan IDs that pass
+
+  for fp in sorted(glob.glob(os.path.join(mzml_dir, '*.mzML'))):
+      stem = os.path.splitext(os.path.basename(fp))[0]
+      try:
+          src = mzml.read(fp)
+      except Exception as e:
+          print(f'[qc] skip {fp}: {e}', file=sys.stderr)
+          continue
+      for spec in src:
+          if spec.get('ms level') != 2:
+              continue
+          total_ms2 += 1
+          mzs = spec.get('m/z array')
+          ints = spec.get('intensity array')
+          if mzs is None or len(mzs) == 0:
+              continue
+          base = float(max(ints)) if len(ints) else 0.0
+          if base <= 0:
+              continue
+          thresh = 0.01 * base
+          hits = []
+          for label, target in OXONIA:
+              # Vectorize-light: find nearest peak within TOL.
+              for m, i in zip(mzs, ints):
+                  if abs(m - target) <= TOL and i >= thresh:
+                      hits.append(label)
+                      break
+          scan_id = spec.get('id', f'{stem}.scan={spec.get("index","?")}')
+          if len(hits) >= min_hits:
+              passing.add(scan_id)
+          rows.append((stem, scan_id, len(hits), ';'.join(hits)))
+
+  os.makedirs(output_dir, exist_ok=True)
+  tsv = os.path.join(output_dir, 'oxonium_summary.tsv')
+  with open(tsv, 'w') as fh:
+      fh.write('file\tscan_id\tn_oxonium_hits\thits\n')
+      for r in rows:
+          fh.write('\t'.join(str(c) for c in r) + '\n')
+
+  passing_pct = (100.0 * len(passing) / total_ms2) if total_ms2 else 0.0
+  summary = {
+      'total_ms2_scans': total_ms2,
+      'passing_scans':   len(passing),
+      'passing_pct':     round(passing_pct, 3),
+      'min_hits':        min_hits,
+      'qc_mode':         qc_mode,
+      'oxonium_panel':   [o[0] for o in OXONIA],
+  }
+
+  # Subset MGF if present.
+  n_mgf_out = 0
+  if mgf_dir and os.path.isdir(mgf_dir):
+      passing_mgf = os.path.join(output_dir, 'passing_scans.mgf')
+      with open(passing_mgf, 'w') as out:
+          for src in sorted(glob.glob(os.path.join(mgf_dir, '*.mgf'))):
+              for spec in mgf.read(src):
+                  title = (spec.get('params') or {}).get('title', '')
+                  scan_match = False
+                  for sid in passing:
+                      if sid in title or title.endswith('scan=' + sid.split('=')[-1]):
+                          scan_match = True
+                          break
+                  if scan_match:
+                      mgf.write([spec], output=out)
+                      n_mgf_out += 1
+      summary['mgf_scans_kept'] = n_mgf_out
+
+  with open(os.path.join(output_dir, 'qc.json'), 'w') as fh:
+      json.dump(summary, fh, indent=2)
+
+  print(json.dumps(summary, indent=2))
+
+  if hard_gate_pct > 0 and passing_pct < hard_gate_pct:
+      print(f'[qc] HARD GATE: {passing_pct:.2f}% passing < {hard_gate_pct}% — enrichment failed', file=sys.stderr)
+      sys.exit(65)
+  PYEOF
+
+  exec apptainer exec --bind /mnt/efs "$PYTHON_SIF" \
+    "$VENV/bin/python" "$OUTPUT_DIR/scan_oxonium.py" \
+      "$MZML_DIR_IN" "${MGF_DIR_IN:-}" "$OUTPUT_DIR" "$MIN_HITS" "$HARD_GATE" "$QC_MODE"

@@ -1,0 +1,146 @@
+id: gpu4pyscf
+name: GPU4PySCF DFT (GPU)
+description: |
+  GPU-accelerated DFT/HF for small-molecule discovery via GPU4PySCF — the
+  official PySCF GPU arm. Drop-in replacement for CPU PySCF: same Python API,
+  same input geometries, ~10–30× faster for medium basis sets on a single A10G.
+vertical: hcls
+category: quantum-chem
+workload_group: quantum-chem
+modality: form
+tools: [GPU4PySCF, PySCF]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: python:3.11-slim
+  requirements:
+    - gpu4pyscf-cuda12x
+    - nvidia-nvjitlink-cu12
+    - nvidia-cuda-nvrtc-cu12
+    - nvidia-cusolver-cu12
+    - nvidia-cusparse-cu12
+    - nvidia-cublas-cu12
+    - nvidia-cuda-runtime-cu12
+    - nvidia-curand-cu12
+    - nvidia-cufft-cu12
+  cache_dir: /mnt/efs/_gpu4pyscf-venv
+  notes: |
+    GPU4PySCF ships no maintained official Docker image. We use the tiny
+    python:3.11-slim base (~50 MB) + apptainer --nv to mount host CUDA libs
+    from the DL AMI; the gpu4pyscf-cuda12x wheel ships its own CUDA runtime.
+    Persist the venv on EFS so subsequent jobs reuse it (~5s vs ~60-90s cold).
+    See dl_ami_skip_pytorch_base.md — heavy pytorch:24-py3 base wastes 25 GB
+    of worker /tmp on every cold pull.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: input_py
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Path on /mnt/efs to a Python script that imports gpu4pyscf and runs a
+      calculation. Empty = ship a default smoke (water B3LYP/def2-svp).
+
+parameters:
+  - key: method
+    widget: enum
+    options: ["dft.RKS", "dft.UKS"]
+    default: "dft.RKS"
+    description: RKS = closed-shell. UKS = open-shell / radicals.
+  - key: basis
+    widget: text
+    default: def2-svp
+    description: Any PySCF-recognized basis.
+  - key: xc
+    widget: text
+    default: B3LYP
+    description: PySCF XC functional string (B3LYP, PBE, PBE0, wB97X-D, M06-2X, ...).
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/gpu4pyscf-{{.ctx.run_id}}"
+  artifacts:
+    - key: log
+      path: "{{.outputs.dir}}/output.log"
+      role: log
+    - key: run_py
+      path: "{{.outputs.dir}}/run.py"
+      role: generic
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+
+  INPUT_PY={{.inputs.input_py | quote}}
+  RUN_PY="$OUTPUT_DIR/run.py"
+  if [ -n "$INPUT_PY" ]; then
+    [ -r "$INPUT_PY" ] || { echo "input_py not readable: $INPUT_PY" >&2; exit 1; }
+    cp "$INPUT_PY" "$RUN_PY"
+  else
+    cat > "$RUN_PY" <<'PYEOF'
+  # Default smoke: single-point B3LYP/def2-svp on water.
+  # Pre-load nvidia wheel-bundled CUDA libs (libnvJitLink, cusolver, ...) so
+  # cupy/gpu4pyscf can resolve them — apptainer --nv only mounts driver libs.
+  import os, glob, ctypes
+  try:
+      import nvidia
+      _base = os.path.dirname(nvidia.__file__)
+      for _libdir in sorted(set(glob.glob(os.path.join(_base, "*", "lib")))):
+          for _so in glob.glob(os.path.join(_libdir, "*.so*")):
+              try: ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
+              except OSError: pass
+  except ImportError:
+      pass
+
+  import pyscf
+  from gpu4pyscf import dft
+
+  mol = pyscf.M(
+      atom='''O  0.0000  0.0000  0.1173
+              H  0.0000  0.7572 -0.4692
+              H  0.0000 -0.7572 -0.4692''',
+      basis='{{.params.basis}}',
+      verbose=4,
+  )
+  mf = {{.params.method}}(mol, xc='{{.params.xc}}')
+  e = mf.kernel()
+  print(f'final energy: {e}')
+  PYEOF
+  fi
+
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  export PIP_CACHE_DIR="/mnt/efs/_gpu4pyscf-venv-cache"
+  mkdir -p "$PIP_CACHE_DIR"
+  # APPTAINER_TMPDIR / APPTAINER_CACHEDIR come from slurmd TaskProlog
+  # (NVMe-rooted when the node has instance-store).
+
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" \
+    "docker://{{.runtime.base_image}}" \
+    bash -c "
+      set -euo pipefail
+      if [ ! -x '$VENV_DIR/bin/python' ]; then
+        python3 -m venv --system-site-packages '$VENV_DIR'
+      fi
+      source '$VENV_DIR/bin/activate'
+      if ! python -c 'import nvidia.nvjitlink' 2>/dev/null; then
+        pip install --quiet --cache-dir '$PIP_CACHE_DIR' \
+          gpu4pyscf-cuda12x \
+          nvidia-nvjitlink-cu12 nvidia-cuda-nvrtc-cu12 \
+          nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-cublas-cu12 \
+          nvidia-cuda-runtime-cu12 nvidia-curand-cu12 nvidia-cufft-cu12
+      fi
+      cd '$OUTPUT_DIR'
+      python '$RUN_PY' 2>&1 | tee '$OUTPUT_DIR/output.log'
+    "

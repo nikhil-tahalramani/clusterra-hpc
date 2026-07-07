@@ -1,0 +1,138 @@
+id: autodock-gpu
+name: AutoDock-GPU (LGA docking)
+description: |
+  Scripps' GPU port of AutoDock4. Runs the Lamarckian Genetic Algorithm (LGA)
+  on a single GPU using the OpenCL/CUDA `autodock_gpu_128wi` binary — ~50–100x
+  the per-ligand throughput of CPU AutoDock4 / Vina on the same A10G. Inputs
+  are precomputed receptor maps (a `.fld` produced by `autogrid4`) plus one or
+  more `.pdbqt` ligands. For batch screening set `ligand_filelist`; for a
+  single-ligand smoke test use `ligand_pdbqt`.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: form
+tools: [AutoDock-GPU, AutoDock4]
+ready: true
+kind: batch
+
+runtime:
+  kind: host_binary
+  build_image: docker://nvidia/cuda:12.2.2-devel-ubuntu22.04
+  binary_path: /mnt/efs/refs/autodock-gpu/bin/autodock_gpu_128wi
+  build_command: |
+    set -euo pipefail
+    SRC="$(dirname "$BIN")/_src-${SLURM_JOB_ID:-build}"
+    rm -rf "$SRC" && mkdir -p "$SRC" && cd "$SRC"
+    curl -sSL -o src.tar.gz https://github.com/ccsb-scripps/AutoDock-GPU/archive/refs/heads/develop.tar.gz
+    tar -xzf src.tar.gz --strip-components=1 && rm -f src.tar.gz
+    apptainer exec --bind /mnt/efs "$SIF" bash -c "
+      set -euo pipefail
+      cd '$SRC'
+      export GPU_INCLUDE_PATH=/usr/local/cuda/include
+      export GPU_LIBRARY_PATH=/usr/local/cuda/lib64
+      export PATH=/usr/local/cuda/bin:\$PATH
+      make DEVICE=CUDA NUMWI=128
+      install -m 0755 bin/autodock_gpu_128wi '$BIN'
+    "
+    cd / && rm -rf "$SRC"
+  notes: |
+    No upstream AutoDock-GPU container exists; %post is blocked in the cap-pod
+    (no CAP_SETGID, no /etc/subuid mapping). We pull the cuda:12.2.2-devel SIF
+    once, compile autodock_gpu_128wi onto EFS, and exec the host binary
+    through the SIF on every run. First-build cost ~1 min on any GPU node.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=16G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: maps_fld
+    role: generic_path
+    required: true
+    description: |
+      Precomputed AutoGrid4 maps for the receptor. The .fld and all sibling
+      map files (.map, .maps.fld, .xyz) must live in the same directory.
+  - key: ligand_pdbqt
+    role: pdbqt
+    required: false
+    default: ""
+    description: Single-ligand mode. Path to a prepared .pdbqt. Empty when using ligand_filelist.
+  - key: ligand_filelist
+    role: generic_path
+    required: false
+    default: ""
+    description: Batch mode. Plain-text file, one .pdbqt path per line. Mutually exclusive with ligand_pdbqt.
+
+parameters:
+  - key: nrun
+    widget: number
+    default: 100
+    min: 10
+    max: 1024
+    description: |
+      Number of independent LGA runs. 100 is the AutoDock4 default; drop to
+      20 for quick scoring sweeps, raise to 256 for flexible / large ligands.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/autodock-gpu-{{.ctx.run_id}}"
+  artifacts:
+    - key: poses
+      path: "{{.outputs.dir}}"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  MAPS_FLD={{.inputs.maps_fld | quote}}
+  LIGAND_PDBQT={{.inputs.ligand_pdbqt | quote}}
+  LIGAND_FILELIST={{.inputs.ligand_filelist | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  NRUN={{.params.nrun}}
+
+  if [ -z "$LIGAND_PDBQT" ] && [ -z "$LIGAND_FILELIST" ]; then
+    echo "must set either ligand_pdbqt (single) or ligand_filelist (batch)" >&2
+    exit 1
+  fi
+  if [ -n "$LIGAND_PDBQT" ] && [ -n "$LIGAND_FILELIST" ]; then
+    echo "ligand_pdbqt and ligand_filelist are mutually exclusive" >&2
+    exit 1
+  fi
+  [ -r "$MAPS_FLD" ] || { echo "maps_fld not readable: $MAPS_FLD" >&2; exit 1; }
+  if [ -n "$LIGAND_PDBQT" ];   then [ -r "$LIGAND_PDBQT"   ] || { echo "ligand_pdbqt not readable" >&2; exit 1; }; fi
+  if [ -n "$LIGAND_FILELIST" ]; then [ -r "$LIGAND_FILELIST" ] || { echo "ligand_filelist not readable" >&2; exit 1; }; fi
+
+  mkdir -p "$OUTPUT_DIR"
+  cd "$OUTPUT_DIR"
+
+  # Build SIF + host binary if missing (one-time per cluster). The SIF is
+  # cached at a fixed convention path for host_binary runtimes.
+  SIF=/mnt/efs/refs/autodock-gpu/cuda-devel-12.2.2.sif
+  BIN={{.runtime.binary_path | quote}}
+  mkdir -p "$(dirname "$SIF")" "$(dirname "$BIN")"
+  if [ ! -s "$SIF" ]; then
+    echo "[autodock-gpu] pulling CUDA devel SIF -> $SIF (~3 min, one-time)" >&2
+    apptainer pull --force "$SIF" {{.runtime.build_image}}
+  fi
+  if [ ! -x "$BIN" ]; then
+    echo "[autodock-gpu] compiling autodock_gpu_128wi -> $BIN (~1 min, one-time)" >&2
+    {{.runtime.build_command | indent 4}}
+  fi
+
+  ARGS=(
+    --ffile "$MAPS_FLD"
+    --nrun  "$NRUN"
+    --gbest 1
+  )
+  if [ -n "$LIGAND_PDBQT" ]; then
+    ARGS+=( --lfile "$LIGAND_PDBQT" )
+  else
+    ARGS+=( --filelist "$LIGAND_FILELIST" )
+  fi
+
+  exec apptainer exec --nv --bind /mnt/efs \
+    "$SIF" \
+    "$BIN" "${ARGS[@]}"

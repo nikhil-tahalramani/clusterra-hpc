@@ -1,0 +1,196 @@
+id: epitopeprediction
+name: Epitope Prediction (nf-core/epitopeprediction)
+description: |
+  nf-core/epitopeprediction 2.3.0: predicts MHC-binding peptides from somatic
+  mutations. Takes a VCF or TSV of somatic variants + HLA allele list and
+  outputs ranked peptide predictions with binding affinity scores per allele.
+
+  Designed as step 2 of the MAPPs Complete immunopeptidomics workflow
+  (Sarek → epitopeprediction → Casanovo). Takes the Strelka2 somatic VCF from
+  Sarek output; for standalone use any annotated somatic VCF works.
+
+  Tools: MHCflurry (MHC-I, MIT license) + MHCnuggets (MHC-I/II, Apache 2).
+  NetMHCpan is excluded here (requires academic license agreement).
+
+  HLA allele format: comma-separated, e.g.
+    HLA-A*02:01,HLA-A*24:02,HLA-B*07:02,HLA-B*35:01,HLA-C*07:02
+vertical: hcls
+category: nextflow
+workload_group: genomics
+modality: form
+tools: [epitopeprediction, MHCflurry, MHCnuggets]
+ready: true
+kind: batch
+
+runtime:
+  kind: nextflow
+  pipeline_repo: nf-core/epitopeprediction
+  revision: "2.3.0"
+  nxf_version: "25.10.2"
+  schema_source: auto
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: input_vcf
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Somatic VCF on /mnt/efs. Default upstream in the MAPPs Complete chain is
+      Parabricks DeepSomatic (path: <pbrun-ds-outdir>/somatic.vcf.gz). The
+      Sarek+Strelka2 CPU path is also supported
+      (<sarek-outdir>/variant_calling/strelka/<TUMOR_SAMPLE>/somatic_snvs.vcf.gz).
+
+      When used as a step in the MAPPs Complete workflow, leave empty: the
+      script auto-discovers the VCF from a sibling workflow step (preference
+      order: step-N-deepsomatic > step-N-sarek Strelka2 output).
+  - key: resume_workdir
+    role: generic_path
+    required: false
+    default: ""
+    description: Existing Nextflow workdir on EFS to resume from. Empty = fresh run.
+
+parameters:
+  - key: alleles
+    widget: text
+    default: "HLA-A*02:01,HLA-B*07:02,HLA-C*07:02"
+    description: |
+      Patient HLA alleles, comma-separated in HLA nomenclature (e.g. HLA-A*02:01).
+      Use the HLA typing output from OptiType or PolySolver for real patient data.
+  - key: tools
+    widget: text
+    default: "mhcflurry,mhcnuggets"
+    description: |
+      Prediction tools to run. Both are open-source: mhcflurry (MIT) + mhcnuggets
+      (Apache 2). Add syfpeithi for SYFPEITHI matrix scoring.
+  - key: genome_version
+    widget: enum
+    options: [GRCh38, GRCh37]
+    default: GRCh38
+    description: Reference genome version. Must match the Sarek genome parameter.
+  - key: peptide_lengths_mhci
+    widget: text
+    default: "8,9,10,11"
+    description: |
+      MHC class I peptide lengths to predict. Standard range 8-11 covers most
+      HLA-A/B/C alleles. timsTOF immunopeptidomics typically enriches 8-10mers.
+  - key: profile
+    widget: enum
+    options: [apptainer, docker, singularity]
+    default: apptainer
+    description: Container engine profile.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/epitopepred-{{.ctx.run_id}}"
+  artifacts:
+    - key: outdir
+      path: "{{.outputs.dir}}"
+      role: primary_output
+    - key: predictions_tsv
+      path: "{{.outputs.dir}}/prediction_scores"
+      role: generic
+
+policy:
+  prefer_on_demand: false
+  prefer_arm64: false
+
+config: |
+  process {
+    executor      = 'slurm'
+    queue         = { task.accelerator?.request > 0 ? 'gpu' : 'cpu' }
+    clusterOptions = "--comment 'clusterra:nf_parent=${SLURM_JOB_ID}'"
+  }
+  apptainer {
+    enabled  = true
+    cacheDir = '/mnt/efs/nxf-cache/_lib'
+    autoMounts = true
+  }
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_VCF={{.inputs.input_vcf | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+
+  # Workflow auto-discovery: when running as a chained step in MAPPs Complete,
+  # input_vcf is empty and outputs.dir is the engine-rewritten per-step path
+  # (.../mapps-<uuid>/step-N-epitopeprediction). Walk up one level to the
+  # workflow root and look for a somatic VCF from a sibling step. Preference:
+  #   1. step-*-deepsomatic/somatic.vcf.gz (Parabricks DeepSomatic, GPU)
+  #   2. step-*-sarek/variant_calling/strelka/*/somatic_snvs.vcf.gz (Strelka2)
+  if [ -z "$INPUT_VCF" ]; then
+    WF_ROOT=$(dirname "$OUTPUT_DIR")
+    # Prefer DeepSomatic if present
+    for cand in "$WF_ROOT"/step-*-deepsomatic/somatic.vcf.gz; do
+      [ -r "$cand" ] && INPUT_VCF="$cand" && break
+    done
+    # Fall back to Strelka2
+    if [ -z "$INPUT_VCF" ]; then
+      for sarek_dir in "$WF_ROOT"/step-*-sarek; do
+        [ -d "$sarek_dir/variant_calling/strelka" ] || continue
+        found=$(find "$sarek_dir/variant_calling/strelka" -name 'somatic_snvs.vcf.gz' 2>/dev/null | head -1)
+        [ -n "$found" ] && INPUT_VCF="$found" && break
+      done
+    fi
+    if [ -z "$INPUT_VCF" ]; then
+      echo "input_vcf empty and could not auto-discover a somatic VCF under $WF_ROOT" >&2
+      echo "looked for: step-*-deepsomatic/somatic.vcf.gz and step-*-sarek/variant_calling/strelka/*/somatic_snvs.vcf.gz" >&2
+      exit 1
+    fi
+    echo "auto-discovered input_vcf=$INPUT_VCF"
+  fi
+
+  [ -r "$INPUT_VCF" ] || { echo "input_vcf not readable: $INPUT_VCF" >&2; exit 1; }
+
+  RESUME_WORKDIR={{.inputs.resume_workdir | quote}}
+  if [ -n "$RESUME_WORKDIR" ]; then
+    WORKDIR="$RESUME_WORKDIR"
+    RESUME_FLAG=(-resume)
+  else
+    WORKDIR=/mnt/efs/work-$SLURM_JOB_ID
+    RESUME_FLAG=()
+  fi
+
+  export NXF_VER={{.runtime.nxf_version}}
+  export NXF_SINGULARITY_CACHEDIR=/mnt/efs/nxf-cache/_lib
+  export NXF_HOME=/mnt/efs/nxf-cache/_home
+
+  # epitopeprediction expects a samplesheet CSV with: sample,alleles,filename
+  SAMPLESHEET=/mnt/efs/epitope-samplesheet-$SLURM_JOB_ID.csv
+  ALLELES={{.params.alleles | quote}}
+  SAMPLE_NAME=$(basename "$INPUT_VCF" | sed 's/\\.vcf.*//')
+  printf 'sample,alleles,filename\n%s,"%s",%s\n' \
+    "$SAMPLE_NAME" "$ALLELES" "$INPUT_VCF" > "$SAMPLESHEET"
+
+  CONFIG_FILE=/mnt/efs/nextflow-$SLURM_JOB_ID.config
+  cat > "$CONFIG_FILE" <<'EOF'
+  {{.config}}
+  EOF
+  sed -i "s|\${SLURM_JOB_ID}|$SLURM_JOB_ID|g" "$CONFIG_FILE"
+
+  PARAMS_FILE=/mnt/efs/epitope-params-$SLURM_JOB_ID.json
+  cat > "$PARAMS_FILE" <<EOF
+  {
+    "input": "$SAMPLESHEET",
+    "genome_version": {{.params.genome_version | quote}},
+    "tools": {{.params.tools | quote}},
+    "peptide_lengths_mhci": {{.params.peptide_lengths_mhci | quote}},
+    "outdir": {{.outputs.dir | quote}}
+  }
+  EOF
+
+  chmod -R a+rX "$NXF_HOME" 2>/dev/null || true
+
+  nextflow run {{.runtime.pipeline_repo | quote}} \
+    -r {{.runtime.revision | quote}} \
+    -profile {{.params.profile | quote}} \
+    -c "$CONFIG_FILE" \
+    -work-dir "$WORKDIR" \
+    "${RESUME_FLAG[@]}" \
+    -params-file "$PARAMS_FILE"

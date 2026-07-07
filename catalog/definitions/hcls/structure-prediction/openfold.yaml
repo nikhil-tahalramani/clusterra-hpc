@@ -1,0 +1,151 @@
+id: openfold
+name: OpenFold (AF2-class, open weights)
+description: |
+  AQLab's GPU-friendly PyTorch reproduction of AlphaFold 2 — fully open
+  weights (Apache 2 code + Apache 2 weights), commercially usable, and
+  active community (Flatiron Institute + Columbia + Rutgers). AF2-equivalent
+  accuracy on monomers; AF-Multimer comparable on small complexes. Use this
+  when you want AF2-style folding with a battle-tested model.
+
+  For diffusion-based folding with ligand + nucleic acid support, use the
+  `openfold3` template instead — fully open, same consortium.
+
+  Install path: openfold source is pre-staged on EFS at
+  /mnt/efs/_openfold-src/openfold-main by a one-time custom-slurm stager
+  (curl|tar — cap-pod has curl). Template runs in pytorch:cuda12.1-runtime
+  apptainer container and pip-installs editable from the EFS path. The
+  editable install preserves the repo's scripts/ dir that setup.py
+  imports from (pypi openfold==0.0.1 is a broken stub).
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [OpenFold, AlphaFold2]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.10"
+  base_image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-devel
+  requirements: ["openfold==0.0.1"]
+  cache_dir: /mnt/efs/_openfold-venv/0.0.1
+  entrypoint: python -m openfold
+  notes: |
+    Upstream Docker image not published on Docker Hub (verified May 11 2026 —
+    aqlaboratory/openfold namespace 404s). We pip install into a persistent
+    EFS site-packages cache. CUDA torch is bundled in the pytorch base
+    image so the CUDA-extension JIT compile path at first import works
+    immediately (no nvcc download needed). Per memory note
+    dl_ami_skip_pytorch_base.md the pytorch/pytorch:2.4.1-cuda12.1-runtime
+    SIF is ~7 GB — fits the per-job NVMe scratch root the slurmd Prolog
+    stamps via APPTAINER_CACHEDIR (commit 0310d7fd).
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=4:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: fasta_path
+    role: fasta
+    required: false
+    default: ""
+    description: |
+      Target protein FASTA (single chain or multimer). Empty = SMOKE_MODE
+      (python -c "import openfold; print(openfold.__version__)" only).
+  - key: msa_dir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Pre-computed MSA directory (mmCIF chain index). Empty = OpenFold will
+      attempt MMseqs2-GPU MSA on the fly (much faster than JackHMMER).
+
+parameters:
+  - key: preset
+    widget: enum
+    options: [model_1_ptm, model_3, multimer_v3]
+    default: model_3
+    description: OpenFold model preset.
+  - key: relax
+    widget: enum
+    options: ["yes", "no"]
+    default: "no"
+    description: Run AMBER relaxation post-fold.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openfold-{{.ctx.run_id}}"
+  artifacts:
+    - key: predicted_pdb
+      path: "{{.outputs.dir}}/predicted.pdb"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+
+  OF_VENV={{.runtime.cache_dir | quote}}
+  mkdir -p "$OF_VENV"
+  export PYTHONUSERBASE="$OF_VENV"
+
+  if [ "${OPENFOLD_SMOKE:-1}" = "1" ] || [ -z {{.inputs.fasta_path | quote}} ]; then
+    echo "[openfold] SMOKE_MODE: import openfold + torch (set OPENFOLD_SMOKE=0 + provide fasta_path for real folding)"
+    RUNNER="$TMPDIR/of-runner.sh"
+    cat > "$RUNNER" <<'RUN'
+  #!/bin/bash
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$PYTHONUSERBASE/bin:$PATH"
+  if ! python -c "import openfold" 2>/dev/null; then
+    # Source pre-staged on EFS by a one-time custom-slurm job. Install
+    # editable so the repo's scripts/ dir stays reachable from setup.py
+    # (pypi openfold==0.0.1 is a broken stub).
+    pip install --user --no-cache-dir --quiet --no-build-isolation -e /mnt/efs/_openfold-src/openfold-main
+  fi
+  python -c "import openfold, torch; print('openfold', openfold.__version__ if hasattr(openfold,'__version__') else 'loaded'); print('torch', torch.__version__); print('cuda available:', torch.cuda.is_available())"
+  RUN
+    chmod +x "$RUNNER"
+    exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+      --env "PYTHONUSERBASE=$PYTHONUSERBASE" \
+      "docker://{{.runtime.base_image}}" bash "$RUNNER"
+  fi
+
+  FASTA={{.inputs.fasta_path | quote}}
+  MSA={{.inputs.msa_dir | quote}}
+  [ -f "$FASTA" ] || { echo "fasta_path not readable: $FASTA" >&2; exit 1; }
+
+  # MSA generation + attention caches land on NVMe; only the final
+  # predicted PDB + small artifacts move back to EFS.
+  WORK_DIR="${TMPDIR}/openfold-work"
+  mkdir -p "$WORK_DIR"
+
+  RUNNER="$TMPDIR/of-runner.sh"
+  cat > "$RUNNER" <<RUN
+  #!/bin/bash
+  set -euo pipefail
+  export PATH="\$HOME/.local/bin:\$PYTHONUSERBASE/bin:\$PATH"
+  if ! python -c "import openfold" 2>/dev/null; then
+    # Source pre-staged on EFS by a one-time custom-slurm job. Install
+    # editable so the repo's scripts/ dir stays reachable from setup.py
+    # (pypi openfold==0.0.1 is a broken stub).
+    pip install --user --no-cache-dir --quiet --no-build-isolation -e /mnt/efs/_openfold-src/openfold-main
+  fi
+  cd "$WORK_DIR"
+  python -m openfold.run_pretrained_openfold \\
+    --fasta_path "$FASTA" \\
+    --output_dir "$WORK_DIR" \\
+    ${MSA:+--use_precomputed_alignments "$MSA"} \\
+    --model_preset {{.params.preset}} \\
+    --relax {{.params.relax}}
+  RUN
+  chmod +x "$RUNNER"
+  apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+    --env "PYTHONUSERBASE=$PYTHONUSERBASE" \
+    "docker://{{.runtime.base_image}}" bash "$RUNNER"
+
+  # Move final artifacts to EFS so the user can read them after node teardown.
+  mv "$WORK_DIR"/* "$OUTPUT_DIR"/ 2>/dev/null || true

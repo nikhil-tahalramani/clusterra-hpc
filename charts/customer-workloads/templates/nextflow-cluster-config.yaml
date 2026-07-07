@@ -1,0 +1,41 @@
+---
+# Nextflow cluster-level resource limits. Deployed once per customer cluster.
+#
+# nf-core pipelines ship with `process.resourceLimits` defaults tuned for
+# university HPC (e.g. memory = 4.TB on the sarek base.config). These defaults
+# cause jobs to PEND forever when submitted to a cluster with smaller instance
+# shapes. This ConfigMap provides sane defaults tuned to the cluster's largest
+# instance shape.
+#
+# Helm values nextflowResourceLimits (if populated by the ApplicationSet) allow
+# per-cluster tuning without template edits. By default, Karpenter provisions
+# to max available (typically g5.12xlarge: 48 CPUs, 192GB RAM), so the defaults
+# are set conservatively to allow room for system overheads.
+#
+# TaskProlog exports NXF_CONFIG_FILE pointing to this file; nf-core pipelines
+# automatically load it when the env var is set. Snakemake, WDL, and other
+# frameworks use their own config paths and ConfigMaps (defined separately).
+#
+# Reference: https://nf-co.re/docs/usage/configuration#limits
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clusterra-nextflow-config
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: nextflow
+    app.kubernetes.io/component: cluster-config
+    clusterra.io/cluster-id: {{ .Values.clusterId }}
+data:
+  clusterra.config: |
+    process {
+      resourceLimits = [
+        memory: {{ ((.Values.nextflowResourceLimits).memory | default "60.GB") | quote }},
+        cpus:   {{ ((.Values.nextflowResourceLimits).cpus   | default 14) }},
+        time:   {{ ((.Values.nextflowResourceLimits).time   | default "8.h") | quote }}
+      ]
+    }
+    apptainer {
+      enabled  = true
+      autoMounts = true
+    }

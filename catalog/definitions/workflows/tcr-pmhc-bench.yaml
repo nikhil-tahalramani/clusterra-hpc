@@ -1,0 +1,222 @@
+id: tcr-pmhc-bench
+name: TCR-pMHC structural benchmark
+description: |
+  Curated TCR-pMHC class-I complex set → OpenFold3 prediction (array
+  fanout) → DockQ + TM-score + ipTM vs the native crystal → Boltz-2
+  affinity head as an out-of-distribution exploratory probe. Headline
+  metric is structural (DockQ vs crystal); Boltz affinity is labeled
+  exploratory because the head was trained on small-molecule binders,
+  not TCR-pMHC.
+
+  Step ordering + handoffs:
+    1. fold     — openfold3-batch array (one task per complex). Reads
+                  /mnt/efs/bench/tcr-pmhc/of3-inputs/<PDB>.json, writes
+                  step-fold/<PDB>/predicted.cif.
+    2. score    — tcr-complex-metrics walks step-fold/ and the staged
+                  crystals/ dir, emits per-complex DockQ + TM + ipTM +
+                  pLDDT into outputs.json + per_complex.csv.
+    3. affinity — boltz-2-affinity runs in batch mode over the prep-
+                  staged Boltz-2 YAMLs (peptide marked as the affinity
+                  binder). One job, processes all complexes in series.
+                  Exploratory probe only — not the headline.
+    4. aggregate — python-step that joins fold metrics + boltz affinity
+                  outputs + manifest K_D + Slurm sacct cost stamps into a
+                  single case-study-ready collated.json.
+
+  Bench fixtures must be pre-staged by tcr-pmhc-bench-prep (not chained
+  in — it's a one-time job per cluster, same convention as
+  drug-disco-bench-prep). Submit with:
+
+      curl -X POST $API/v1/clusters/$CID/jobs/submit \
+           -H "Cookie: $COOKIE" -H "Content-Type: application/json" \
+           -d '{"template_id": "tcr-pmhc-bench-prep",
+                "params": {"complex_count": 50}}'
+
+  Once prep completes, submit this workflow.
+
+  Wall-clock (n=1 target, untested): ~25-40 min (warm node, weights
+  cached). Cost (~50 complexes on g5.xlarge A10G spot at ~$0.40/h):
+  ~$10-15 total, target <$1/complex including the exploratory affinity
+  pass on L40s spot.
+
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [OpenFold3, Boltz-2, DockQ]
+ready: true
+kind: workflow
+
+steps:
+  - step_id: fold
+    template_id: openfold3-batch
+    display_name: OpenFold3 fold (array)
+    input_overrides:
+      manifest_csv: /mnt/efs/bench/tcr-pmhc/manifest.csv
+      input_dir:    /mnt/efs/bench/tcr-pmhc/of3-inputs
+    param_overrides:
+      batch_count: 5
+      array_concurrency: 5
+      num_diffusion_samples: 5
+
+  - step_id: score
+    template_id: tcr-complex-metrics
+    display_name: DockQ + TM-score vs crystal
+    depends_on: [fold]
+    input_overrides:
+      predictions_dir: /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-fold
+      manifest_csv:    /mnt/efs/bench/tcr-pmhc/manifest.csv
+      crystals_dir:    /mnt/efs/bench/tcr-pmhc/crystals
+
+  - step_id: affinity
+    template_id: boltz-2-affinity
+    display_name: Boltz-2 affinity (exploratory)
+    depends_on: [fold]
+    input_overrides:
+      input_dir: /mnt/efs/bench/tcr-pmhc/boltz-inputs
+    param_overrides:
+      diffusion_samples: 1
+      recycling_steps: 3
+      use_msa_server: true
+
+  - step_id: aggregate
+    template_id: python-step
+    display_name: Aggregate metrics
+    depends_on: [score, affinity]
+    param_overrides:
+      extra_requirements: "scipy==1.13.0 numpy==1.26.4"
+      script_body: |
+        import csv
+        import json
+        import os
+        import pathlib
+        import statistics
+        import sys
+
+        WORKFLOW_DIR = pathlib.Path(os.environ["WORKFLOW_DIR"])
+        OUTPUT_DIR = pathlib.Path(os.environ["OUTPUT_DIR"])
+
+        # Step output discovery — drug-disco-bench convention: per-step subdir.
+        score_out    = WORKFLOW_DIR / "step-score"
+        affinity_out = WORKFLOW_DIR / "step-affinity"
+
+        score_json = score_out / "outputs.json"
+        score = json.loads(score_json.read_text()) if score_json.is_file() else {}
+
+        # Boltz-2 emits one affinity_<complex>.json per input under predictions/.
+        # Walk the tree and pull affinity_pred_value + affinity_probability_binary.
+        affinity_records = {}
+        if affinity_out.is_dir():
+            for f in affinity_out.rglob("affinity_*.json"):
+                try:
+                    payload = json.loads(f.read_text())
+                    # Convention: filename is affinity_<pdb_id>.json
+                    pdb = f.stem.split("affinity_", 1)[-1].upper()
+                    affinity_records[pdb] = {
+                        "affinity_pred_value": payload.get("affinity_pred_value"),
+                        "affinity_probability_binary": payload.get("affinity_probability_binary"),
+                    }
+                except (OSError, json.JSONDecodeError):
+                    continue
+
+        # Manifest for K_D ground truth.
+        manifest_path = pathlib.Path("/mnt/efs/bench/tcr-pmhc/manifest.csv")
+        manifest = {}
+        if manifest_path.is_file():
+            with manifest_path.open() as fh:
+                for row in csv.DictReader(fh):
+                    manifest[(row.get("pdb_id") or "").upper()] = row
+
+        # Join.
+        rows = []
+        for c in score.get("per_complex", []):
+            pdb = (c.get("pdb_id") or "").upper()
+            aff = affinity_records.get(pdb, {})
+            m = manifest.get(pdb, {})
+            kd = m.get("kd_micromolar") or ""
+            try:
+                kd_float = float(kd) if kd else None
+            except ValueError:
+                kd_float = None
+            rows.append({
+                "pdb_id": pdb,
+                "hla_allele": m.get("hla_allele", ""),
+                "peptide_sequence": m.get("peptide_sequence", ""),
+                "tcr_clone": m.get("tcr_clone", ""),
+                "kd_micromolar": kd_float,
+                "status": c.get("status"),
+                "dockq_mean": c.get("dockq_mean"),
+                "tm_score_mean": c.get("tm_score_mean"),
+                "ipTM": c.get("ipTM"),
+                "pLDDT": c.get("pLDDT"),
+                "affinity_pred_value": aff.get("affinity_pred_value"),
+                "affinity_probability_binary": aff.get("affinity_probability_binary"),
+            })
+
+        # Exploratory Pearson R: affinity_pred_value vs log10(K_D).
+        try:
+            from scipy.stats import pearsonr, spearmanr
+            import math
+            kd_pairs = [(r["affinity_pred_value"], math.log10(r["kd_micromolar"] * 1e-6))
+                        for r in rows
+                        if r.get("affinity_pred_value") is not None
+                        and r.get("kd_micromolar") not in (None, "")]
+            if len(kd_pairs) >= 3:
+                preds, log_kds = zip(*kd_pairs)
+                pr, p_val = pearsonr(preds, log_kds)
+                sr, sp_val = spearmanr(preds, log_kds)
+                pearson_block = {"r": round(pr, 4), "p_value": round(p_val, 4),
+                                  "n": len(kd_pairs)}
+                spearman_block = {"rho": round(sr, 4), "p_value": round(sp_val, 4),
+                                   "n": len(kd_pairs)}
+            else:
+                pearson_block = {"r": None, "n": len(kd_pairs),
+                                  "note": "fewer than 3 paired K_D measurements"}
+                spearman_block = pearson_block
+        except ImportError:
+            pearson_block = {"r": None, "note": "scipy not available"}
+            spearman_block = pearson_block
+
+        # DockQ-bucketed AUC vs K_D is not meaningful (K_D bands aren't binder/non-binder).
+        # Leave deeper analysis to the case-study collator.
+
+        collated = {
+            "schema_version": 1,
+            "headline_metrics": {
+                "dockq": score.get("dockq", {}),
+                "tm_score": score.get("tm_score", {}),
+                "ipTM": score.get("ipTM", {}),
+                "pLDDT": score.get("pLDDT", {}),
+                "n_scored": score.get("n_scored", 0),
+                "n_total": score.get("n_total", 0),
+            },
+            "exploratory_affinity": {
+                "framing": (
+                    "Boltz-2 affinity head was trained on protein-small-molecule "
+                    "binders (PDBbind). TCR-pMHC is out-of-distribution by "
+                    "construction. Treat the Pearson/Spearman below as a probe, "
+                    "not a calibrated K_D regressor."
+                ),
+                "pearson_vs_log10_kd": pearson_block,
+                "spearman_vs_log10_kd": spearman_block,
+                "n_affinity_predictions": len(affinity_records),
+            },
+            "per_complex": rows,
+        }
+
+        (OUTPUT_DIR / "collated.json").write_text(json.dumps(collated, indent=2))
+
+        flat = ["pdb_id", "hla_allele", "peptide_sequence", "tcr_clone",
+                "kd_micromolar", "status",
+                "dockq_mean", "tm_score_mean", "ipTM", "pLDDT",
+                "affinity_pred_value", "affinity_probability_binary"]
+        with (OUTPUT_DIR / "collated.csv").open("w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=flat, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in flat})
+
+        print("=== TCR-pMHC bench aggregate ===")
+        print(json.dumps(collated["headline_metrics"], indent=2))
+        print(json.dumps(collated["exploratory_affinity"], indent=2))
+        sys.exit(0)

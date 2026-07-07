@@ -1,0 +1,38 @@
+id: nf-core-sarek-test-full
+name: "Upstream test_full profile (Sarek)"
+description: |
+  Direct passthrough of nf-core/sarek's `test_full` profile. Launches but
+  Clusterra does not validate correctness — the run uses upstream's bundled
+  samplesheet + reference paths, which nf-core maintains but Clusterra does
+  not regression-test. Use to smoke the pipeline against the cluster; use
+  the GIAB germline preset for end-to-end validation.
+vertical: hcls
+category: nextflow
+workload_group: genomics
+modality: form
+tools: [Sarek]
+ready: true
+kind: preset
+tier: borrowed
+pipeline_repo: nf-core/sarek
+revision: "3.6.1"
+parameters:
+  - key: pipeline_repo
+    widget: text
+    default: "nf-core/sarek"
+  - key: revision
+    widget: text
+    default: "3.6.1"
+  - key: profile
+    widget: enum
+    options: [docker, singularity, apptainer, conda, none]
+    default: apptainer
+  - key: extra_profiles
+    widget: text
+    default: "test_full"
+    description: |
+      nf-core/sarek's full upstream test profile. Borrows the pipeline's own
+      validation rig; correctness claims are upstream's, not Clusterra's.
+  - key: pipeline_params_json
+    widget: nextflow_schema
+    default: ""

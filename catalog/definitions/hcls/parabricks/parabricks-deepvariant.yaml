@@ -1,0 +1,131 @@
+id: parabricks-deepvariant
+name: Parabricks DeepVariant (GPU)
+description: |
+  GPU-accelerated DeepVariant via NVIDIA Parabricks `pbrun deepvariant`. Same model
+  weights as Google's CPU DeepVariant — identical output, ~10–20× faster on a
+  single GPU vs the 20-shard CPU scatter sarek runs today. Supports Illumina
+  short-read, Oxford Nanopore (ONT), and PacBio HiFi modes via the model_type
+  parameter. Designed to be chained off a sarek run that produced a recalibrated
+  BAM/CRAM.
+vertical: hcls
+category: variant-calling
+workload_group: genomics
+modality: form
+tools: [Parabricks, DeepVariant]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: nvcr.io/nvidia/clara/clara-parabricks:4.5.1-1
+  notes: |
+    PINNED TO 4.5.1-1 (May 9 2026). The 4.6.0-1 deepsomatic-routing bug
+    documented in deepvariant-ont (see memory pbrun_4_6_ont_routing_bug.md)
+    also affects the shortread path under default flags — `pbrun deepvariant
+    --mode shortread` invokes the deepsomatic binary and dies with
+    "Invalid tumor sample name input" (job 1845 on clusde74, May 9 2026).
+    4.5.1-1 ships the dedicated germline shortread codepath without the
+    deepsomatic detour. Re-evaluate on 4.6.1+/4.7.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=12
+  #SBATCH --mem=64G
+  #SBATCH --time=1:30:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+  #SBATCH --requeue
+inputs:
+  - key: input_bam
+    role: bam
+    required: false
+    default: /mnt/efs/smoke/deepsomatic/HG002.chr21.tumorSM.bam
+    description: |
+      Recalibrated BAM/CRAM. Standard sarek output:
+      /mnt/efs/<outdir>/preprocessing/recalibrated/<sample>/<sample>.recal.bam.
+      Default = the staged HG002 chr21 BAM with explicit @RG SM:TUMOR header
+      (the plain HG002.chr21.bam was reheadered to drop @RG and Parabricks
+      DV refuses to run on it: "Empty sample name"). Override for production.
+  - key: input_bai
+    role: generic_path
+    required: false
+    default: ""
+    description: Optional. If empty, derived as <input_bam>.bai (or .crai).
+  - key: reference_fasta
+    role: reference_fasta
+    required: false
+    default: /mnt/s3-refs/igenomes/Homo_sapiens/GATK/GRCh38/Sequence/WholeGenomeFasta/Homo_sapiens_assembly38.fasta
+    description: Reference genome FASTA (with .fai sibling).
+  - key: intervals_bed
+    role: generic_path
+    required: false
+    default: /mnt/efs/smoke/deepsomatic/chr21.bed
+    description: |
+      Optional regions BED. Default points at the staged chr21 smoke BED so
+      the default-input smoke runs in <10 min. Set to "" for whole genome.
+
+parameters:
+  - key: model_type
+    widget: enum
+    options: [shortread, ont, pacbio]
+    default: shortread
+    description: |
+      shortread = Illumina/MGI WGS/WES; ont = Oxford Nanopore long reads;
+      pacbio = PacBio HiFi. All three modes pinned to 4.5.1-1 (see runtime notes).
+  - key: emit_gvcf
+    widget: bool
+    default: false
+    description: When true, also emit a gVCF for joint-genotyping downstream.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/pbrun-dv-{{.ctx.run_id}}"
+  artifacts:
+    - key: vcf
+      path: "{{.outputs.dir}}/variants.vcf.gz"
+      role: primary_output
+    - key: gvcf
+      path: "{{.outputs.dir}}/variants.g.vcf.gz"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  # TMPDIR is exported by Slurm's TaskProlog (NVMe via /mnt/scratch on
+  # NVMe-bearing nodes; EFS fallback otherwise). Epilog cleans up.
+
+  INPUT_BAM={{.inputs.input_bam | quote}}
+  INPUT_BAI={{.inputs.input_bai | quote}}
+  if [ -z "$INPUT_BAI" ]; then
+    case "$INPUT_BAM" in
+      *.cram) INPUT_BAI="${INPUT_BAM}.crai" ;;
+      *.bam)  INPUT_BAI="${INPUT_BAM}.bai" ;;
+      *)
+        echo "input_bam must end in .bam or .cram (got: $INPUT_BAM)" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  for f in "$INPUT_BAM" "$INPUT_BAI" {{.inputs.reference_fasta | quote}}; do
+    [ -r "$f" ] || { echo "input not readable: $f" >&2; exit 1; }
+  done
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  OUTPUT_VCF="$OUTPUT_DIR/variants.vcf.gz"
+  OUTPUT_GVCF="$OUTPUT_DIR/variants.g.vcf.gz"
+  INTERVALS={{.inputs.intervals_bed | quote}}
+
+  ARGS=(
+    --ref            {{.inputs.reference_fasta | quote}}
+    --in-bam         "$INPUT_BAM"
+    --out-variants   "$OUTPUT_VCF"
+    --tmp-dir        "$TMPDIR"
+    --mode           {{.params.model_type | quote}}
+  )
+  {{if .params.emit_gvcf}}ARGS+=( --gvcf --out-gvcf "$OUTPUT_GVCF" ){{end}}
+  [ -n "$INTERVALS" ] && ARGS+=( --interval-file "$INTERVALS" )
+
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" \
+    "docker://{{.runtime.image}}" \
+    pbrun deepvariant "${ARGS[@]}"

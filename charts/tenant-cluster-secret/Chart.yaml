@@ -1,0 +1,9 @@
+apiVersion: v2
+name: tenant-cluster-secret
+description: |
+  One ExternalSecret per tenant that materializes the ArgoCD cluster Secret
+  registering a customer K3s. The kubeconfig payload is read from
+  central-account Secrets Manager (clusterra/cluster/{clusterId}/kubeconfig)
+  by ESO and shaped into ArgoCD's expected cluster Secret format.
+type: application
+version: 0.1.0

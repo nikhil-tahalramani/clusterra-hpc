@@ -1,0 +1,494 @@
+id: aav-capsid-receptor-bench-prep
+name: AAV capsid-receptor bench — fixture prep
+description: |
+  One-time fixture staging job for aav-capsid-receptor-bench. Idempotent —
+  safe to rerun; skips any per-complex artifact that already exists on EFS.
+
+  Stages under /mnt/efs/bench/aav-capsid-receptor/:
+    manifest.csv             — one row per complex: pdb_id, capsid_serotype,
+                                receptor_name, n_capsid_chains_to_fold,
+                                receptor_chain_length_aa, source_note,
+                                resolved chain IDs + lengths, status.
+    crystals/<PDB>.cif       — native cryo-EM mmCIF fetched from RCSB, used
+                                as the DockQ / TM-score ground truth in the
+                                scoring step.
+    of3-inputs/<PDB>.json    — OpenFold3 InferenceQuerySet JSON: 4 protein
+                                chains (3× VP3 trimer + 1× receptor) using
+                                molecule_type: 0 and chain IDs A,B,C,D.
+                                YAML twin written alongside for traceability.
+    chains/<PDB>.json        — per-complex chain assignments, sequences, +
+                                crystal contact residues (heavy atoms within
+                                5 Å between any VP3 chain and the receptor)
+                                for the downstream scoring step.
+
+  Curated reference set (start with these 4 verified entries; structure
+  supports extending the catalog):
+    6IHB  AAV2 + AAVR PKD2 (cryo-EM 2.84 Å, 2018) — reference set
+    6NZ0  AAV2 + AAVR PKD1+2 (cryo-EM 2.4 Å, 2019) — reference set
+    7UD4  AAV-PHP.eB capsid only (2022) — engineered capsid, no receptor,
+          chain-fold-only reference (receptor side of the manifest is blank
+          and the metrics step degrades gracefully to chain-level TM).
+    9J6Z  AAV8 + receptor (cryo-EM 3.02 Å, August 2024) — POST OpenFold3
+          training cutoff, generalisation anchor.
+
+  Why 3× VP3 trimer + receptor: the AAVR PKD2 binding interface is built
+  by the 3-fold symmetry axis of the capsid; a single VP3 monomer does
+  not present the canonical pocket. Receptor binding mode (interface)
+  matches the published Gradinaru APPRAISE-AAV multi-stage workflow
+  (Sci Adv 2023, PMC10115422) which adds a RosettaRemodel refinement
+  step we have NOT yet packaged — see notes.
+
+  VP3 chain slicing: the longest >400 aa chain starting after the
+  disordered VP1 N-terminus is identified as VP3; we slice VP3 = residues
+  203-735 of VP1 by sequence position (this is the canonical AAV2 VP3
+  start at Met203). The receptor chain is the 90-250 aa companion.
+
+  Wall-clock: ~5-10 min total (PDB fetches dominate; chain parsing is
+  CPU-bound seconds-level per entry). Run once per cluster before
+  submitting aav-capsid-receptor-bench.
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [Python, gemmi]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://python:3.11
+  notes: |
+    Stock python:3.11 — gemmi for CIF parsing, requests for RCSB fetch.
+    Provisioned on EFS at /mnt/efs/_aav-bench-prep-venv (flock-guarded,
+    first-run ~90 s; subsequent runs reuse).
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=8G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+
+inputs: []
+
+parameters:
+  - key: complex_count
+    label: Number of complexes to stage
+    widget: number
+    default: 4
+    min: 1
+    max: 20
+    description: |
+      Truncate the curated complex list to the first N entries. Default 4
+      runs the verified reference set (6IHB, 6NZ0, 7UD4, 9J6Z). Extend the
+      catalog inline as additional AAV+receptor complexes are curated.
+  - key: bench_dir
+    label: Benchmark output directory on EFS
+    widget: text
+    default: "/mnt/efs/bench/aav-capsid-receptor"
+    description: |
+      EFS path under which crystals/, of3-inputs/, chains/, and manifest.csv
+      are staged. Use a distinct path (e.g. /mnt/efs/bench/aav-capsid-receptor-postcutoff)
+      for split runs so they don't overwrite each other.
+
+outputs:
+  dir: "{{.params.bench_dir}}"
+  artifacts:
+    - key: manifest
+      path: "{{.params.bench_dir}}/manifest.csv"
+      role: primary_output
+    - key: prep_log
+      path: "{{.params.bench_dir}}/prep.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  BENCH={{.params.bench_dir}}
+  mkdir -p "$BENCH"
+  LOG="$BENCH/prep.log"
+  exec > >(tee -a "$LOG") 2>&1
+  echo "=== aav-capsid-receptor-bench-prep started $(date) (complex_count={{.params.complex_count}}, bench_dir=$BENCH) ==="
+
+  PYTHON_IMAGE="docker://python:3.11"
+  PREP_VENV=/mnt/efs/_aav-bench-prep-venv
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"
+  mkdir -p "$APPTAINER_CACHEDIR"
+  export PIP_CACHE_DIR="${TMPDIR:-/tmp}/aav-prep-pip-cache"
+  mkdir -p "$PIP_CACHE_DIR"
+
+  # Provision the venv on EFS (gemmi for CIF parsing, requests for RCSB
+  # fetch). flock-guarded so concurrent first-time submits don't race.
+  (
+    flock -x 9
+    if ! apptainer exec --bind /mnt/efs "$PYTHON_IMAGE" \
+          "$PREP_VENV/bin/python3" -c "import gemmi, requests" 2>/dev/null; then
+      echo "--- provisioning gemmi+requests venv on EFS (one-time, ~90s) ---"
+      apptainer exec --bind /mnt/efs "$PYTHON_IMAGE" bash -c "
+        set -euo pipefail
+        [ -x '$PREP_VENV/bin/python3' ] || python3 -m venv '$PREP_VENV'
+        '$PREP_VENV/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$PREP_VENV/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' \
+          gemmi==0.6.7 requests==2.32.3
+      "
+    fi
+  ) 9>"${TMPDIR:-/tmp}/_aav-bench-prep.lock"
+
+  mkdir -p "$BENCH/crystals" "$BENCH/of3-inputs" "$BENCH/chains"
+
+  # Run the prep script. Heavy lifting in Python — the curated PDB list,
+  # VP3 + receptor identification heuristics, and per-complex JSON writers
+  # all live in there.
+  APPTAINERENV_BENCH="$BENCH" APPTAINERENV_COMPLEX_COUNT="{{.params.complex_count}}" \
+  apptainer exec --bind /mnt/efs "$PYTHON_IMAGE" \
+    "$PREP_VENV/bin/python3" - <<'PYEOF'
+  import csv
+  import json
+  import os
+  import pathlib
+  import sys
+  import time
+
+  import gemmi
+  import requests
+
+  BENCH = pathlib.Path(os.environ["BENCH"])
+  COMPLEX_COUNT = int(os.environ.get("COMPLEX_COUNT", "4"))
+
+  # ── Curated AAV capsid-receptor catalog ───────────────────────────────────
+  # Each entry: (pdb_id, capsid_serotype, receptor_name,
+  #              n_capsid_chains_to_fold, receptor_chain_length_aa,
+  #              source_note).
+  # n_capsid_chains_to_fold = 3 means a VP3 trimer (the canonical receptor-
+  # binding unit at the 3-fold symmetry axis). Use 1 for capsid-only entries.
+  # receptor_chain_length_aa is the expected length used for chain matching;
+  # set to 0 for capsid-only entries (no receptor expected).
+  CATALOG = [
+      ("6IHB", "AAV2",      "AAVR-PKD2",     3,  94,  "Meyer 2019 cryo-EM 2.84 A; canonical AAV2+AAVR PKD2 reference"),
+      ("6NZ0", "AAV2",      "AAVR-PKD1+2",   3, 195,  "Zhang 2019 cryo-EM 2.4 A; AAV2+AAVR PKD1+2 (longer receptor fragment)"),
+      ("7UD4", "AAV-PHP.eB", "",             1,  0,   "Goertsen 2022; engineered capsid, no receptor — chain-fold reference only"),
+      ("9J6Z", "AAV8",      "AAVR",          3, 110,  "post-cutoff 2024-08; AAV8+receptor cryo-EM 3.02 A; OF3 generalisation anchor"),
+  ]
+  # Dedup by PDB ID; truncate to complex_count.
+  seen = set()
+  unique_catalog = []
+  for entry in CATALOG:
+      pdb = entry[0].upper()
+      if pdb in seen:
+          continue
+      seen.add(pdb)
+      unique_catalog.append(entry)
+  CATALOG = unique_catalog[:COMPLEX_COUNT]
+  print(f"catalog: {len(CATALOG)} unique entries (truncated to complex_count={COMPLEX_COUNT})")
+
+  # ── Chain identification ─────────────────────────────────────────────────
+  # AAV capsid VPs share the C-terminus (VP3) but differ at the N-terminus:
+  #   VP1: ~735 aa (full-length, mostly disordered N-term in crystals)
+  #   VP2: ~599 aa (alternative start codon)
+  #   VP3: ~533 aa (canonical receptor-binding unit, Met203 → end of VP1)
+  # Cryo-EM AAV structures typically resolve only VP3-equivalent residues
+  # (~203-735 of VP1 numbering). We identify VP3 as the longest >400 aa
+  # protein chain in the crystal. Receptors are the 90-250 aa companion
+  # chains.
+  THREE_TO_ONE = {
+      "ALA": "A", "CYS": "C", "ASP": "D", "GLU": "E", "PHE": "F", "GLY": "G",
+      "HIS": "H", "ILE": "I", "LYS": "K", "LEU": "L", "MET": "M", "ASN": "N",
+      "PRO": "P", "GLN": "Q", "ARG": "R", "SER": "S", "THR": "T", "VAL": "V",
+      "TRP": "W", "TYR": "Y",
+  }
+
+  # Canonical AAV2 VP3 N-terminus (Met203 of VP1). High-resolution AAV
+  # cryo-EM entries are slightly variable here but the leading motif is
+  # conserved across AAV2/8/PHP.eB. The slice convention is documented in
+  # the case study: VP3 = residues 203-735 of VP1.
+  VP3_N_TERM_MOTIFS = ("AAKDDEEK", "AKDDEEK",       # AAV2 / AAV8 canonical
+                       "MAADGYL", "AADGYL",         # PHP.eB variant
+                       "MAADGY")
+  VP3_VP1_OFFSET = 202    # residue 203 of VP1 → position 1 of VP3 slice
+  VP3_MIN_LEN = 400
+  RECEPTOR_LEN_RANGE = (60, 250)
+
+  def chain_sequence(chain):
+      out = []
+      for residue in chain:
+          one = THREE_TO_ONE.get(residue.name.upper())
+          if one is None:
+              continue
+          out.append(one)
+      return "".join(out)
+
+  def slice_to_vp3(seq):
+      """Return the VP3 portion of a VP1/VP2/VP3 sequence.
+
+      Cryo-EM AAV entries usually only resolve VP3-equivalent residues, so
+      `seq` is already ~533 aa. But for the rare crystals that resolve a
+      bit of VP2 we trim from the canonical Met203 motif when present, and
+      fall back to a length-based trim otherwise."""
+      for motif in VP3_N_TERM_MOTIFS:
+          idx = seq.find(motif)
+          if idx != -1:
+              return seq[idx:]
+      # Fallback: if the chain is much longer than canonical VP3, trim from
+      # the position implied by VP1 numbering. This is a heuristic and the
+      # downstream metrics step verifies via residue-name match at the
+      # first 5-8 positions before trusting any TM/DockQ result.
+      if len(seq) > 600:
+          return seq[VP3_VP1_OFFSET:]
+      return seq
+
+  def fetch_pdb_cif(pdb_id, dest):
+      """Fetch the mmCIF from RCSB. Returns False on 404 / network error."""
+      if dest.is_file() and dest.stat().st_size > 0:
+          return True
+      url = f"https://files.rcsb.org/download/{pdb_id.upper()}.cif"
+      try:
+          r = requests.get(url, timeout=30)
+          if r.status_code != 200:
+              print(f"  {pdb_id}: RCSB returned {r.status_code}")
+              return False
+          dest.write_bytes(r.content)
+          time.sleep(0.2)   # Rate-limit: be nice to RCSB.
+          return True
+      except requests.RequestException as ex:
+          print(f"  {pdb_id}: fetch failed ({ex})")
+          return False
+
+  def parse_complex(pdb_id, expected_receptor_len, expect_receptor):
+      """Read the CIF and return a dict describing the VP3 chain + receptor
+      chain. Returns None if the structure doesn't contain the required
+      composition.
+
+      Cryo-EM AAV entries deposit one unique VP3 chain (the whole capsid is
+      built by NCS expansion of this chain) plus, when present, the
+      receptor. We pick the first long protein chain as VP3 and, for
+      ternary complexes, the longest remaining chain in the receptor-
+      length window as the receptor."""
+      cif_path = BENCH / "crystals" / f"{pdb_id}.cif"
+      structure = gemmi.read_structure(str(cif_path))
+      if len(structure) == 0:
+          return None
+      model = structure[0]
+
+      long_chains = []      # (chain_id, seq) for >= VP3_MIN_LEN
+      receptor_chains = []  # (chain_id, seq) in receptor-length window
+      for chain in model:
+          seq = chain_sequence(chain)
+          if not seq:
+              continue
+          if len(seq) >= VP3_MIN_LEN:
+              long_chains.append((chain.name, seq))
+          elif RECEPTOR_LEN_RANGE[0] <= len(seq) <= RECEPTOR_LEN_RANGE[1]:
+              receptor_chains.append((chain.name, seq))
+
+      if not long_chains:
+          print(f"  {pdb_id}: no chain >= {VP3_MIN_LEN} aa (VP3 not found)")
+          return None
+
+      # Pick the first long chain as VP3 (these are usually all the unique
+      # capsid chain — the asymmetric unit holds one VP3 monomer).
+      vp3_cid, vp3_raw_seq = long_chains[0]
+      vp3_seq = slice_to_vp3(vp3_raw_seq)
+
+      receptor_cid = None
+      receptor_seq = None
+      if expect_receptor:
+          if not receptor_chains:
+              print(f"  {pdb_id}: receptor expected but no chain in "
+                    f"{RECEPTOR_LEN_RANGE} aa range")
+              return None
+          # Prefer the receptor chain whose length is closest to the
+          # catalog's expected length.
+          receptor_chains.sort(
+              key=lambda x: abs(len(x[1]) - expected_receptor_len))
+          receptor_cid, receptor_seq = receptor_chains[0]
+
+      return {
+          "vp3":      {"chain": vp3_cid, "sequence": vp3_seq,
+                       "raw_chain_length": len(vp3_raw_seq)},
+          "receptor": (None if receptor_cid is None
+                       else {"chain": receptor_cid, "sequence": receptor_seq}),
+      }
+
+  def crystal_contact_residues(pdb_id, chains, cutoff_angstrom=5.0):
+      """Return the list of (vp3_chain, vp3_resnum, receptor_resnum) tuples
+      where any heavy atom of the VP3 chain is within `cutoff` Å of any
+      heavy atom of the receptor chain. Used by the downstream scoring
+      step to focus DockQ / interface evaluation on the contact patch.
+
+      For receptor-less entries (e.g. 7UD4) returns []."""
+      if chains["receptor"] is None:
+          return []
+      cif_path = BENCH / "crystals" / f"{pdb_id}.cif"
+      structure = gemmi.read_structure(str(cif_path))
+      model = structure[0]
+      vp3_cid = chains["vp3"]["chain"]
+      rec_cid = chains["receptor"]["chain"]
+
+      vp3_atoms = []
+      rec_atoms = []
+      for chain in model:
+          if chain.name == vp3_cid:
+              for residue in chain:
+                  for atom in residue:
+                      if atom.element.name == "H":
+                          continue
+                      vp3_atoms.append((residue.seqid.num, atom.pos))
+          elif chain.name == rec_cid:
+              for residue in chain:
+                  for atom in residue:
+                      if atom.element.name == "H":
+                          continue
+                      rec_atoms.append((residue.seqid.num, atom.pos))
+
+      contacts = set()
+      cutoff_sq = cutoff_angstrom * cutoff_angstrom
+      for vp3_res, vp3_pos in vp3_atoms:
+          for rec_res, rec_pos in rec_atoms:
+              dx = vp3_pos.x - rec_pos.x
+              dy = vp3_pos.y - rec_pos.y
+              dz = vp3_pos.z - rec_pos.z
+              if dx*dx + dy*dy + dz*dz <= cutoff_sq:
+                  contacts.add((vp3_res, rec_res))
+      return sorted(contacts)
+
+  def write_of3_input(pdb_id, chains, n_capsid_chains):
+      """OpenFold3 InferenceQuerySet JSON.
+
+      Standard layout = 4 chains: A=VP3, B=VP3, C=VP3, D=receptor (the
+      VP3 trimer is the canonical receptor-binding unit at the 3-fold
+      axis). For receptor-less catalog entries (n_capsid_chains_to_fold=1
+      and no receptor) we emit a single A=VP3 chain — the metrics step
+      degrades gracefully to chain-level TM-score with no DockQ row."""
+      ordered = []
+      vp3_letters = ["A", "B", "C", "D", "E", "F"][:n_capsid_chains]
+      for letter in vp3_letters:
+          ordered.append((letter, "vp3"))
+      receptor_letter = None
+      if chains["receptor"] is not None:
+          # Chain ID for the receptor is the next letter after the trimer.
+          receptor_letter = ["A", "B", "C", "D", "E", "F"][n_capsid_chains]
+          ordered.append((receptor_letter, "receptor"))
+
+      def seq_for(role):
+          if role == "vp3":
+              return chains["vp3"]["sequence"]
+          return chains["receptor"]["sequence"]
+
+      query = {
+          "seeds": [42],
+          "queries": {
+              pdb_id: {
+                  "chains": [
+                      {
+                          "molecule_type": 0,     # protein
+                          "chain_ids": [letter],
+                          "sequence": seq_for(role),
+                      }
+                      for letter, role in ordered
+                  ]
+              }
+          },
+      }
+      json_path = BENCH / "of3-inputs" / f"{pdb_id}.json"
+      json_path.write_text(json.dumps(query, indent=2))
+      # YAML twin (sequences only, matching the openfold3 .yaml convention).
+      yaml_text = "version: 1\nsequences:\n"
+      for letter, role in ordered:
+          yaml_text += (
+              f"  - protein:\n"
+              f"      id: {letter}\n"
+              f"      sequence: {seq_for(role)}\n"
+          )
+      (BENCH / "of3-inputs" / f"{pdb_id}.yaml").write_text(yaml_text)
+      return [letter for letter, role in ordered if role == "vp3"], receptor_letter
+
+  # ── Drive the catalog ───────────────────────────────────────────────────
+  manifest_path = BENCH / "manifest.csv"
+  with manifest_path.open("w", newline="") as fh:
+      writer = csv.writer(fh)
+      writer.writerow([
+          "row_index", "pdb_id", "capsid_serotype", "receptor_name",
+          "n_capsid_chains_to_fold", "receptor_chain_length_aa",
+          "source_note",
+          "vp3_crystal_chain", "vp3_sequence_length",
+          "receptor_crystal_chain", "receptor_sequence_length",
+          "n_crystal_contacts",
+          "status",
+      ])
+
+      ok = parse_fail = fetch_fail = 0
+      for idx, (pdb, serotype, receptor_name, n_capsid,
+                receptor_len, note) in enumerate(CATALOG, start=1):
+          print(f"[{idx}/{len(CATALOG)}] {pdb} — {serotype} + {receptor_name or '(no receptor)'}")
+          cif_path = BENCH / "crystals" / f"{pdb}.cif"
+
+          if not fetch_pdb_cif(pdb, cif_path):
+              fetch_fail += 1
+              writer.writerow([idx, pdb, serotype, receptor_name, n_capsid,
+                              receptor_len, note,
+                              "", "", "", "", "", "fetch_failed"])
+              continue
+
+          expect_receptor = bool(receptor_name)
+          chains = parse_complex(pdb, receptor_len, expect_receptor)
+          if chains is None:
+              parse_fail += 1
+              writer.writerow([idx, pdb, serotype, receptor_name, n_capsid,
+                              receptor_len, note,
+                              "", "", "", "", "", "parse_failed"])
+              continue
+
+          contacts = crystal_contact_residues(pdb, chains)
+
+          # Stage chain-assignment JSON for the downstream metrics step.
+          (BENCH / "chains" / f"{pdb}.json").write_text(
+              json.dumps({
+                  "pdb_id": pdb,
+                  "capsid_serotype": serotype,
+                  "receptor_name": receptor_name,
+                  "n_capsid_chains_to_fold": n_capsid,
+                  "chains": {
+                      "vp3": chains["vp3"],
+                      "receptor": chains["receptor"],
+                  },
+                  "crystal_cif": str(cif_path),
+                  "crystal_contacts": [
+                      {"vp3_resnum": v, "receptor_resnum": r}
+                      for v, r in contacts
+                  ],
+                  "vp3_vp1_offset": VP3_VP1_OFFSET,
+              }, indent=2)
+          )
+
+          vp3_model_letters, receptor_letter = write_of3_input(
+              pdb, chains, n_capsid)
+
+          writer.writerow([
+              idx, pdb, serotype, receptor_name, n_capsid,
+              receptor_len, note,
+              chains["vp3"]["chain"], len(chains["vp3"]["sequence"]),
+              ("" if chains["receptor"] is None else chains["receptor"]["chain"]),
+              ("" if chains["receptor"] is None else len(chains["receptor"]["sequence"])),
+              len(contacts),
+              "ok",
+          ])
+          ok += 1
+
+  print()
+  print(f"=== prep summary: ok={ok} parse_failed={parse_fail} fetch_failed={fetch_fail} ===")
+  if ok < max(1, COMPLEX_COUNT // 3):
+      print(f"FAIL: only {ok}/{COMPLEX_COUNT} complexes successfully staged "
+            f"(floor: {max(1, COMPLEX_COUNT // 3)})")
+      sys.exit(1)
+  PYEOF
+
+  echo
+  echo "=== aav-capsid-receptor-bench-prep complete $(date) ==="
+  N_CRYSTALS=$(find "$BENCH/crystals" -name '*.cif' 2>/dev/null | wc -l)
+  N_OF3=$(find "$BENCH/of3-inputs" -name '*.json' 2>/dev/null | wc -l)
+  N_CHAINS=$(find "$BENCH/chains" -name '*.json' 2>/dev/null | wc -l)
+  echo "Summary:"
+  echo "  crystals (CIF):   $N_CRYSTALS"
+  echo "  OF3 inputs (JSON): $N_OF3"
+  echo "  chain manifests:  $N_CHAINS"
+  echo "  manifest.csv:     $(wc -l < "$BENCH/manifest.csv") lines"

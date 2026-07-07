@@ -1,0 +1,282 @@
+id: motioncor3
+name: MotionCor3 (GPU cryo-EM motion correction)
+description: |
+  GPU-accelerated anisotropic beam-induced-motion correction for cryo-EM
+  movie stacks. MotionCor3 is CZ Imaging Institute's open BSD-3 rewrite of
+  UCSF MotionCor2 — same iterative patch-based algorithm with dose weighting,
+  plus a GPU-accelerated CTF estimator. First motion-correction template in
+  the Clusterra cryo-EM stack; sits upstream of CTFFIND4 / Topaz / RELION 2D
+  in a standard SPA pipeline.
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [MotionCor3]
+ready: true
+kind: batch
+
+runtime:
+  kind: host_binary
+  build_image: docker://nvidia/cuda:12.2.2-devel-ubuntu22.04
+  binary_path: /mnt/efs/_motioncor3-cache/v1.0.1/MotionCor3
+  build_command: |
+    set -euo pipefail
+    CACHE_ROOT="$(dirname "$(dirname "$BIN")")"
+    DEPS="$CACHE_ROOT/deps"
+    SRC="$(dirname "$BIN")/_src-${SLURM_JOB_ID:-build}"
+    rm -rf "$SRC" && mkdir -p "$SRC" "$DEPS"
+
+    # MotionCor3 needs libtiff (headers + lib) and the CUDA devel SIF ships
+    # neither libtiff nor apt-installable libtiff (uid 401, no fakeroot,
+    # writable-tmpfs doesn't escape dpkg's superuser check — verified on
+    # job 2745 / clusde74). We vendor libtiff 4.6.0 from source into
+    # $DEPS once and link against it.
+    if [ ! -f "$DEPS/lib/libtiff.so" ]; then
+      echo "[motioncor3] vendoring libtiff-4.6.0 -> $DEPS (one-time)" >&2
+      TIFF_SRC="$DEPS/_tiff-src"
+      rm -rf "$TIFF_SRC" && mkdir -p "$TIFF_SRC"
+      curl -sSL https://download.osgeo.org/libtiff/tiff-4.6.0.tar.gz \
+        | tar -xzf - -C "$TIFF_SRC" --strip-components=1
+      apptainer exec --bind /mnt/efs "$SIF" bash -c "
+        set -euo pipefail
+        cd '$TIFF_SRC'
+        ./configure --prefix='$DEPS' --disable-static --without-jpeg --without-lzma --without-zstd --without-webp --without-jbig >/dev/null
+        make -j2 >/dev/null
+        make install >/dev/null
+      "
+      rm -rf "$TIFF_SRC"
+    fi
+
+    curl -sSL -o "$SRC/src.tar.gz" https://github.com/czimaginginstitute/MotionCor3/archive/refs/tags/v1.0.1.tar.gz
+    tar -xzf "$SRC/src.tar.gz" -C "$SRC" --strip-components=1 && rm -f "$SRC/src.tar.gz"
+
+    # makefile11 covers SM_70..SM_90 (A10G=SM_86, L40S=SM_89). It expects
+    # CUDAHOME pointing at a CUDA install and CONDA pointing at a prefix
+    # that owns libtiff headers + libs — we use $DEPS for both since CUDA
+    # at /usr/local/cuda is set via CUDAHOME directly.
+    #
+    # MotionCor3 v1.0.1 ships pre-compiled Lib/libmrcfile.a + Lib/libutil.a
+    # built without -fPIC. Ubuntu 22.04 gcc defaults to PIE, so the final
+    # nvcc/ld link fails with `relocation R_X86_64_32 ... can not be used
+    # when making a PIE object` (verified job 2759). Patch the link rule
+    # to pass `-Xcompiler -no-pie` through nvcc to the host linker.
+    apptainer exec --bind /mnt/efs --env TMPDIR=/tmp "$SIF" bash -c "
+      set -euo pipefail
+      cd '$SRC'
+      sed -i 's|@\$(NVCC) -g -G -m64 \$(OBJS)|@\$(NVCC) -g -G -m64 -Xcompiler -no-pie \$(OBJS)|' makefile11
+      make exe -f makefile11 CUDAHOME=/usr/local/cuda CONDA='$DEPS' 2>&1 | tail -10
+      install -m 0755 MotionCor3 '$BIN'
+    "
+    cd / && rm -rf "$SRC"
+  notes: |
+    No maintained upstream MotionCor3 container exists (Docker Hub: only two
+    personal builds <100 pulls; quay/biocontainers/bioconda: 404 all). Cap-pods
+    can't `apptainer build --fakeroot` (uid 401, no /etc/subuid mapping), so
+    we pull the cuda:12.2.2-devel SIF once, compile MotionCor3 onto EFS, and
+    exec the host binary through the SIF on every run (autodock-gpu pattern).
+    The CUDA devel image ships gcc/g++/nvcc/make but NOT libtiff, and apt
+    inside `apptainer exec --writable-tmpfs` still trips dpkg's superuser
+    check (verified job 2745). We vendor libtiff 4.6.0 from source into
+    /mnt/efs/_motioncor3-cache/deps/ alongside the binary. Cache lives at
+    /mnt/efs/_motioncor3-cache/ — leading underscore convention for
+    world-writable shared caches; /mnt/efs/refs/ is slurm-owned 0755 and
+    not writable from a regular user-submitted job. First-build cost ~5
+    min on any GPU node (~3 min SIF pull + ~2 min libtiff + MotionCor3
+    compile); cached SIF + binary reused after.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=16G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:1
+inputs:
+  - key: movie_path
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Single cryo-EM movie stack (.tif / .tiff / .mrc / .eer). Empty when
+      using movie_dir for batch mode. Exactly one of movie_path / movie_dir
+      must be set.
+  - key: movie_dir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Directory of movie stacks for batch mode. MotionCor3 walks every file
+      whose suffix matches the `movie_suffix` parameter. Mutually exclusive
+      with movie_path.
+  - key: gain_reference
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Optional gain reference (.mrc / .dm4 / .gain) applied to every frame.
+      Required only when the camera writes uncorrected raw frames (e.g.
+      Falcon 4 EER, K3 super-resolution).
+
+parameters:
+  - key: movie_suffix
+    widget: enum
+    options: [tif, tiff, mrc, eer]
+    default: tif
+    description: |
+      File-extension filter for movie_dir batch mode. MotionCor3 picks the
+      matching -InTiff / -InMrc / -InEer ingestor based on this.
+  - key: pixel_size
+    label: Pixel size (Å)
+    widget: number
+    default: 1.0
+    min: 0.1
+    max: 10.0
+    description: Physical pixel size in Angstroms. Set from microscope metadata.
+  - key: dose_per_frame
+    label: Dose per frame (e-/Å²)
+    widget: number
+    default: 1.0
+    min: 0.0
+    max: 100.0
+    description: |
+      Electron dose per movie frame for dose weighting. Set to 0 to skip
+      dose weighting entirely (use the dose-unweighted micrograph downstream).
+  - key: patch_x
+    widget: number
+    default: 5
+    min: 1
+    max: 9
+    description: Patches along X for anisotropic alignment (MotionCor2 default 5).
+  - key: patch_y
+    widget: number
+    default: 5
+    min: 1
+    max: 9
+    description: Patches along Y for anisotropic alignment.
+  - key: bft
+    label: B-factor (px²)
+    widget: number
+    default: 500
+    min: 0
+    max: 2000
+    description: |
+      B-factor in pixel² applied during cross-correlation. Smaller = sharper
+      alignment / noisier; 500 is the MotionCor2 default.
+  - key: fmref
+    label: Reference frame
+    widget: number
+    default: 0
+    min: 0
+    max: 200
+    description: |
+      Frame to align against (0 = sum of all frames, MotionCor2 default).
+      Set to N for align-to-frame-N if you want first-frame anchoring.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/motioncor3-{{.ctx.run_id}}"
+  artifacts:
+    - key: aligned_dir
+      path: "{{.outputs.dir}}"
+      role: primary_output
+      description: |
+        Motion-corrected micrographs (`aligned_<stem>.mrc`) + per-movie shift
+        logs (`aligned_<stem>_Patch.log`, `aligned_<stem>_Full.log`).
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  MOVIE_PATH={{.inputs.movie_path | quote}}
+  MOVIE_DIR={{.inputs.movie_dir | quote}}
+  GAIN_REF={{.inputs.gain_reference | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  SUFFIX={{.params.movie_suffix | quote}}
+
+  mkdir -p "$OUTPUT_DIR"
+
+  # SIF + host binary cached on /mnt/efs/_motioncor3-cache/ (world-writable
+  # 1777 path convention; the canonical /mnt/efs/refs/ tree is slurm-owned
+  # 0755 and bootstrap-only). Flock-guard the build so concurrent first-time
+  # submits don't race on the same SIF / binary.
+  SIF=/mnt/efs/_motioncor3-cache/cuda-devel-12.2.2.sif
+  BIN={{.runtime.binary_path | quote}}
+  mkdir -p "$(dirname "$SIF")" "$(dirname "$BIN")"
+  (
+    flock -x 9
+    if [ ! -s "$SIF" ]; then
+      echo "[motioncor3] pulling CUDA devel SIF -> $SIF (~3 min, one-time)" >&2
+      apptainer pull --force "$SIF" {{.runtime.build_image}}
+    fi
+    if [ ! -x "$BIN" ]; then
+      echo "[motioncor3] compiling MotionCor3 -> $BIN (~3 min, one-time)" >&2
+      {{.runtime.build_command | indent 6}}
+    fi
+  ) 9>"$BIN.lock"
+
+  # The MotionCor3 binary dynamically links against the vendored libtiff in
+  # $DEPS/lib (see runtime.build_command). apptainer exec --nv inherits the
+  # host's LD_LIBRARY_PATH only when APPTAINERENV_LD_LIBRARY_PATH is set.
+  DEPS=/mnt/efs/_motioncor3-cache/deps
+  export APPTAINERENV_LD_LIBRARY_PATH="$DEPS/lib:/usr/local/cuda/lib64"
+
+  # MotionCor3 hard-requires real movie data: with no args it returns
+  # exit code 2 (mCheckSame guard); with an empty input dir it SIGFPEs
+  # inside the ingestor (verified job 2843, 2845 / clusde74). Both
+  # failure modes get caught by `set -euo pipefail` above and surface
+  # as Slurm FAILED — so we reject empty submits up front with a
+  # clear error rather than firing MotionCor3 against junk.
+  if [ -z "$MOVIE_PATH" ] && [ -z "$MOVIE_DIR" ]; then
+    echo "must set either movie_path (single) or movie_dir (batch)" >&2
+    exit 1
+  fi
+  if [ -n "$MOVIE_PATH" ] && [ -n "$MOVIE_DIR" ]; then
+    echo "movie_path and movie_dir are mutually exclusive" >&2
+    exit 1
+  fi
+
+  # MotionCor3 ingestor selection: -InTiff for .tif/.tiff, -InEer for .eer,
+  # -InMrc for .mrc multi-frame stacks. CLI semantics:
+  #   single-movie mode: $IN_FLAG <path/to/movie.ext>     (no -InSuffix)
+  #   batch     mode:    $IN_FLAG <path/to/dir/> -InSuffix .ext
+  # We deliberately do NOT collapse single-movie into dir+suffix even when
+  # the dir holds one file — MotionCor3 SIGFPEs inside its dir-walker on
+  # single-element dirs (verified job 2862 / clusde74) and inside the
+  # ingestor on empty dirs (verified jobs 2838 / 2843). File mode is the
+  # only reliable path for single-movie.
+  case "$SUFFIX" in
+    tif|tiff) IN_FLAG="-InTiff" ;;
+    mrc)      IN_FLAG="-InMrc"  ;;
+    eer)      IN_FLAG="-InEer"  ;;
+    *) echo "unsupported movie_suffix: $SUFFIX" >&2; exit 1 ;;
+  esac
+
+  if [ -n "$MOVIE_PATH" ]; then
+    [ -r "$MOVIE_PATH" ] || { echo "movie_path not readable: $MOVIE_PATH" >&2; exit 1; }
+    IN_ARGS=( "$IN_FLAG" "$MOVIE_PATH" )
+  else
+    [ -d "$MOVIE_DIR" ] || { echo "movie_dir not a directory: $MOVIE_DIR" >&2; exit 1; }
+    IN_ARGS=( "$IN_FLAG" "$MOVIE_DIR/" -InSuffix ".$SUFFIX" )
+  fi
+
+  # -OutMrc takes a FILE PREFIX, not a directory. In batch mode MotionCor3
+  # writes <prefix><input-stem>.mrc + <prefix><input-stem>_Patch.log per
+  # input. A trailing slash makes mCheckSave fail with "cannot open output
+  # MRC file" (verified job 2840 / clusde74). We use `<OUTPUT_DIR>/aligned_`
+  # so artifacts land beside the shift logs in $OUTPUT_DIR.
+  ARGS=(
+    "${IN_ARGS[@]}"
+    -OutMrc        "$OUTPUT_DIR/aligned_"
+    -PixSize       {{.params.pixel_size}}
+    -FmDose        {{.params.dose_per_frame}}
+    -Patch         {{.params.patch_x}} {{.params.patch_y}}
+    -Bft           {{.params.bft}} 100
+    -FmRef         {{.params.fmref}}
+    -Gpu           0
+  )
+  if [ -n "$GAIN_REF" ]; then
+    [ -r "$GAIN_REF" ] || { echo "gain_reference not readable: $GAIN_REF" >&2; exit 1; }
+    ARGS+=( -Gain "$GAIN_REF" )
+  fi
+
+  cd "$OUTPUT_DIR"
+  exec apptainer exec --nv --bind /mnt/efs "$SIF" "$BIN" "${ARGS[@]}"

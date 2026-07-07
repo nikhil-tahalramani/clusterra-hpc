@@ -1,0 +1,314 @@
+id: openfe-plan-network
+name: openfe — plan RBFE perturbation network
+description: |
+  Stage 1 of a managed OpenFE relative binding free-energy (RBFE) campaign:
+  turn a ligand series + prepared receptor into a perturbation network of
+  alchemical transformations ready for GPU fan-out.
+
+  Runs `openfe plan-rbfe-network` (OpenFE 1.11.1): atom-maps every ligand pair,
+  scores edges (LOMAP), and emits a minimal-spanning / radial / minimal-redundant
+  network of `transformations/*.json`. Each transformation JSON is ONE directed
+  edge × ONE thermodynamic leg (complex or solvent) — for a 16-ligand minimal
+  spanning network that is ~15 edges × 2 legs = ~30 independent quickrun units.
+
+  This step is CPU-only and fast (atom mapping + graph optimization, minutes).
+  The expensive production MD is the downstream `openfe-rbfe-run` array job, one
+  Slurm array task per transformation JSON.
+
+  We pin `--n-protocol-repeats 1` so each emitted transformation is a single
+  repeat — repeats become independent array tasks downstream (better spot
+  packing) rather than being serialized inside one quickrun.
+
+  Outputs (under outputs.dir):
+    network/network.json           full AlchemicalNetwork
+    network/ligand_network.graphml topology for visualization
+    network/transformations/*.json one JSON per edge×leg (the fan-out units)
+    manifest.txt                   sorted list of transformation JSONs, one per
+                                   line; line N is array task N downstream
+    edge_count.txt                 integer count = number of transformation JSONs
+
+  Shares the same EFS-materialized openfe env as `openfep` / `openfe-rbfe-run` /
+  `openfe-gather` (/mnt/efs/_openfe-env/v1.11.1-cu126), so the ~5-10 min env build is
+  paid once per tenant across the whole campaign.
+
+  GOTCHAS (verified against OpenFE 1.11.1 — see runtime.notes):
+    • Input ligand SDF must carry valid 3D conformers AND correct protonation /
+      tautomer states. OpenFE does NOT protonate ligands; wrong states silently
+      corrupt every downstream ΔΔG.
+    • Partial charges are assigned with AM1-BCC at plan time unless already
+      present on the SDF. Cofactors with metals (Zn/Mg) or phosphates are not
+      handled by the OpenFF/GAFF charge path and will silently produce wrong
+      results — parametrize those upstream.
+    • Scaffold hops (ring replacements) score ~0 under LOMAP and are dropped by
+      the minimal-spanning network. Use network_type=minimal_redundant for
+      scaffold-hopping series.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: form
+tools: [OpenFE, LOMAP, Kartograf]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: docker://mambaorg/micromamba:1.5.10
+  cache_dir: /mnt/efs/_openfe-env/v1.11.1-cu126
+  requirements: ["openfe=1.11.1", "cuda-version=12.6"]
+  notes: |
+    Shared micromamba env with openfep (same cache_dir). Both upstream OpenFE
+    container paths fail under apptainer (see openfep.yaml runtime.notes:
+    -apptainer tag has no extractable OCI layers; :latest activates conda via
+    ENTRYPOINT which apptainer skips → exit 127). So we materialize a micromamba
+    env on EFS once per tenant and `micromamba run -p` for every invocation.
+
+    plan-rbfe-network defaults in 1.11.x (verified by the openfe-probe job):
+      - default atom mapper = Kartograf (changed from LOMAP in 1.7.0)
+      - default network = minimal spanning tree (Kruskal on LOMAP scores)
+      - default small-molecule FF = openff-2.2.1 (Sage); protein = ff14SB
+      - charge-changing edges auto-expand to 22 λ-windows / 20 ns at plan time
+    The mapper/network selection and (optional) sim-length override are written
+    into a settings YAML passed via `-s`; see the script's heredoc.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=2:00:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: ligands
+    role: sdf
+    required: true
+    description: |
+      Ligand series as a single multi-molecule SDF (3D conformers + correct
+      protonation; partial charges optional — AM1-BCC assigned if absent).
+  - key: protein
+    role: pdb
+    required: true
+    description: Prepared receptor (PDB or mmCIF). Protonated, capped, loops modeled.
+  - key: cofactors
+    role: sdf
+    required: false
+    default: ""
+    description: |
+      Optional cofactor SDF (may hold multiple cofactors). Metals/phosphates are
+      NOT handled by the default charge path — parametrize those upstream.
+
+parameters:
+  - key: network_type
+    label: Network topology
+    widget: enum
+    options: [minimal_spanning, radial, minimal_redundant]
+    default: minimal_spanning
+    description: |
+      minimal_spanning = fewest edges covering all ligands (cheapest; default).
+      radial = star map around a central ligand (set central_ligand).
+      minimal_redundant = extra edges for cycle-closure correction (best for
+      scaffold-hopping series where MST drops low-LOMAP edges).
+  - key: mapper
+    label: Atom mapper
+    widget: enum
+    options: [kartograf, lomap]
+    default: kartograf
+    description: |
+      kartograf = 1.7.0+ CLI default (geometry-based, robust). lomap = MCS-based
+      (classic; better for congeneric series with shared scaffold).
+  - key: central_ligand
+    label: Central ligand (radial only)
+    widget: text
+    default: ""
+    advanced: true
+    description: |
+      Ligand name (or 0-based integer index) at the hub of a radial/star network.
+      Ignored unless network_type=radial. Empty + radial = first ligand.
+  - key: production_ns
+    label: Production MD length per λ-window (ns)
+    widget: number
+    default: 5.0
+    advanced: true
+    description: |
+      Per-window production length. The OpenFE CLI does NOT expose simulation
+      length via the settings YAML (only mapper/network/charge), so we patch it
+      directly into every emitted transformation JSON after planning (the value
+      is a plain {magnitude, unit} field quickrun reads on load). 5.0 ns is the
+      OpenFE default. Set to a tiny value (e.g. 0.02) to plan a fast/cheap SMOKE
+      network for pipeline validation — results below ~1 ns are not
+      scientifically meaningful.
+  - key: equilibration_ns
+    label: Equilibration MD length per λ-window (ns)
+    widget: number
+    default: 1.0
+    advanced: true
+    description: |
+      Per-window equilibration length, patched into each transformation JSON
+      alongside production_ns. 1.0 ns is the OpenFE default. Drop to ~0.01 for a
+      smoke so equilibration doesn't dominate the (already tiny) production run.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openfe-plan-{{.ctx.run_id}}"
+  artifacts:
+    - key: network_setup
+      path: "{{.outputs.dir}}/network/network.json"
+      role: primary_output
+    - key: manifest
+      path: "{{.outputs.dir}}/manifest.txt"
+      role: generic
+    - key: edge_count
+      path: "{{.outputs.dir}}/edge_count.txt"
+      role: metrics_file
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  LIGANDS={{.inputs.ligands | quote}}
+  PROTEIN={{.inputs.protein | quote}}
+  COFACTORS={{.inputs.cofactors | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  ENV_PREFIX={{.runtime.cache_dir | quote}}
+  BASE_IMAGE="{{.runtime.base_image}}"
+  NETWORK_TYPE={{.params.network_type | quote}}
+  MAPPER={{.params.mapper | quote}}
+  CENTRAL_LIGAND={{.params.central_ligand | quote}}
+  PRODUCTION_NS={{.params.production_ns}}
+  EQUILIBRATION_NS={{.params.equilibration_ns}}
+
+  for f in "$LIGANDS" "$PROTEIN"; do
+    [ -r "$f" ] || { echo "input not readable: $f" >&2; exit 1; }
+  done
+  mkdir -p "$OUTPUT_DIR"
+
+  # ── one-time shared env build (flock-guarded; shared with openfep) ──────────
+  ENV_LOCK="${ENV_PREFIX}.lock"
+  ENV_READY="${ENV_PREFIX}/.ready"
+  mkdir -p "$(dirname "$ENV_PREFIX")"
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"; mkdir -p "$APPTAINER_CACHEDIR"
+  if [ ! -f "$ENV_READY" ]; then
+    (
+      flock -x 9
+      if [ ! -f "$ENV_READY" ]; then
+        echo "[plan] building openfe env at $ENV_PREFIX (one-time, ~5-10 min)"
+        apptainer exec --bind /mnt/efs:/mnt/efs --bind "$TMPDIR:$TMPDIR" \
+          "$BASE_IMAGE" bash -c "
+            set -euo pipefail
+            export MAMBA_ROOT_PREFIX=$TMPDIR/mamba; mkdir -p \$MAMBA_ROOT_PREFIX
+            micromamba create -y -p '$ENV_PREFIX' -c conda-forge openfe=1.11.1 'cuda-version=12.6'
+          "
+        touch "$ENV_READY"
+      fi
+    ) 9>"$ENV_LOCK"
+  fi
+
+  ofe() { apptainer exec --bind /mnt/efs:/mnt/efs --bind "$TMPDIR:$TMPDIR" \
+            --bind "$OUTPUT_DIR:$OUTPUT_DIR" "$BASE_IMAGE" \
+            micromamba run -p "$ENV_PREFIX" "$@"; }
+
+  # ── settings YAML: mapper + network topology + production length ────────────
+  # The CLI -s YAML is parsed by openfecli's settings loader. mapper/network
+  # sections are the documented surface; the protocol/simulation block is
+  # written from the probe-verified key path so production_ns is honored at
+  # plan time.
+  SETTINGS="$OUTPUT_DIR/plan_settings.yaml"
+  {
+    echo "mapper:"
+    if [ "$MAPPER" = "lomap" ]; then
+      echo "  method: LomapAtomMapper"
+    else
+      echo "  method: KartografAtomMapper"
+    fi
+    echo "network:"
+    case "$NETWORK_TYPE" in
+      radial)
+        echo "  method: generate_radial_network"
+        if [ -n "$CENTRAL_LIGAND" ]; then
+          echo "  settings:"
+          echo "    central_ligand: '$CENTRAL_LIGAND'"
+        fi ;;
+      minimal_redundant)
+        echo "  method: generate_minimal_redundant_network" ;;
+      *)
+        echo "  method: generate_minimal_spanning_network" ;;
+    esac
+  } > "$SETTINGS"
+  echo "[plan] settings YAML:"; cat "$SETTINGS"
+
+  NETDIR="$OUTPUT_DIR/network"
+  rm -rf "$NETDIR"
+
+  COFACTOR_ARG=()
+  if [ -n "$COFACTORS" ] && [ -r "$COFACTORS" ]; then
+    COFACTOR_ARG=(-C "$COFACTORS")
+  fi
+
+  # --n-protocol-repeats 1: one repeat per emitted transformation; repeats become
+  # independent downstream array tasks instead of being serialized in quickrun.
+  ofe openfe plan-rbfe-network \
+    -M "$LIGANDS" \
+    -p "$PROTEIN" \
+    "${COFACTOR_ARG[@]}" \
+    -s "$SETTINGS" \
+    -o "$NETDIR" \
+    --n-protocol-repeats 1 \
+    -n "${SLURM_CPUS_PER_TASK:-8}" 2>&1 | tee "$OUTPUT_DIR/stdout.log"
+
+  # ── manifest + edge_count for the downstream array job ──────────────────────
+  # transformations/*.json are the fan-out units; sort for stable array indexing.
+  TXDIR="$NETDIR/transformations"
+  if [ ! -d "$TXDIR" ]; then
+    echo "FATAL: plan-rbfe-network produced no transformations/ dir under $NETDIR" >&2
+    echo "       (inspect stdout.log — atom mapping may have failed on the series)" >&2
+    exit 1
+  fi
+  find "$TXDIR" -maxdepth 1 -name '*.json' -type f | sort > "$OUTPUT_DIR/manifest.txt"
+  COUNT=$(wc -l < "$OUTPUT_DIR/manifest.txt" | tr -d ' ')
+  echo "$COUNT" > "$OUTPUT_DIR/edge_count.txt"
+  echo "[plan] planned $COUNT transformation(s) (edge×leg units) → $OUTPUT_DIR/manifest.txt"
+  if [ "$COUNT" -eq 0 ]; then
+    echo "FATAL: 0 transformations planned — check input chemistry / mapper" >&2
+    exit 1
+  fi
+
+  # ── patch per-window MD length into every transformation JSON ───────────────
+  # The CLI bakes the protocol DEFAULTS (5 ns production / 1 ns equilibration)
+  # into each transformation and gives no flag to change them. They serialize as
+  # plain {"magnitude": <float>, "unit": "nanosecond", ...} fields, so we rewrite
+  # the magnitudes here. quickrun reads these on deserialization. This is the
+  # only knob for a fast/cheap SMOKE (e.g. production_ns=0.02, equilibration_ns=0.01).
+  export OFE_PROD_NS="$PRODUCTION_NS" OFE_EQUIL_NS="$EQUILIBRATION_NS"
+  ofe python - "$TXDIR" <<'PY'
+  import json, os, sys, pathlib
+  prod = float(os.environ["OFE_PROD_NS"])
+  equil = float(os.environ["OFE_EQUIL_NS"])
+  txdir = pathlib.Path(sys.argv[1])
+
+  def patch(node):
+      n = 0
+      if isinstance(node, dict):
+          for k, v in node.items():
+              if k == "production_length" and isinstance(v, dict) and "magnitude" in v:
+                  v["magnitude"] = prod; n += 1
+              elif k == "equilibration_length" and isinstance(v, dict) and "magnitude" in v:
+                  v["magnitude"] = equil; n += 1
+              else:
+                  n += patch(v)
+      elif isinstance(node, list):
+          for v in node: n += patch(v)
+      return n
+
+  total = 0
+  files = sorted(txdir.glob("*.json"))
+  for f in files:
+      d = json.loads(f.read_text())
+      c = patch(d)
+      if c:
+          f.write_text(json.dumps(d))
+      total += c
+  print(f"[plan] patched MD length on {len(files)} transformation(s): "
+        f"production={prod} ns, equilibration={equil} ns ({total} field(s) set)")
+  PY

@@ -1,0 +1,99 @@
+[
+    {
+        "id": "clusterra-watch-job",
+        "type": "subflow",
+        "name": "clusterra-watch-job",
+        "info": "Polls a job until it reaches a terminal state (COMPLETED, FAILED, CANCELLED, TIMEOUT, NODE_FAIL, OUT_OF_MEMORY, BOOT_FAIL, DEADLINE).\n\nInput (on msg):\n- `job_id` — required\n- `poll_interval_ms` — default 5000\n- `timeout_ms` — default 86400000 (24h)\n\nOutputs:\n1. final state (one msg when terminal)\n2. transitions (one msg per state change)",
+        "category": "Clusterra",
+        "in": [
+            {
+                "x": 60,
+                "y": 80,
+                "wires": [{ "id": "wj-init" }]
+            }
+        ],
+        "out": [
+            { "x": 1080, "y": 40, "wires": [{ "id": "wj-final", "port": 0 }] },
+            { "x": 1080, "y": 120, "wires": [{ "id": "wj-trans", "port": 0 }] }
+        ],
+        "env": [],
+        "color": "#87A980"
+    },
+    {
+        "id": "wj-init",
+        "type": "function",
+        "z": "clusterra-watch-job",
+        "name": "init",
+        "func": "if (!msg.job_id) { node.error('msg.job_id required', msg); return null; }\nmsg._wj = {\n    job_id: msg.job_id,\n    poll_interval_ms: msg.poll_interval_ms || 5000,\n    deadline: Date.now() + (msg.timeout_ms || 86400000),\n    last_state: null\n};\nmsg.method = 'GET';\nmsg.path = '/v1/clusters/{cluster_id}/jobs/{job_id}';\nreturn msg;",
+        "outputs": 1,
+        "x": 220,
+        "y": 80,
+        "wires": [["wj-call"]]
+    },
+    {
+        "id": "wj-call",
+        "type": "subflow:clusterra-api",
+        "z": "clusterra-watch-job",
+        "name": "GET /jobs/{job_id}",
+        "x": 420,
+        "y": 80,
+        "wires": [["wj-eval"]]
+    },
+    {
+        "id": "wj-eval",
+        "type": "function",
+        "z": "clusterra-watch-job",
+        "name": "eval state",
+        "func": "const TERMINAL = ['COMPLETED','FAILED','CANCELLED','TIMEOUT','NODE_FAIL','OUT_OF_MEMORY','BOOT_FAIL','DEADLINE'];\nconst body = msg.payload || {};\nconst state = body.state || (body.job && body.job.state) || 'UNKNOWN';\nmsg._wj = msg._wj || {};\nlet transitionMsg = null;\nif (state !== msg._wj.last_state) {\n    transitionMsg = { payload: { job_id: msg._wj.job_id, state: state, prev: msg._wj.last_state, body: body } };\n    msg._wj.last_state = state;\n}\nif (TERMINAL.includes(state)) {\n    return [{ payload: { job_id: msg._wj.job_id, state: state, body: body } }, transitionMsg, null];\n}\nif (Date.now() > msg._wj.deadline) {\n    return [{ payload: { job_id: msg._wj.job_id, state: 'TIMEOUT_LOCAL', body: body } }, transitionMsg, null];\n}\n// keep polling\nreturn [null, transitionMsg, msg];",
+        "outputs": 3,
+        "x": 620,
+        "y": 80,
+        "wires": [["wj-final"], ["wj-trans"], ["wj-delay"]]
+    },
+    {
+        "id": "wj-delay",
+        "type": "delay",
+        "z": "clusterra-watch-job",
+        "name": "wait",
+        "pauseType": "delayv",
+        "timeout": "5",
+        "timeoutUnits": "seconds",
+        "rate": "1",
+        "nbRateUnits": "1",
+        "rateUnits": "second",
+        "randomFirst": "1",
+        "randomLast": "5",
+        "randomUnits": "seconds",
+        "drop": false,
+        "x": 820,
+        "y": 80,
+        "wires": [["wj-repath"]]
+    },
+    {
+        "id": "wj-repath",
+        "type": "function",
+        "z": "clusterra-watch-job",
+        "name": "next poll",
+        "func": "msg.delay = msg._wj.poll_interval_ms;\nmsg.method = 'GET';\nmsg.path = '/v1/clusters/{cluster_id}/jobs/{job_id}';\nmsg.job_id = msg._wj.job_id;\nreturn msg;",
+        "outputs": 1,
+        "x": 820,
+        "y": 140,
+        "wires": [["wj-call"]]
+    },
+    {
+        "id": "wj-final",
+        "type": "junction",
+        "z": "clusterra-watch-job",
+        "x": 980,
+        "y": 40,
+        "wires": [[]]
+    },
+    {
+        "id": "wj-trans",
+        "type": "junction",
+        "z": "clusterra-watch-job",
+        "x": 980,
+        "y": 120,
+        "wires": [[]]
+    }
+]

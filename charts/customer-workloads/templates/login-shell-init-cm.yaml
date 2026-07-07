@@ -1,0 +1,110 @@
+# Shell init for the login pod: wraps sinfo/squeue/scontrol so the slurm.conf
+# CLOUD-ghosts (cloud-tpl-cpu / cloud-tpl-gpu, see fleet/charts/cluster/templates/slurm-app.yaml)
+# don't surface to interactive users. cluster-api filters the ghosts from the
+# HTTP API; sinfo/squeue/scontrol talk to slurmctld directly via libslurm and
+# bypass that filter, so we add a parallel scrub at the CLI layer.
+#
+# /etc/profile.d/*.sh is sourced by login shells. The terminal handler spawns
+# `runuser -l <user>` (handler.go), which IS a login shell — so this file runs
+# automatically on every shell-in. Filename starts with `zz-` so it loads after
+# the image's standard profile.d scripts and can override their definitions.
+#
+# Mounted into the login Deployment via subPath, which does NOT auto-propagate
+# ConfigMap edits — login-deployment.yaml sets a checksum/shell-init annotation
+# off this file's sha256 so any edit here rolls the pod automatically.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: login-shell-init
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: login
+    clusterra.io/cluster-id: {{ .Values.clusterId }}
+data:
+  zz-clusterra-ghost-filter.sh: |
+    # Hide the slurm.conf-declared CLOUD ghosts (cloud-tpl-{cpu,gpu}) from
+    # interactive Slurm CLI output. No-op if the binaries aren't where we
+    # expect them.
+    if command -v sinfo >/dev/null 2>&1; then
+      # Rewrite ghost-only rows instead of dropping them, otherwise a partition
+      # whose only declared nodes are the cloud-tpl-* ghosts (no real slurmd
+      # registered yet) disappears from `sinfo` entirely. Keep the partition
+      # visible as `0 idle (none)` so users can see it exists.
+      #
+      # Default sinfo text output is 6 whitespace-delimited columns:
+      #   PARTITION AVAIL TIMELIMIT NODES STATE NODELIST
+      # For structured / custom formats (-o, --json, -N, etc.) the column
+      # layout is user-defined; rewriting is unsafe so we fall back to a
+      # plain grep -v drop (same as before — those callers re-lose the
+      # ghost-only partition row, but they're power-user paths).
+      sinfo() {
+        local has_header=1
+        for a in "$@"; do
+          case "$a" in
+            -o|-O|--format|--Format|--json|--yaml|-N|--Node)
+              command sinfo "$@" | grep -v -E 'cloud-tpl-(cpu|gpu)'
+              return ;;
+            -h|--noheader) has_header=0 ;;
+          esac
+        done
+        command sinfo "$@" | awk -v hdr="$has_header" '
+          hdr && NR==1 { print; next }
+          NF < 6      { print; next }
+          {
+            n = split($NF, names, ",")
+            kept = ""; kn = 0
+            for (i = 1; i <= n; i++) {
+              if (names[i] !~ /^cloud-tpl-(cpu|gpu)$/) {
+                kept = kept (kn ? "," : "") names[i]
+                kn++
+              }
+            }
+            if (kn == 0) {
+              # Ghost-only row: defer. Emit a synthetic empty row at END
+              # only if no real row showed up for this partition (otherwise
+              # we leak a duplicate "0 idle (none)" alongside real workers).
+              if (!($1 in ghost_seen)) {
+                ghost_seen[$1] = 1
+                ghost_avail[$1] = $2
+                ghost_time[$1] = $3
+              }
+              next
+            }
+            real_seen[$1] = 1
+            if (kn != n) {
+              printf "%-9s %5s %10s %6d %6s %s\n", $1, $2, $3, kn, $5, kept
+            } else {
+              print
+            }
+          }
+          END {
+            for (p in ghost_seen) {
+              if (!(p in real_seen)) {
+                printf "%-9s %5s %10s %6d %6s %s\n", p, ghost_avail[p], ghost_time[p], 0, "idle", "(none)"
+              }
+            }
+          }'
+      }
+      squeue() { command squeue "$@" | sed -E -e 's/, *UnavailableNodes:cloud-tpl-(cpu|gpu)//g' -e 's/UnavailableNodes:cloud-tpl-(cpu|gpu),*//g'; }
+      scontrol() {
+        # Slurm accepts both `show node` and `show nodes` (and abbreviations
+        # like `show nod`); strip the ghosts from any node-listing form that
+        # doesn't name a specific node. With an explicit nodename arg we
+        # pass through — querying cloud-tpl-{cpu,gpu} directly is a no-op
+        # for users and filtering it would hide unrelated real-node lookups.
+        if [ "$1" = "show" ] && [ -z "$3" ]; then
+          case "$2" in
+            node|nodes|nod|nodelist)
+              command scontrol show "$2" | awk '
+                /^NodeName=cloud-tpl-(cpu|gpu)/ { skip=1; next }
+                /^$/                     { if (skip) { skip=0; next } print; next }
+                !skip                    { print }
+              '
+              return
+              ;;
+          esac
+        fi
+        command scontrol "$@"
+      }
+      export -f sinfo squeue scontrol
+    fi

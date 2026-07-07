@@ -1,0 +1,123 @@
+id: openfe-gather
+name: openfe — gather ΔG / ΔΔG results
+description: |
+  Stage 3 of a managed OpenFE RBFE campaign: collect the per-edge quickrun
+  result JSONs from `openfe-rbfe-run` and produce the campaign-level free-energy
+  tables.
+
+  Runs `openfe gather` (OpenFE 1.11.1) over the results directory:
+    --report dg  → per-ligand absolute ΔG (MLE over the network) + uncertainty
+    --report ddg → per-edge ΔΔG(i→j) + uncertainty
+    --report raw → every individual repeat result (debugging / convergence)
+
+  Output is TSV — Cinnabar-ready for plotting ΔΔG vs experimental and computing
+  MUE / RMSE against known affinities (the headline accuracy numbers for a FEP
+  case study).
+
+  Uses --allow-partial so a campaign with a few failed/preempted edges still
+  produces a table (missing edges are warned to stderr, not fatal). Check
+  gather_stderr.log for skipped edges before trusting the ranking.
+
+  CPU-only and fast (MBAR estimation + graph MLE, seconds-minutes).
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: form
+tools: [OpenFE, alchemlyb, MBAR]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: docker://mambaorg/micromamba:1.5.10
+  cache_dir: /mnt/efs/_openfe-env/v1.11.1-cu126
+  requirements: ["openfe=1.11.1", "cuda-version=12.6"]
+  notes: |
+    Shared micromamba env with the rest of the campaign (same cache_dir).
+    `openfe gather` walks the result path(s) recursively for *.json result
+    files; directories are fine. --report dg is the default.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=8G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: results_dir
+    role: generic_path
+    required: true
+    description: |
+      The outputs.dir of openfe-rbfe-run (holding result_<N>.json files). In a
+      workflow this is the rbfe-run step's output directory.
+
+parameters:
+  - key: report
+    label: Report type
+    widget: enum
+    options: [dg, ddg, raw]
+    default: dg
+    description: |
+      dg = per-ligand absolute ΔG (MLE, default). ddg = per-edge ΔΔG pairs.
+      raw = all individual repeat results (convergence debugging).
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openfe-gather-{{.ctx.run_id}}"
+  artifacts:
+    - key: results_tsv
+      path: "{{.outputs.dir}}/results.tsv"
+      role: primary_output
+    - key: gather_stderr
+      path: "{{.outputs.dir}}/gather_stderr.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  RESULTS_DIR={{.inputs.results_dir | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  ENV_PREFIX={{.runtime.cache_dir | quote}}
+  BASE_IMAGE="{{.runtime.base_image}}"
+  REPORT={{.params.report | quote}}
+
+  [ -d "$RESULTS_DIR" ] || { echo "results_dir not a directory: $RESULTS_DIR" >&2; exit 1; }
+  mkdir -p "$OUTPUT_DIR"
+
+  # ── one-time shared env build (flock-guarded; shared with plan/rbfe) ────────
+  ENV_LOCK="${ENV_PREFIX}.lock"
+  ENV_READY="${ENV_PREFIX}/.ready"
+  mkdir -p "$(dirname "$ENV_PREFIX")"
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"; mkdir -p "$APPTAINER_CACHEDIR"
+  if [ ! -f "$ENV_READY" ]; then
+    (
+      flock -x 9
+      if [ ! -f "$ENV_READY" ]; then
+        echo "[gather] building openfe env at $ENV_PREFIX (one-time, ~5-10 min)"
+        apptainer exec --bind /mnt/efs:/mnt/efs --bind "$TMPDIR:$TMPDIR" \
+          "$BASE_IMAGE" bash -c "
+            set -euo pipefail
+            export MAMBA_ROOT_PREFIX=$TMPDIR/mamba; mkdir -p \$MAMBA_ROOT_PREFIX
+            micromamba create -y -p '$ENV_PREFIX' -c conda-forge openfe=1.11.1 'cuda-version=12.6'
+          "
+        touch "$ENV_READY"
+      fi
+    ) 9>"$ENV_LOCK"
+  fi
+
+  apptainer exec \
+    --bind /mnt/efs:/mnt/efs \
+    --bind "$TMPDIR:$TMPDIR" \
+    --bind "$OUTPUT_DIR:$OUTPUT_DIR" \
+    "$BASE_IMAGE" \
+    micromamba run -p "$ENV_PREFIX" \
+      openfe gather "$RESULTS_DIR" --report "$REPORT" --allow-partial \
+        -o "$OUTPUT_DIR/results.tsv" 2> "$OUTPUT_DIR/gather_stderr.log"
+
+  echo "[gather] wrote $OUTPUT_DIR/results.tsv (report=$REPORT)"
+  echo "=== results.tsv ==="
+  cat "$OUTPUT_DIR/results.tsv"
+  echo "=== gather stderr (skipped/partial edges) ==="
+  cat "$OUTPUT_DIR/gather_stderr.log" || true

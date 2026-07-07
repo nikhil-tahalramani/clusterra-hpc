@@ -1,0 +1,162 @@
+id: alphapeptdeep-predict
+name: AlphaPeptDeep Spectral Library Predict (GPU)
+description: |
+  Step 2 of the scp-dia chain. Predicts a DIA spectral library (MS2 + RT +
+  ion mobility) from a proteome FASTA using AlphaPeptDeep 1.4 (MannLabs,
+  Apache-2.0). One-shot per cohort; subsequent cohorts reusing the same
+  FASTA hit the EFS cache and skip this step entirely.
+
+  Runtime: official `mannlabs/peptdeep:latest` from Docker Hub (verified May
+  20 2026 on clusde74 job 2427 — import + ModelManager OK in 2m37s including
+  SIF conversion; cached at /mnt/efs/_apptainer-cache, ~3 GB). No venv, no
+  pip install — `apptainer exec` directly. peptdeep 1.4.2 ships with torch
+  cu126 baked in.
+
+  Output: `library.speclib` (HDF) at
+  $WORKFLOW_DIR/step-2-predict-library/library.speclib. Step-3 (dia-search)
+  auto-discovers by path. Cache key = sha256(fasta_db), so a re-run with
+  the same FASTA shortcuts and re-uses the previous library.
+
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [AlphaPeptDeep]
+ready: false
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://mannlabs/peptdeep@sha256:ef2fce44a583471172ee331df0da806fab109c01f6d3c7eab0752ef01865c276
+  notes: |
+    Apache-2.0. Upstream official container (verified clusde74 job 2427).
+    Model weights download on first use from MannLabs/alphapeptdeep
+    releases (~1.5 GB); persist via PEPTDEEP_MODEL_PATH +
+    TRANSFORMERS_CACHE bound to /mnt/efs/refs/alphapeptdeep/models/.
+    Digest pin: mannlabs/peptdeep:latest as of 2026-03-11 (Docker Hub).
+    Re-resolve with `docker manifest inspect mannlabs/peptdeep:latest`
+    before bumping.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=1:30:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+
+inputs:
+  - key: fasta_db
+    role: fasta_db
+    required: true
+    description: |
+      Proteome FASTA. UniProt human canonical+isoform recommended for SCP
+      (~20K reviewed entries → ~2-3M predicted precursors after digest +
+      missed-cleavages expansion).
+
+parameters:
+  - key: instrument
+    widget: enum
+    options: [orbitrap_astral, orbitrap_exploris, orbitrap_lumos, timstof_scp, timstof_pro]
+    default: orbitrap_astral
+    description: |
+      Selects the per-instrument MS2 + RT + IM model heads. Astral and
+      tims models are distinct; pick the one matching your raw files.
+  - key: missed_cleavages
+    widget: number
+    default: 1
+    min: 0
+    max: 3
+    description: Trypsin missed cleavages allowed in the in-silico digest.
+  - key: precursor_charges
+    widget: text
+    default: "2,3,4"
+    description: Comma-separated precursor charge states to predict.
+  - key: variable_mods
+    widget: text
+    default: "Oxidation@M,Acetyl@Protein_N-term"
+    description: Variable PTMs for the digest (peptdeep mod syntax).
+  - key: fixed_mods
+    widget: text
+    default: "Carbamidomethyl@C"
+    description: Fixed PTMs (peptdeep mod syntax).
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/alphapeptdeep-{{.ctx.run_id}}"
+  artifacts:
+    - key: library
+      path: "{{.outputs.dir}}/library.speclib"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  FASTA={{.inputs.fasta_db | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  INSTRUMENT={{.params.instrument | quote}}
+  MISSED_CLEAVAGES={{.params.missed_cleavages}}
+  PREC_CHARGES={{.params.precursor_charges | quote}}
+  VAR_MODS={{.params.variable_mods | quote}}
+  FIX_MODS={{.params.fixed_mods | quote}}
+
+  mkdir -p "$OUTPUT_DIR"
+  [ -r "$FASTA" ] || { echo "fasta_db not readable: $FASTA" >&2; exit 1; }
+
+  STEP_DIR="${WORKFLOW_DIR:-$OUTPUT_DIR}/step-2-predict-library"
+  [ "${WORKFLOW_DIR:-}" = "" ] && STEP_DIR="$OUTPUT_DIR"
+  mkdir -p "$STEP_DIR"
+
+  # Library cache: keyed by sha256(fasta). A second cohort with the same
+  # FASTA reads through to the cache and skips the (~30-90 min) predict.
+  FASTA_SHA=$(sha256sum "$FASTA" | awk '{print $1}')
+  CACHE="/mnt/efs/refs/alphapeptdeep-libs/${FASTA_SHA}_${INSTRUMENT}.speclib"
+  if [ -r "$CACHE" ]; then
+    echo "[apd] cache HIT: $CACHE"
+    cp "$CACHE" "$STEP_DIR/library.speclib"
+    cat > "$STEP_DIR/manifest.json" <<EOF
+  {"source":"cache","cache_path":"$CACHE","fasta_sha256":"$FASTA_SHA","instrument":"$INSTRUMENT"}
+  EOF
+    exit 0
+  fi
+  mkdir -p "$(dirname "$CACHE")"
+
+  MODEL_HOME="/mnt/efs/refs/alphapeptdeep/models"
+  HF_HOME="/mnt/efs/refs/alphapeptdeep/hf"
+  MPL_CONF="/mnt/efs/refs/alphapeptdeep/mpl"
+  mkdir -p "$MODEL_HOME" "$HF_HOME" "$MPL_CONF"
+  export APPTAINER_CACHEDIR=/mnt/efs/_apptainer-cache
+
+  # Cache-dir env vars must be set inside the container — pass via
+  # APPTAINERENV_ to avoid the "Overriding HOME" warning.
+  export APPTAINERENV_PEPTDEEP_MODEL_PATH="$MODEL_HOME"
+  export APPTAINERENV_HF_HOME="$HF_HOME"
+  export APPTAINERENV_TRANSFORMERS_CACHE="$HF_HOME/transformers"
+  export APPTAINERENV_MPLCONFIGDIR="$MPL_CONF"
+
+  RUNNER="$STEP_DIR/runner-$$.py"
+  cat > "$RUNNER" <<PYEOF
+  from peptdeep.pipeline_api import predict_lib
+  predict_lib(
+      settings_dict={
+          "library": {
+              "fasta_files": ["$FASTA"],
+              "missed_cleavages": $MISSED_CLEAVAGES,
+              "precursor_charges": [int(c) for c in "$PREC_CHARGES".split(",")],
+              "variable_modifications": [m for m in "$VAR_MODS".split(",") if m],
+              "fixed_modifications": [m for m in "$FIX_MODS".split(",") if m],
+              "instrument": "$INSTRUMENT",
+              "output_folder": "$STEP_DIR",
+              "output_filename": "library.speclib",
+          }
+      }
+  )
+  PYEOF
+
+  apptainer exec --nv "{{.runtime.image}}" python "$RUNNER"
+
+  # Promote to cohort-shared cache for the next run.
+  if [ -r "$STEP_DIR/library.speclib" ]; then
+    cp "$STEP_DIR/library.speclib" "$CACHE"
+    echo "[apd] cached library at $CACHE"
+  fi

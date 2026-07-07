@@ -1,0 +1,173 @@
+id: unidock
+name: Uni-Dock (GPU virtual screening)
+description: |
+  GPU-batched molecular docking via Uni-Dock — a CUDA reimplementation of the
+  Vina/Vinardo/AD4 scoring stack from DP Technology. Batches thousands of
+  ligand .pdbqt files into a single GPU residency; benchmarks ~120-1600× a
+  single-thread Vina-CPU run on equivalent box/exhaustiveness, with identical
+  pose ranking when --scoring vina is selected. Drop-in replacement for the
+  Vina-CPU sbatch-array pattern when the workload is a ligand library against
+  one (or a few) receptor pockets — single A10G chews a 10k-ligand library in
+  ~10-20 min where the Vina-CPU array would run hours.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: form
+tools: [Uni-Dock]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://dptechnology/unidock:1.1.3
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=32G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: receptor_pdbqt
+    role: pdbqt
+    required: true
+    description: |
+      Prepared receptor in AutoDock PDBQT format (e.g. via MGLTools
+      prepare_receptor4.py or Meeko). Same input format as Vina — existing
+      Vina receptors work unchanged.
+  - key: ligand_dir
+    role: generic_path
+    required: true
+    description: |
+      Directory containing ligand .pdbqt files. Uni-Dock batches the whole
+      glob onto a single GPU; 1k-50k ligands per job is the sweet spot. For
+      a quick smoke test, point at the bundled
+      example/screening_test/ligands/ from the Uni-Dock repo (10 ligands).
+
+parameters:
+  # Defaults match the bundled screening_test fixture (see unidock.SMOKE.md
+  # box geometry). Workflows can't override params yet (step.inputs only
+  # maps to child inputs, not params) — keeping a working default here lets
+  # the structure-to-lead chain submit cleanly. Real screens still override.
+  - key: center_x
+    label: Search box center X (Å)
+    widget: number
+    default: -36.0095
+  - key: center_y
+    label: Search box center Y (Å)
+    widget: number
+    default: 25.6285
+  - key: center_z
+    label: Search box center Z (Å)
+    widget: number
+    default: 67.4920
+  - key: size_x
+    label: Search box size X (Å)
+    widget: number
+    default: 22.5
+  - key: size_y
+    label: Search box size Y (Å)
+    widget: number
+    default: 22.5
+  - key: size_z
+    label: Search box size Z (Å)
+    widget: number
+    default: 22.5
+  - key: search_mode
+    label: Search mode
+    widget: enum
+    # Uni-Dock exhaustiveness presets. fast≈Vina exh=8 (screen), balance≈
+    # exh=32 (default, recommended), detail≈exh=128 (lead-opt rescoring).
+    options: [fast, balance, detail]
+    default: balance
+  - key: scoring
+    label: Scoring function
+    widget: enum
+    options: [vina, vinardo, ad4]
+    default: vina
+
+outputs:
+  dir: /mnt/efs/{{.ctx.user_email}}/unidock-{{.ctx.run_id}}
+  artifacts:
+    - key: poses
+      path: "{{.outputs.dir}}"
+      role: primary_output
+      description: Per-ligand <name>_out.pdbqt files with REMARK VINA RESULT lines.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  RECEPTOR={{.inputs.receptor_pdbqt | quote}}
+  LIGAND_DIR={{.inputs.ligand_dir | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+
+  # Idempotent smoke-fixture stager. Upstream layout (verified May 2026):
+  #   unidock/example/screening_test/indata/def.pdbqt    — receptor
+  #   unidock/example/screening_test/indata/def.tar.bz2  — ligand archive
+  #     IMPORTANT: despite the .bz2 extension this archive is GZIP-framed
+  #     (file(1) reports "gzip compressed data"). Python tarfile.open(.,'r:bz2')
+  #     and `tar xjf` strictly enforce bz2 magic and fail with "not a bzip2
+  #     file" / "Invalid data stream". Plain `tar xf` auto-detects and works.
+  #     Inside, ligands live at def_unique_charged/*.pdbqt (5,799 files).
+  # Materializes:
+  #   $SMOKE_ROOT/receptor.pdbqt           (copy of def.pdbqt)
+  #   $SMOKE_ROOT/ligands/*.pdbqt          (first 10 ligands)
+  # Box geometry from config_def.json — center≈(-36.0,25.6,67.5),
+  # size≈(17.2,14.4,12.2). Keep submit recipe in unidock.SMOKE.md in sync.
+  SMOKE_ROOT=/mnt/efs/fixtures/unidock-smoke
+  if [[ "$RECEPTOR" == "$SMOKE_ROOT/"* || "$LIGAND_DIR" == "$SMOKE_ROOT/"* ]] \
+     && { [ ! -f "$SMOKE_ROOT/receptor.pdbqt" ] || [ ! -d "$SMOKE_ROOT/ligands" ] || [ -z "$(ls -A "$SMOKE_ROOT/ligands" 2>/dev/null || true)" ]; }; then
+    echo "staging Uni-Dock smoke fixture into $SMOKE_ROOT"
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    curl -sSfL https://github.com/dptech-corp/Uni-Dock/archive/refs/heads/main.tar.gz \
+      -o "$TMP/repo.tar.gz"
+    tar xzf "$TMP/repo.tar.gz" -C "$TMP" \
+      --wildcards 'Uni-Dock-main/unidock/example/screening_test/indata/*'
+    SRC="$TMP/Uni-Dock-main/unidock/example/screening_test/indata"
+    mkdir -p "$SMOKE_ROOT/ligands" "$TMP/lig"
+    cp "$SRC/def.pdbqt" "$SMOKE_ROOT/receptor.pdbqt"
+    # Auto-detect compression — archive is mislabeled .bz2 but is gzip.
+    tar xf "$SRC/def.tar.bz2" -C "$TMP/lig"
+    LIG_SRC="$TMP/lig/def_unique_charged"
+    [ -d "$LIG_SRC" ] || LIG_SRC=$(find "$TMP/lig" -mindepth 1 -maxdepth 2 -type d -print -quit)
+    count=0
+    for f in "$LIG_SRC"/*.pdbqt; do
+      cp "$f" "$SMOKE_ROOT/ligands/"
+      count=$((count+1))
+      [ "$count" -ge 10 ] && break
+    done
+    echo "staged $count ligands"
+  fi
+
+  [ -r "$RECEPTOR" ] || { echo "receptor not readable: $RECEPTOR" >&2; exit 1; }
+  [ -d "$LIGAND_DIR" ] || { echo "ligand_dir not a directory: $LIGAND_DIR" >&2; exit 1; }
+  shopt -s nullglob
+  LIGANDS=( "$LIGAND_DIR"/*.pdbqt )
+  shopt -u nullglob
+  if [ "${#LIGANDS[@]}" -eq 0 ]; then
+    echo "no .pdbqt ligands found under $LIGAND_DIR" >&2
+    exit 1
+  fi
+  mkdir -p "$OUTPUT_DIR"
+  echo "uni-dock: ${#LIGANDS[@]} ligands -> $OUTPUT_DIR"
+
+  # /mnt/efs and /mnt/s3-refs are default-bound by the slurmd image's
+  # apptainer.conf; --nv binds /dev/nvidia* + CUDA userspace. Uni-Dock
+  # accepts --gpu_batch as a glob expansion of ligand paths in argv.
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" \
+    "{{.runtime.image}}" \
+    unidock \
+      --receptor "$RECEPTOR" \
+      --gpu_batch "${LIGANDS[@]}" \
+      --center_x {{.params.center_x}} \
+      --center_y {{.params.center_y}} \
+      --center_z {{.params.center_z}} \
+      --size_x {{.params.size_x}} \
+      --size_y {{.params.size_y}} \
+      --size_z {{.params.size_z}} \
+      --search_mode {{.params.search_mode | quote}} \
+      --scoring {{.params.scoring | quote}} \
+      --dir "$OUTPUT_DIR"

@@ -1,0 +1,143 @@
+id: cellpose
+name: Cellpose (GPU cell segmentation)
+description: |
+  GPU-accelerated cell and nucleus segmentation for microscopy and spatial
+  biology. Cellpose 4 (SAM-based) is the de-facto open-source segmenter for
+  fluorescence + brightfield + H&E + spatial-transcriptomics tissue images;
+  upstream MouseLand/cellpose at 2.1k stars with no CPU competitor of
+  comparable accuracy (per gpu_wedge_report § 5). Single A10G segments a
+  2048×2048 image in <2s vs ~minutes on CPU.
+vertical: hcls
+category: imaging
+workload_group: imaging
+modality: form
+tools: [Cellpose]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://biocontainers/cellpose@sha256:1ece14a8f3557558a1447ca62ef15398805936cae07160f64caa434b8288616f
+  notes: |
+    biocontainers/cellpose:4.0.7_cv1 (bioconda-built, amd64, ~4.7 GB). No
+    upstream MouseLand image on Docker Hub (the `mouseland/cellpose`
+    namespace 404s). The biocontainer ships the cellpose conda env with the
+    `cellpose` CLI on PATH; CUDA wheels of torch are pulled in by the
+    cellpose dep tree so `--gpu` works when /dev/nvidia* are bound via
+    `apptainer --nv`.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: image_path
+    role: generic_path
+    required: false
+    default: /mnt/efs/smoke/cellpose/img02.png
+    description: |
+      Path to a single .png/.tif/.jpg image (or a directory of images) to
+      segment. Default = staged smoke fixture (cellpose's bundled test image,
+      copied out of the container at run time).
+  - key: model_type
+    role: generic_path
+    required: false
+    default: "cyto3"
+    description: |
+      Cellpose model name (cyto3 / nuclei / cyto2 / cpsam) or a path to a
+      custom .pt checkpoint on /mnt/efs.
+
+parameters:
+  - key: diameter
+    label: Diameter (px, 0=auto)
+    widget: number
+    default: 30
+    min: 0
+    max: 500
+  - key: chan
+    label: Cytoplasm channel (0=grayscale, 1=R, 2=G, 3=B)
+    widget: number
+    default: 0
+    min: 0
+    max: 3
+  - key: chan2
+    label: Nuclear channel (0=none)
+    widget: number
+    default: 0
+    min: 0
+    max: 3
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/cellpose-{{.ctx.run_id}}"
+  artifacts:
+    - key: masks
+      path: "{{.outputs.dir}}"
+      role: primary_output
+      description: Per-image *_cp_masks.png + *_seg.npy from cellpose.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  IMAGE_PATH={{.inputs.image_path | quote}}
+  MODEL_TYPE={{.inputs.model_type | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+
+  mkdir -p "$OUTPUT_DIR"
+  CACHE_DIR=/mnt/efs/_cellpose-cache
+  mkdir -p "$CACHE_DIR"
+
+  # SMOKE_MODE: container-existence + CLI smoke (~5s functional check).
+  # `cellpose --help` exercises the bioconda env activation + python import
+  # path; sufficient to prove the image runs on this slurmd. Runs before
+  # any fixture staging — smoke needs no input image.
+  if [ "${CELLPOSE_SMOKE:-1}" = "1" ]; then
+    echo "[cellpose] SMOKE_MODE: cellpose --help (set CELLPOSE_SMOKE=0 to run real segmentation)"
+    exec apptainer exec --nv --bind /mnt/efs \
+      "{{.runtime.image}}" \
+      cellpose --help
+  fi
+
+  # Idempotent smoke-fixture stager — extracts cellpose's bundled test
+  # image from inside the container (no upstream HTTP dep). The bioconda
+  # cellpose package ships test fixtures at
+  # /opt/conda/lib/python*/site-packages/cellpose/test/.
+  SMOKE_ROOT=/mnt/efs/smoke/cellpose
+  if [[ "$IMAGE_PATH" == "$SMOKE_ROOT/"* ]] && [ ! -f "$SMOKE_ROOT/img02.png" ]; then
+    echo "[cellpose] staging smoke fixture into $SMOKE_ROOT"
+    mkdir -p "$SMOKE_ROOT"
+    apptainer exec --bind "$SMOKE_ROOT:/out" \
+      "{{.runtime.image}}" \
+      bash -c '
+        set -e
+        SRC=$(find /opt/conda /usr/local -path "*cellpose/test*" -name "*.png" 2>/dev/null | head -1)
+        [ -n "$SRC" ] || SRC=$(find /opt/conda /usr/local -path "*cellpose*" -name "img*.png" 2>/dev/null | head -1)
+        [ -n "$SRC" ] || { echo "no bundled test image found in container" >&2; exit 1; }
+        cp "$SRC" /out/img02.png
+      '
+  fi
+
+  [ -e "$IMAGE_PATH" ] || { echo "image_path not found: $IMAGE_PATH" >&2; exit 1; }
+  if [ -f "$IMAGE_PATH" ]; then
+    DIR=$(dirname "$IMAGE_PATH")
+  else
+    DIR="$IMAGE_PATH"
+  fi
+
+  exec apptainer exec --nv \
+    --bind /mnt/efs \
+    --env "CELLPOSE_LOCAL_MODELS_PATH=$CACHE_DIR" \
+    "{{.runtime.image}}" \
+    cellpose \
+      --dir "$DIR" \
+      --pretrained_model "$MODEL_TYPE" \
+      --diameter {{.params.diameter}} \
+      --chan {{.params.chan}} \
+      --chan2 {{.params.chan2}} \
+      --use_gpu \
+      --save_png \
+      --savedir "$OUTPUT_DIR" \
+      --verbose

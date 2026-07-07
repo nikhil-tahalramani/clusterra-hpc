@@ -1,0 +1,59 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: tenant-karpenter-config
+  namespace: argocd
+  annotations:
+    # Wave 5 (same as tenant-workloads): tenant-cluster-secrets at wave 4
+    # materializes the cluster Secret this Application's destination resolves
+    # against. Karpenter operator + CRDs are installed by stage-b-k8s TF
+    # before the tenant ever shows up in the plugin generator response.
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - plugin:
+        configMapRef:
+          name: argocd-tenants-plugin
+        requeueAfterSeconds: 30
+  template:
+    metadata:
+      name: 'tenant-{{`{{.cluster_id}}`}}-karpenter-config'
+      namespace: argocd
+      labels:
+        clusterra.io/cluster: '{{`{{.cluster_id}}`}}'
+    spec:
+      project: default
+      sources:
+        - repoURL: {{ .Values.repoURL | squote }}
+          targetRevision: {{ .Values.targetRevision }}
+          path: core/fleet/charts/customer-karpenter-config
+          helm:
+            parameters:
+              - name: clusterId
+                value: '{{`{{.cluster_id}}`}}'
+              - name: region
+                value: '{{`{{.region}}`}}'
+              - name: k3sPrivateIp
+                value: '{{`{{.k3s_private_ip}}`}}'
+              - name: karpenterNodeRoleName
+                value: '{{`{{.karpenter_node_role_name}}`}}'
+              - name: efsMountTargetIp
+                value: '{{`{{.efs_mount_target_ip}}`}}'
+      destination:
+        # Resolves via the cluster Secret materialized by the
+        # tenant-cluster-secrets ApplicationSet (wave 4). EC2NodeClass and
+        # NodePool are cluster-scoped CRs so namespace is nominal.
+        name: 'tenant-{{`{{.cluster_id}}`}}'
+        namespace: karpenter
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        # ServerSideApply lets ArgoCD adopt the live EC2NodeClass + NodePool
+        # left behind when stage-b-k8s `tofu state rm`'s them — same
+        # adoption pattern proven for tenant-workloads on Apr 24 2026.
+        syncOptions:
+          - ServerSideApply=true
+          - CreateNamespace=true

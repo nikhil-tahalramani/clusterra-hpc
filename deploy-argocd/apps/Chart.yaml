@@ -1,0 +1,4 @@
+apiVersion: v2
+name: argocd-apps
+description: ArgoCD Application manifests for central cluster
+version: 0.1.0

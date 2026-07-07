@@ -1,0 +1,231 @@
+id: selectivity-aggregate
+name: Selectivity aggregator (on- vs off-target)
+description: |
+  Stage-5 bridge: turn an on-target Boltz-2 affinity run plus a panel of
+  off-target Boltz-2 affinity runs into a per-molecule selectivity table.
+
+  This is the MID-TIER selectivity readout (throughput layer). It ranks and
+  culls; it does NOT certify selectivity. The rigorous tier is OpenFE RBFE
+  ΔΔΔG (the SAME perturbation run in the on-target and each off-target, then
+  differenced — systematic errors partially cancel), run separately on the
+  short list via the openfe-* templates. Comparing absolute Boltz-2 affinities
+  across two different protein models conflates model error on A with model
+  error on B, so selectivity from this bridge is ALWAYS a human-confirm flag.
+
+  Pipeline:
+    1. Parse on-target predictions: glob affinity_*.json under the on-target
+       Boltz-2 output; key each molecule by its prediction subdir name.
+    2. Parse each off-target panel member the same way (one subdir per
+       off-target under offtarget_root).
+    3. Per molecule: convert affinity_pred_value → ΔG via
+       ΔG ≈ (6 − value) × 1.364 kcal/mol (more negative = stronger binding);
+       take the strongest (most negative) off-target ΔG.
+    4. selectivity_margin_kcal = best_offtarget_ΔG − ontarget_ΔG
+       (positive ⇒ binds the on-target more strongly than any off-target ⇒
+       more selective). Also carry binder probabilities.
+    5. selectivity.csv (ranked by margin, descending) + outputs.json.
+
+  affinity_pred_value is a blended ML proxy (μM-scaled log-IC50), NOT a Kd;
+  margins are relative ranking signals. A molecule potent on an off-target
+  (negative/near-zero margin) should be dropped or flagged.
+
+  Inputs are Boltz-2 affinity output dirs (the `predictions/` tree produced by
+  the boltz-2-affinity template). Molecule identity is the prediction subdir
+  name, so run the on-target and every off-target over the SAME set of
+  per-complex inputs (same source_ids) for the join to line up.
+vertical: hcls
+category: drug-discovery
+workload_group: md-docking
+modality: form
+tools: [Python]
+ready: true
+kind: batch
+display: connector
+
+runtime:
+  kind: docker_image
+  image: python:3.11
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=4G
+  #SBATCH --time=0:20:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: ontarget_predictions
+    role: generic_path
+    required: true
+    description: |
+      Path to the on-target boltz-2-affinity output dir (the one whose
+      `predictions/<molecule>/affinity_<molecule>.json` files carry the
+      on-target affinities). When wired in a workflow set to
+      /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-<ontarget-boltz>.
+  - key: offtarget_root
+    role: generic_path
+    required: true
+    description: |
+      Directory containing ONE SUBDIR PER OFF-TARGET, each subdir being (or
+      containing) a boltz-2-affinity output dir for that off-target. The
+      subdir name is used as the off-target id in the output table. Run one
+      boltz-2-affinity job per off-target and stage their outputs side by side
+      under this root.
+
+parameters:
+  - key: min_margin_kcal
+    label: Min selectivity margin to keep (kcal/mol)
+    widget: number
+    default: 0.0
+    min: -5.0
+    max: 10.0
+    description: |
+      Molecules with selectivity_margin_kcal below this are flagged "fail" in
+      the table (not deleted — selectivity is a human-confirm call). 0.0 keeps
+      anything that prefers the on-target at all; 1.0–2.0 is a meaningful
+      margin given model error.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/selectivity-aggregate-{{.ctx.run_id}}"
+  artifacts:
+    - key: selectivity_table
+      path: "{{.outputs.dir}}/selectivity.csv"
+      role: primary_output
+    - key: provenance
+      path: "{{.outputs.dir}}/outputs.json"
+      role: generic
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  export OUTPUT_DIR
+
+  SIF_DIR=/mnt/efs/_apt-sifs
+  mkdir -p "$SIF_DIR"
+  IMAGE="$SIF_DIR/python-3.11.sif"
+  [ -f "$IMAGE" ] || apptainer pull "$IMAGE" docker://{{.runtime.image}} 2>&1 | tail -3
+
+  SCRIPT_PATH="$OUTPUT_DIR/selectivity.py"
+  cat > "$SCRIPT_PATH" <<'__SEL_PY_EOF__'
+  import csv, json, os, pathlib
+  from datetime import datetime, timezone
+
+  ON = pathlib.Path(os.environ["SEL_ONTARGET"])
+  OFF_ROOT = pathlib.Path(os.environ["SEL_OFFTARGET_ROOT"])
+  OUTPUT_DIR = pathlib.Path(os.environ["OUTPUT_DIR"])
+  MIN_MARGIN = float(os.environ.get("SEL_MIN_MARGIN") or "0.0")
+
+  def dg_from_value(v):
+      # Boltz-2 affinity head: value is μM-scaled log-IC50; documented map.
+      return (6.0 - float(v)) * 1.364
+
+  def parse_affinities(root):
+      """molecule_name -> {value, prob, dG} from affinity_*.json under root."""
+      out = {}
+      if not root.exists():
+          return out
+      for jpath in root.rglob("affinity_*.json"):
+          # molecule id = the prediction subdir name, or the json stem.
+          name = jpath.parent.name
+          if name in ("predictions", "") or name == root.name:
+              name = jpath.stem.replace("affinity_", "", 1)
+          try:
+              d = json.loads(jpath.read_text())
+          except Exception:
+              continue
+          val = d.get("affinity_pred_value")
+          if val is None:
+              continue
+          prob = d.get("affinity_probability_binary")
+          out[name] = {"value": float(val), "prob": (float(prob) if prob is not None else None),
+                       "dG": dg_from_value(val)}
+      return out
+
+  on = parse_affinities(ON)
+  if not on:
+      raise SystemExit(f"selectivity: no affinity_*.json found under on-target {ON}")
+  print(f"on-target molecules: {len(on)}", flush=True)
+
+  # Each immediate subdir of OFF_ROOT is one off-target.
+  off_targets = {}
+  for sub in sorted(p for p in OFF_ROOT.iterdir() if p.is_dir()):
+      aff = parse_affinities(sub)
+      if aff:
+          off_targets[sub.name] = aff
+          print(f"  off-target {sub.name}: {len(aff)} molecules", flush=True)
+  if not off_targets:
+      raise SystemExit(f"selectivity: no off-target affinity dirs found under {OFF_ROOT}")
+
+  rows = []
+  for mol, on_rec in on.items():
+      best_off_id, best_off_dg = None, None
+      per_off = {}
+      for ot_id, aff in off_targets.items():
+          rec = aff.get(mol)
+          if not rec:
+              continue
+          per_off[ot_id] = rec["dG"]
+          if best_off_dg is None or rec["dG"] < best_off_dg:  # more negative = stronger
+              best_off_dg, best_off_id = rec["dG"], ot_id
+      margin = (best_off_dg - on_rec["dG"]) if best_off_dg is not None else None
+      rows.append({
+          "source_id": mol,
+          "ontarget_value": round(on_rec["value"], 4),
+          "ontarget_dG": round(on_rec["dG"], 3),
+          "ontarget_binder_prob": on_rec["prob"],
+          "best_offtarget_id": best_off_id,
+          "best_offtarget_dG": (round(best_off_dg, 3) if best_off_dg is not None else None),
+          "selectivity_margin_kcal": (round(margin, 3) if margin is not None else None),
+          "verdict": ("pass" if (margin is not None and margin >= MIN_MARGIN)
+                      else ("fail" if margin is not None else "no_offtarget_data")),
+          "per_offtarget_dG": per_off,
+      })
+
+  # Rank by margin descending (most selective first); None last.
+  rows.sort(key=lambda r: (r["selectivity_margin_kcal"] is None,
+                           -(r["selectivity_margin_kcal"] or 0)))
+
+  csv_path = OUTPUT_DIR / "selectivity.csv"
+  ot_ids = sorted(off_targets.keys())
+  with csv_path.open("w", newline="") as f:
+      w = csv.writer(f)
+      w.writerow(["source_id", "ontarget_value", "ontarget_dG", "ontarget_binder_prob",
+                  "best_offtarget_id", "best_offtarget_dG", "selectivity_margin_kcal",
+                  "verdict"] + [f"dG_{o}" for o in ot_ids])
+      for r in rows:
+          w.writerow([r["source_id"], r["ontarget_value"], r["ontarget_dG"],
+                      r["ontarget_binder_prob"], r["best_offtarget_id"],
+                      r["best_offtarget_dG"], r["selectivity_margin_kcal"], r["verdict"]]
+                     + [r["per_offtarget_dG"].get(o, "") for o in ot_ids])
+  print(f"selectivity.csv -> {csv_path}", flush=True)
+
+  n_pass = sum(1 for r in rows if r["verdict"] == "pass")
+  outputs = {
+      "schema_version": 1,
+      "produced_at": datetime.now(timezone.utc).isoformat(),
+      "selectivity_table": str(csv_path),
+      "n_molecules": len(rows),
+      "n_pass": n_pass,
+      "off_targets": ot_ids,
+      "min_margin_kcal": MIN_MARGIN,
+      "note": "Mid-tier ranking from Boltz-2 affinity. Confirm with OpenFE RBFE ΔΔΔG and wet-lab. Always human-confirm.",
+      "rows": rows,
+  }
+  (OUTPUT_DIR / "outputs.json").write_text(json.dumps(outputs, indent=2, default=str))
+  print(f"DONE — {n_pass}/{len(rows)} pass margin>={MIN_MARGIN}", flush=True)
+  __SEL_PY_EOF__
+
+  export SEL_ONTARGET={{.inputs.ontarget_predictions | quote}}
+  export SEL_OFFTARGET_ROOT={{.inputs.offtarget_root | quote}}
+  export SEL_MIN_MARGIN={{.params.min_margin_kcal}}
+
+  cd "$OUTPUT_DIR"
+  exec apptainer exec --bind /mnt/efs "$IMAGE" \
+    python3 "$SCRIPT_PATH" \
+    2>&1 | tee "$OUTPUT_DIR/stdout.log"

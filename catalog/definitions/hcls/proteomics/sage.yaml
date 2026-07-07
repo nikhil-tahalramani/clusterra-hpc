@@ -1,0 +1,196 @@
+id: sage
+name: Sage Database Search (MS/MS)
+description: |
+  Fast, accurate database search for MS/MS spectra using Sage (Lazear et al., 2023).
+  Static Rust binary cached on EFS — no container overhead, starts in seconds.
+
+  Pairs with Casanovo de novo sequencing: Sage validates the peptides where Casanovo
+  and database search agree (the "two-witness" set), while Casanovo covers novel
+  peptides Sage cannot find by construction. Together they produce a clinical-grade
+  confidence tier: (1) Casanovo+Sage agree → high confidence; (2) Casanovo-only →
+  novel / non-canonical; (3) Sage-only → database-anchored, Casanovo blind-spot.
+
+  Defaults to non-specific cleavage and 20 ppm tolerances, matching the Comet
+  parameters used in the MAPPs Complete benchmark. Static Carbamidomethyl Cys
+  (+57.02) and variable Met oxidation (+15.99) are applied by default.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [Sage]
+ready: true
+kind: batch
+
+runtime:
+  kind: host_system
+  binary: /mnt/efs/bin/sage-v0.14.7
+  notes: |
+    Sage is a statically linked Rust binary (x86_64-unknown-linux-musl). No container
+    needed. The script downloads the binary once to /mnt/efs/bin/sage-v0.14.7 on first
+    run, then reuses it across jobs. All worker shapes in us-east-1 are x86_64.
+    Pinned to v0.14.7 (2025-01-14, latest stable as of May 2026).
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+inputs:
+  - key: input_mgf
+    role: mgf
+    required: false
+    default: /mnt/efs/nikhil@clusterra.io/comet-dbsearch/input.mgf
+    description: |
+      Path to .mgf or .mzML spectrum file on EFS. Defaults to the 128-spectrum
+      tryptic benchmark MGF used for the Casanovo vs Comet comparison.
+  - key: fasta_db
+    role: fasta_db
+    required: false
+    default: /mnt/efs/nikhil@clusterra.io/comet-dbsearch/human_sprot_td.fasta
+    description: |
+      FASTA with decoy sequences (DECOY_ prefix). Defaults to UniProt Swiss-Prot
+      human + reversed-decoy (~85k entries) staged for the MAPPs benchmark.
+
+parameters:
+  - key: enzyme_mode
+    widget: enum
+    options: [trypsin, non_specific]
+    default: trypsin
+    description: |
+      trypsin = K/R C-terminal cleavage, 2 missed cleavages (default; safe for large
+      FASTAs). non_specific = no cleavage constraint — WARNING: enumerates all
+      substrings of every protein; causes OOM on databases >10k entries. Use only with
+      a small custom FASTA or a pre-digested peptide database.
+  - key: precursor_tol_ppm
+    widget: number
+    default: 20
+    min: 1
+    max: 100
+    description: Precursor mass tolerance ± ppm.
+  - key: fragment_tol_ppm
+    widget: number
+    default: 20
+    min: 1
+    max: 100
+    description: Fragment ion tolerance ± ppm.
+  - key: fdr_threshold
+    widget: number
+    default: 0.01
+    min: 0.001
+    max: 0.10
+    description: |
+      PSM-level FDR cutoff applied to Sage's spectrum_q column. 0.01 = 1% FDR,
+      matching the Comet benchmark threshold.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/sage-{{.ctx.run_id}}"
+  artifacts:
+    - key: results_tsv
+      path: "{{.outputs.dir}}/results.sage.tsv"
+      role: primary_output
+    - key: log
+      path: "{{.outputs.dir}}/sage.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  SAGE_VERSION="0.14.7"
+  SAGE_BIN="/mnt/efs/bin/sage-v${SAGE_VERSION}"
+  SAGE_URL="https://github.com/lazear/sage/releases/download/v${SAGE_VERSION}/sage-v${SAGE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+
+  INPUT_MGF={{.inputs.input_mgf | quote}}
+  FASTA_DB={{.inputs.fasta_db | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  ENZYME_MODE={{.params.enzyme_mode | quote}}
+  PRECURSOR_TOL={{.params.precursor_tol_ppm}}
+  FRAGMENT_TOL={{.params.fragment_tol_ppm}}
+  FDR={{.params.fdr_threshold}}
+  THREADS=8
+
+  mkdir -p "$OUTPUT_DIR" /mnt/efs/bin
+
+  [ -r "$INPUT_MGF" ] || { echo "input_mgf not readable: $INPUT_MGF" >&2; exit 1; }
+  [ -r "$FASTA_DB"  ] || { echo "fasta_db not readable: $FASTA_DB"   >&2; exit 1; }
+
+  # Download Sage binary once to EFS — shared across all jobs on this cluster.
+  if [ ! -x "$SAGE_BIN" ]; then
+    echo "staging Sage v${SAGE_VERSION} from GitHub releases..."
+    TMPTAR="${SAGE_BIN}.tar.gz.tmp.$$"
+    curl -sSL --fail -o "$TMPTAR" "$SAGE_URL"
+    tar -xzf "$TMPTAR" -C /mnt/efs/bin/ --wildcards '*/sage' --strip-components=1
+    mv /mnt/efs/bin/sage "$SAGE_BIN"
+    rm -f "$TMPTAR"
+    chmod +x "$SAGE_BIN"
+    echo "Sage binary staged at $SAGE_BIN"
+  else
+    echo "Using cached Sage binary: $SAGE_BIN"
+  fi
+  "$SAGE_BIN" --version
+
+  # Build enzyme stanza. non_specific = empty cleave_at (no digest constraint).
+  if [ "$ENZYME_MODE" = "non_specific" ]; then
+    ENZYME_JSON='"missed_cleavages": 2, "min_len": 7, "max_len": 50, "cleave_at": ""'
+  else
+    ENZYME_JSON='"missed_cleavages": 2, "min_len": 7, "max_len": 50, "cleave_at": "KR", "restrict": "P", "c_terminal": true'
+  fi
+
+  # Write Sage JSON config. Parameters mirror the Comet benchmark search:
+  # static Carbamidomethyl Cys, variable Met-ox + N-term Acetyl, 600-5000 Da.
+  # generate_decoys=false because the FASTA already contains DECOY_-prefixed entries.
+  cat > "$OUTPUT_DIR/config.json" <<SAGEEOF
+  {
+    "database": {
+      "bucket_size": 32768,
+      "enzyme": { ${ENZYME_JSON} },
+      "fragment_min_mz": 150.0,
+      "fragment_max_mz": 2000.0,
+      "peptide_min_mass": 600.0,
+      "peptide_max_mass": 5000.0,
+      "ion_kinds": ["b", "y"],
+      "min_ion_index": 2,
+      "static_mods": {"C": 57.0215},
+      "variable_mods": {"M": [15.9949], "[": [42.0106]},
+      "decoy_tag": "DECOY_",
+      "generate_decoys": false,
+      "fasta": "$FASTA_DB"
+    },
+    "precursor_tol": {"ppm": [-${PRECURSOR_TOL}, ${PRECURSOR_TOL}]},
+    "fragment_tol": {"ppm": [-${FRAGMENT_TOL}, ${FRAGMENT_TOL}]},
+    "report_psms": 1,
+    "chimera": false,
+    "wide_window": false,
+    "min_peaks": 15,
+    "max_peaks": 150,
+    "min_matched_peaks": 4,
+    "max_fragment_charge": 2,
+    "num_threads": ${THREADS},
+    "output_directory": "$OUTPUT_DIR"
+  }
+  SAGEEOF
+
+  echo "=== Sage config ===" && cat "$OUTPUT_DIR/config.json" && echo "==================="
+
+  "$SAGE_BIN" --write-pin "$OUTPUT_DIR/config.json" "$INPUT_MGF" \
+    2>&1 | tee "$OUTPUT_DIR/sage.log"
+
+  RAW_TSV="$OUTPUT_DIR/results.sage.tsv"
+  [ -f "$RAW_TSV" ] || { echo "Sage produced no results.sage.tsv — check log" >&2; exit 1; }
+
+  # Filter by spectrum_q column (Sage's PSM-level FDR estimate).
+  HDR=$(head -1 "$RAW_TSV")
+  Q_COL=$(echo "$HDR" | tr '\t' '\n' | grep -n '^spectrum_q$' | cut -d: -f1)
+  if [ -z "$Q_COL" ]; then
+    echo "WARN: spectrum_q column not found — emitting unfiltered TSV" >&2
+    cp "$RAW_TSV" "$OUTPUT_DIR/results.sage.fdr${FDR}.tsv"
+  else
+    TOTAL=$(awk 'NR>1' "$RAW_TSV" | wc -l)
+    PASSING=$(awk -v col="$Q_COL" -v fdr="$FDR" 'NR>1 && $col+0 <= fdr' "$RAW_TSV" | wc -l)
+    echo "=== Sage summary: $PASSING / $TOTAL PSMs pass spectrum_q <= $FDR ==="
+    { echo "$HDR"; awk -v col="$Q_COL" -v fdr="$FDR" 'NR>1 && $col+0 <= fdr' "$RAW_TSV"; } \
+      > "$OUTPUT_DIR/results.sage.fdr${FDR}.tsv"
+  fi
+
+  echo "outputs written to $OUTPUT_DIR"

@@ -1,0 +1,82 @@
+[
+    {
+        "id": "clusterra-api",
+        "type": "subflow",
+        "name": "clusterra-api",
+        "info": "HTTP + SSE primitive for the Clusterra REST API.\n\nInputs (on msg):\n- `method` — GET/POST/DELETE/PUT (default GET)\n- `path` — e.g. `/v1/clusters/{cluster_id}/jobs/{job_id}`. `{cluster_id}` is filled from creds; other `{var}` are filled from `msg[var]`.\n- `body` — request body (object) for POST/PUT\n- `stream` — when truthy, treat the response as Server-Sent Events; one outgoing msg per event with `msg.payload` parsed JSON if possible.\n- `params` — optional alternate source for path placeholders (else looked up on `msg`)\n\nOutput: one msg per response (or per SSE event). `msg.statusCode` set on errors.",
+        "category": "Clusterra",
+        "in": [
+            {
+                "x": 60,
+                "y": 80,
+                "wires": [{ "id": "ca-build" }]
+            }
+        ],
+        "out": [
+            {
+                "x": 1080,
+                "y": 80,
+                "wires": [
+                    { "id": "ca-http", "port": 0 },
+                    { "id": "ca-sse", "port": 0 }
+                ]
+            }
+        ],
+        "env": [],
+        "color": "#87A980"
+    },
+    {
+        "id": "ca-build",
+        "type": "function",
+        "z": "clusterra-api",
+        "name": "build request",
+        "func": "const fs = global.get('fs');\nconst userDir = global.get('userDir') || '/data';\nconst credsPath = userDir + '/clusterra-creds.json';\nlet creds;\ntry { creds = JSON.parse(fs.readFileSync(credsPath, 'utf8')); }\ncatch (e) { node.error('cannot read clusterra-creds.json: ' + e.message, msg); return null; }\n\nconst method = (msg.method || 'GET').toUpperCase();\nlet path = msg.path || '';\nif (!path) { node.error('msg.path is required', msg); return null; }\n\nconst params = msg.params || msg;\npath = path.replace(/\\{([^}]+)\\}/g, (_m, key) => {\n    if (key === 'cluster_id') return creds.cluster_id;\n    const v = params[key];\n    if (v === undefined || v === null) {\n        node.error('missing path param ' + key, msg);\n        throw new Error('missing param ' + key);\n    }\n    return encodeURIComponent(String(v));\n});\n\nmsg.url = creds.api_url + path;\nmsg.method = method;\nmsg.headers = {\n    'Authorization': 'Bearer ' + creds.auth_token,\n    'Accept': msg.stream ? 'text/event-stream' : 'application/json'\n};\nif (msg.body !== undefined && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {\n    msg.headers['Content-Type'] = 'application/json';\n    msg.payload = msg.body;\n} else {\n    msg.payload = undefined;\n}\nreturn msg;",
+        "outputs": 1,
+        "x": 230,
+        "y": 80,
+        "wires": [["ca-switch"]]
+    },
+    {
+        "id": "ca-switch",
+        "type": "switch",
+        "z": "clusterra-api",
+        "name": "stream?",
+        "property": "stream",
+        "propertyType": "msg",
+        "rules": [
+            { "t": "true" },
+            { "t": "else" }
+        ],
+        "checkall": "false",
+        "outputs": 2,
+        "x": 410,
+        "y": 80,
+        "wires": [["ca-sse"], ["ca-http"]]
+    },
+    {
+        "id": "ca-http",
+        "type": "http request",
+        "z": "clusterra-api",
+        "name": "request",
+        "method": "use",
+        "ret": "obj",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "x": 600,
+        "y": 120,
+        "wires": [[]]
+    },
+    {
+        "id": "ca-sse",
+        "type": "function",
+        "z": "clusterra-api",
+        "name": "sse",
+        "func": "// Open the SSE connection inline — Node-RED's http-request node has no\n// streaming mode, so we use the http(s) module directly and emit one msg\n// per event line.\nconst urlMod = global.get('url') || require('url');\nconst u = new urlMod.URL(msg.url);\nconst lib = u.protocol === 'https:' ? (global.get('https') || require('https')) : (global.get('http') || require('http'));\nconst opts = {\n    method: msg.method || 'GET',\n    hostname: u.hostname,\n    port: u.port || (u.protocol === 'https:' ? 443 : 80),\n    path: u.pathname + u.search,\n    headers: msg.headers || {}\n};\nconst ctxKey = 'sse_' + msg._msgid;\nconst req = lib.request(opts, (res) => {\n    if (res.statusCode >= 400) {\n        node.error('SSE ' + res.statusCode + ' ' + res.statusMessage, msg);\n        return;\n    }\n    let buf = '';\n    res.setEncoding('utf8');\n    res.on('data', (chunk) => {\n        buf += chunk;\n        let idx;\n        while ((idx = buf.indexOf('\\n\\n')) >= 0) {\n            const block = buf.slice(0, idx);\n            buf = buf.slice(idx + 2);\n            const out = { _msgid: RED.util.generateId() };\n            for (const line of block.split('\\n')) {\n                const c = line.indexOf(':');\n                if (c < 0) continue;\n                const k = line.slice(0, c).trim();\n                const v = line.slice(c + 1).trim();\n                if (k === 'data') {\n                    try { out.payload = JSON.parse(v); } catch { out.payload = v; }\n                } else if (k === 'event') {\n                    out.topic = v;\n                }\n            }\n            if (out.payload !== undefined) node.send(out);\n        }\n    });\n    res.on('end', () => { node.status({ fill: 'grey', text: 'closed' }); });\n});\nreq.on('error', (e) => node.error('SSE error: ' + e.message, msg));\nreq.end();\nnode.status({ fill: 'green', text: 'streaming' });\nreturn null;",
+        "outputs": 1,
+        "x": 600,
+        "y": 40,
+        "wires": [[]]
+    }
+]

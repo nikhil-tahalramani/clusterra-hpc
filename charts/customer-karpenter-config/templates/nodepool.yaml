@@ -1,0 +1,54 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  # Name kept as `cpu-workers` for backwards compatibility with live
+  # tenants whose nodes carry `karpenter.sh/nodepool=cpu-workers`. The
+  # name is now misleading — this single pool provisions both CPU and
+  # GPU instances; routing happens cap-pod-side (selectors) and
+  # node-side (clusterra.io/gpu taint).
+  name: cpu-workers
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+      # expireAfter moved from spec.disruption to spec.template.spec in the
+      # Karpenter v1 API. Keeping it under disruption now fails schema validation.
+      expireAfter: 720h
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        # arm64 + amd64 both allowed — slurmd and notebook images are
+        # multi-arch manifests, so kubelet picks the right variant per node.
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["arm64", "amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        # AMD GPU families (g4ad → v520) are excluded: slurmd's GPU
+        # classification + nvidia-container-runtime hook are NVIDIA-only,
+        # so an AMD GPU node would register as "gpu" but have no /dev/nvidia*
+        # and ghost-create. Door-close at the NodePool level rather than
+        # entrypoint-rework.
+        - key: karpenter.k8s.aws/instance-family
+          operator: NotIn
+          values: ["g4ad"]
+        # No instance-category pinning. CPU/GPU steering is cap-pod-side:
+        # GPU cap-pods select on `instance-gpu-manufacturer/count/name`;
+        # CPU/GPU isolation on the node itself is enforced by the
+        # `clusterra.io/gpu=true:NoSchedule` taint that edge-agent applies
+        # on every node carrying the gpu-manufacturer label, and only GPU
+        # cap-pods + GPU-targeting DaemonSets carry the matching toleration.
+        # See internal design notes.
+  limits:
+    cpu: "10000"
+    memory: 100Ti
+  disruption:
+    consolidationPolicy: WhenEmpty
+    # 180s retains capacity longer after a job finishes — gives burst jobs
+    # a window to reuse the warm node before Karpenter tears it down.
+    consolidateAfter: 180s

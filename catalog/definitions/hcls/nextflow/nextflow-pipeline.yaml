@@ -1,0 +1,433 @@
+id: nextflow-pipeline
+name: Nextflow Pipeline (generic)
+description: Run any Nextflow pipeline by repo URL or org/repo slug.
+vertical: hcls
+category: nextflow
+workload_group: genomics
+modality: form
+tools: [Nextflow]
+ready: true
+kind: batch
+
+runtime:
+  kind: nextflow
+  # pipeline_repo + revision are runtime defaults overridable per-submit via
+  # the `pipeline_repo` / `revision` parameters. Generic = "any nf-core or
+  # arbitrary Nextflow repo"; child preset templates pin specific pipelines
+  # (see nf-core-sarek for the canonical sarek wrapper).
+  pipeline_repo: nf-core/hello
+  revision: master
+  # Pinned at 25.10.2 (May 2026). The 25.04 line can't resolve
+  # nf-core-utils@0.4.0; sarek 3.8.1 pins nextflowVersion `>=25.10.2`.
+  # 26.04.1 broke sarek: withName colon-path selectors in modules.config
+  # no longer parse under the 26.x config DSL (job 2008).
+  nxf_version: "25.10.2"
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=8G
+  #SBATCH --time=24:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: samplesheet_csv
+    role: samplesheet
+    required: false
+    default: ""
+    description: |
+      When set, written to /mnt/efs/samplesheet-${SLURM_JOB_ID}.csv and
+      passed as --input. Use to override a profile-supplied samplesheet
+      (e.g. swap s3:// URLs for /mnt/s3-refs/... paths).
+  - key: resume_workdir
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      When set, reuses an existing Nextflow workdir on EFS and adds `-resume`
+      so previously-cached tasks are skipped. Empty = fresh run.
+
+parameters:
+  - key: pipeline_repo
+    widget: text
+    default: ""
+    description: |
+      Override the runtime's pipeline_repo (e.g. "nf-core/rnaseq",
+      "nextflow-io/hello", "myorg/myrepo"). Empty = use runtime default.
+  - key: revision
+    widget: text
+    default: ""
+    description: |
+      Override the runtime's revision (branch, tag, or commit SHA). Empty =
+      runtime default. Pin to a release tag for reproducibility.
+  - key: profile
+    widget: enum
+    options: [docker, singularity, apptainer, conda, none]
+    default: apptainer
+    description: |
+      Nextflow -profile flag selecting the container engine. Default = apptainer
+      (matches the apptainer block in the rendered nextflow.config; passing
+      `singularity` here causes "Cannot enable more than one container engine"
+      because nf-core profiles enable singularity at the same time).
+  - key: extra_profiles
+    widget: text
+    default: ""
+    description: |
+      Comma-separated profiles layered before the runtime profile (e.g.
+      "test_full_germline" to pull nf-core's GIAB samplesheet + ref pack).
+  - key: pipeline_params_json
+    widget: nextflow_schema
+    default: ""
+    description: |
+      Auto-generated form from the pipeline's nextflow_schema.json (fetched
+      from GitHub at the resolved revision). The merged params are passed
+      as --params-file at submit (runtime writes them to
+      /mnt/efs/params-${SLURM_JOB_ID}.json). Falls back to a JSON textarea
+      if the schema can't be fetched.
+
+outputs:
+  dir: "/mnt/efs/nf-out-{{.ctx.run_id}}"
+  artifacts:
+    - key: outdir
+      path: "{{.outputs.dir}}"
+      role: primary_output
+
+policy:
+  prefer_on_demand: false
+  prefer_arm64: false
+
+config: |
+  // Unified clusterra: comment block — same grammar as the structured routing
+  // signals (see 2026-05-01-infra-variable-routing-plan.md). Every NF child task carries
+  // BOTH `chain=<wrapper>` (when launched inside a chain) AND `nf_parent=<head>`
+  // so a single `comment LIKE 'clusterra:%chain=W%'` regex returns the entire
+  // tree — wrapper → NF heads → NF children — without a 2-level join.
+  //
+  // CHAIN_ROOT_ID flows from the chain wrapper via Slurm's default --export=ALL;
+  // when there's no wrapper (a standalone NF run), the key is omitted.
+  def clusterraComment = {
+    def chain = System.getenv('CHAIN_ROOT_ID') ?: ''
+    def head  = System.getenv('SLURM_JOB_ID') ?: 'unknown'
+    def block = chain ? "clusterra:chain=${chain};nf_parent=${head}" : "clusterra:nf_parent=${head}"
+    return "--comment '${block}'"
+  }
+
+  process {
+    // Without an explicit executor Nextflow defaults to `local` and parses
+    // `process.array` below as unsupported, blowing up at compile time with
+    // "Executor 'local' does not support job arrays" (e.g. nf-core/sarek's
+    // prepare_genome subworkflow). Pin to slurm; the head sbatch already
+    // runs inside a slurmd pod so `sbatch` is on PATH for child tasks.
+    executor      = 'slurm'
+
+    // Stamp the structured `clusterra:` block onto every NF child sbatch.
+    // The console reads this for parent/child grouping; the scaler also
+    // reads it for routing signals (capacity/arch propagated from the
+    // wrapper when a chain set them).
+    clusterOptions = clusterraComment()
+
+    // Default to the cpu partition (slurm-app.yaml marks it Default=YES);
+    // GPU-bound modules can override via withName/withLabel selectors.
+    queue         = 'cpu'
+
+    // Workdir and outdir live on the same EFS filesystem, so publish via
+    // hardlink instead of copy. nf-core's default is `copy`, which on a
+    // 50 GB recalibrated CRAM costs minutes of EFS read+write per output.
+    // `link` is a constant-time link() syscall: zero data movement, zero
+    // additional storage, and the published file's inode survives a
+    // `rm -rf work-${JOBID}` after success — workdirs become truly
+    // ephemeral. Falls back to copy automatically if outdir is on a
+    // different filesystem (e.g. S3). See internal design notes.
+    publishDir.mode = 'link'
+    // Stage outputs from $TMPDIR (NVMe scratch on `*d` families) back to
+    // the EFS workdir via rsync rather than the default cp -r; rsync is
+    // ~2x faster for large CRAMs and avoids re-copying anything that's
+    // already in place on -resume.
+    stageOutMode  = 'rsync'
+    // Retry on known-transient signals (104=NetworkRetry, 137=SIGKILL/OOM
+    // or spot reclaim, 143=SIGTERM, 247=cgroup OOM) AND on null exitStatus.
+    // null = slurm couldn't read .exitcode at all because the node died
+    // (spot reclaim mid-task, kubelet crash, EFS metadata lag past the
+    // exit-status read timeout). Without the null branch, a single
+    // "Process terminated by external system" aborts the whole pipeline,
+    // which we observed repeatedly during BQSR/variant scatter on spot.
+    errorStrategy = { task.exitStatus == null || task.exitStatus in [104,137,143,247] ? 'retry' : 'finish' }
+    maxRetries    = 3
+    memory        = { check_max( 4.GB * task.attempt, 'memory' ) }
+    time          = { check_max( 4.h  * task.attempt, 'time'   ) }
+
+    // GPU routing for sarek's Parabricks tasks. Sarek 3.6.1 base.config sets
+    // `accelerator = null` for the slurm executor (only awsbatch/k8s/hq get
+    // a real value), so without this the fq2bam child sbatch lands on the
+    // default `cpu` partition and crashes the moment it touches CUDA.
+    // queue='gpu' + --gres=gpu:a10g:1 route the task to an A10G slurmd node
+    // and request the typed GPU GRES; the --comment is preserved here so the
+    // console's parent/child grouping (above) keeps working for the GPU child.
+    //
+    // Why typed (a10g), not untyped (gpu:1): an untyped request lets Karpenter
+    // bid the cheapest spot match — that's T4 (g4dn), which has 16 GiB VRAM
+    // and runs Parabricks fq2bam at 85-88% VRAM (one larger reference away
+    // from OOM) and ~2× slower than A10G per NVIDIA's published benchmark.
+    // a10g (g5/g6 family, 24 GiB) is the right floor for fq2bam. Typed GRES
+    // resolution is wired in slurmd-daemonset.yaml and decisions.go.
+    withName: 'PARABRICKS_FQ2BAM' {
+      queue            = 'gpu'
+      accelerator      = 1
+      clusterOptions   = { "--gres=gpu:a10g:1 ${clusterraComment()}" }
+      // --nv tells apptainer to bind-mount /dev/nvidia* + CUDA userspace
+      // libs into the container. Without it Parabricks crashes immediately
+      // with "Could not find accessible GPUs". Can't go in
+      // apptainer.runOptions (global) because CPU nodes have no
+      // /dev/nvidia* and --nv would fail-open on every CPU child task.
+      // process.containerOptions scopes the flag to this module only. The
+      // NVIDIA_{VISIBLE_DEVICES,DRIVER_CAPABILITIES} env vars set on
+      // slurmd-daemonset are for nvidia-container-runtime under containerd
+      // (the slurmd pod itself); apptainer-launched task containers don't
+      // see them and need --nv via this directive.
+      containerOptions = '--nv'
+      // Stage the task to node-local NVMe (Karpenter EC2NodeClass formats
+      // instance-store as RAID0 xfs at /mnt/scratch on every fresh GPU
+      // worker). Inputs are still symlinked from EFS workdir; the heavy
+      // intermediate writes (BWA bin tiles, sort spill, Mark Duplicates,
+      // BQSR table tmp) hit NVMe at GB/s instead of EFS at ~50 MB/s.
+      // Outputs are mv'd back to the EFS workdir at task end so -resume
+      // / downstream tasks see them.
+      scratch = '/mnt/scratch'
+    }
+
+    // DeepVariant's example_maker / call_variants / postprocess_variants
+    // pipeline writes 10s of GB of intermediate examples + tfrecord shards
+    // per genomic interval. On EFS-backed scratch each shard pays
+    // ~50 MB/s + per-op metadata latency, and the Apr-30 GIAB run had 20
+    // shards each taking 1h–2h14m wall-clock. `scratch = true` stages the
+    // task into $TMPDIR (set by the head sbatch — /mnt/scratch when the
+    // node has instance-store, else /mnt/efs/tmp-...). `--tmp=80G` is
+    // the routing lever: per internal design notes, Slurm
+    // refuses to land --tmp=N jobs on a node whose advertised TmpDisk
+    // is below N, so non-`*d` CPU families (m6i/c6i/r6i — zero TmpDisk)
+    // are excluded and DV shards pend until a `*d` (m6id/c6id/r6id)
+    // shows up. 80G covers a 30× WGS shard with headroom (~10–25 GB
+    // typical) without forcing oversized instances. Combined with
+    // scratch=true this collapses the EFS metadata-lag tail observed
+    // Apr-30 (1h–2h14m per shard) toward NVMe-bound. No --nv /
+    // accelerator: still CPU `run_deepvariant`. See TODO(gpu-deepvariant)
+    // in console presets.ts for the path to true GPU DeepVariant via
+    // Parabricks.
+    withName: 'DEEPVARIANT_RUNDEEPVARIANT' {
+      scratch         = true
+      clusterOptions  = { "--tmp=80G ${clusterraComment()}" }
+    }
+
+    // ── sarek CPU heavy-IO modules ───────────────────────────────────────
+    // The May 1 trace analysis (see internal design notes) showed
+    // these five modules dominate EFS write/metadata pressure on the
+    // bench-cpu-baseline pipeline:
+    //   GATK4_MARKDUPLICATES — 147 GB written/task at 14-18 MB/s on EFS
+    //                          (single per-sample, 148-178 min wall-clock).
+    //   BWAMEM1/2_MEM        — 98 chunks × ~25 min, sort spill on EFS at
+    //                          ~28 MB/s.
+    //   GATK4_BASERECALIBRATOR — 105 interval scatter, 16 m median, IO-starved
+    //                          at ~3 MB/s read (small interval BAM slices).
+    //   GATK4_APPLYBQSR      — same 105-way scatter, 20 m median, 2.5 MB/s.
+    //
+    // Per-module `scratch = true` stages task to `$TMPDIR` (which the head
+    // sbatch sets to /mnt/scratch when instance-store NVMe is present, see
+    // script body below). `clusterOptions = "--tmp=NG"` is what routes the
+    // child sbatch onto an NVMe-backed `*d` Karpenter family — Slurm
+    // refuses to schedule a `--tmp=N` job on a node whose advertised
+    // `TmpDisk < N`, so non-`*d` instances (c6i/m6i/r6i — zero TmpDisk) get
+    // excluded automatically. See internal design notes
+    // Phase 2 for the full wiring (cap-pod nodeAffinity → instance-local-nvme).
+    //
+    // Tmp sizes are conservative against actual usage — generous enough to
+    // not pend, tight enough to avoid forcing oversized instances:
+    //   MARKDUPLICATES 300G — needs to fit input BAM (~100G) + scratch dedup
+    //     index + output BAM (~100G); pushes to r6id.4xlarge (940G NVMe).
+    //   BWAMEM 80G — per-chunk BAM ~5-10G + sort spill ~10-15G; fits
+    //     c6id.large (118G NVMe) for cheap parallelism across chunks.
+    //   APPLYBQSR 80G — per-interval recal BAM + intermediate; fits c6id.large.
+    //   BASERECALIBRATOR 40G — table-gen, small; any `*d` shape.
+    //
+    // Other sarek modules (FASTQC, FASTP, MultiQC, snpEff, VEP, software
+    // versions, schema validators) are intentionally NOT tagged — they
+    // either don't touch disk meaningfully or run fast enough that the
+    // NVMe spot-pool concentration risk outweighs the per-task savings.
+    // See internal design notes "surgical NVMe opt-in" for the
+    // policy rationale.
+    withName: 'GATK4_MARKDUPLICATES' {
+      scratch         = true
+      clusterOptions  = { "--tmp=300G ${clusterraComment()}" }
+    }
+    withName: 'BWAMEM2_MEM' {
+      scratch         = true
+      clusterOptions  = { "--tmp=80G ${clusterraComment()}" }
+    }
+    // BWAMEM1_MEM also tagged: sarek 3.6.1 test_full_germline defaults to
+    // bwa-mem (1) unless `--aligner bwa-mem2` is set. The May 1 trace
+    // showed BWAMEM1_MEM running 98 chunks; keep both names tagged so the
+    // routing works whichever aligner the run picks.
+    withName: 'BWAMEM1_MEM' {
+      scratch         = true
+      clusterOptions  = { "--tmp=80G ${clusterraComment()}" }
+    }
+    withName: 'GATK4_BASERECALIBRATOR' {
+      scratch         = true
+      clusterOptions  = { "--tmp=40G ${clusterraComment()}" }
+    }
+    withName: 'GATK4_APPLYBQSR' {
+      scratch         = true
+      clusterOptions  = { "--tmp=80G ${clusterraComment()}" }
+    }
+  }
+  executor {
+    queueSize = 500
+    // EFS metadata cache lag at high task fanout (sarek prepare_genome,
+    // rnaseq STAR fan-out, DeepVariant scatter, etc.) means Nextflow's
+    // exit-status file can lag behind the task-end signal by minutes;
+    // the default 270 s read deadline trips and the task is marked failed
+    // despite a clean rc=0 on disk ("terminated for an unknown reason --
+    // Likely terminated by the external system"). Bump to 15 m so the
+    // GridTaskHandler waits out the worst-case stat() roundtrip instead
+    // of synthesizing spurious failures (which would also defeat -resume
+    // reuse). Must be inside `executor { }` — top-level is silently
+    // ignored.
+    exitReadTimeout = '15min'
+  }
+  process.array = 1000
+  // Apptainer engine block — paired with `-profile apptainer` selected by
+  // the `profile` param. nf-core pipelines (sarek, rnaseq, ...) ship their
+  // own `apptainer` profile that flips `apptainer.enabled = true`, so this
+  // block must scope `apptainer` (not `singularity`) — otherwise Nextflow
+  // sees two engines enabled and aborts with "Cannot enable more than one
+  // container engine".
+  apptainer {
+    enabled     = true
+    autoMounts  = true
+    cacheDir    = '/mnt/efs/nxf-cache/_lib'
+    // Bind the s3-refs FUSE mount into apptainer-launched task containers so
+    // symlinks Nextflow stages from work/ → /mnt/s3-refs/... resolve inside
+    // the container (autoMounts handles workdir + projectDir but not arbitrary
+    // host paths). Required when samplesheet / params point at FUSE paths.
+    runOptions  = '-B /mnt/s3-refs'
+    // Default pullTimeout is 20m; the Parabricks 4.6 image (~25 GB
+    // uncompressed) takes 30-40 min to extract OCI layers + write the
+    // squashfs to EFS. 90m gives headroom on cold cache; warm-cache runs
+    // skip the pull entirely (cacheDir is EFS-shared).
+    pullTimeout = '90m'
+  }
+  // Point nf-core's iGenomes lookup at the Mountpoint-for-S3 view of
+  // s3://ngi-igenomes (mounted at /mnt/s3-refs by Karpenter userData,
+  // surfaced into slurmd via HostToContainer propagation). Pipelines that
+  // resolve refs through `params.igenomes_base` (sarek, rnaseq, methylseq,
+  // ampliseq, ...) read FASTA + BWA index + known-sites VCFs as local file
+  // opens served from the kernel page cache instead of paying the
+  // "Staging foreign file: s3://ngi-igenomes/igenomes/..." copy on every
+  // run. Pipelines that don't reference this param ignore it. Users can
+  // override per-job by setting --igenomes_base on the CLI / params-file.
+  params {
+    igenomes_base = '/mnt/s3-refs/igenomes'
+  }
+
+  // Anonymous reads against public S3 buckets (e.g. ngi-igenomes for nf-core
+  // test_full_* profiles, ngi-igenomes reference packs). Without this, any
+  // pipeline that stages s3:// inputs via the public bucket fails with
+  // AnonymousAWSCredentialsException unless the slurmd pod has an IAM role.
+  // Still required even with Mountpoint above — sample FASTQs in the
+  // test_full_* profiles live at s3://ngi-igenomes/test-data/... and are
+  // staged by Nextflow's S3 client (Mountpoint covers the references only).
+  aws {
+    client { anonymous = true }
+  }
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  RESUME_WORKDIR={{.inputs.resume_workdir | quote}}
+  if [ -n "$RESUME_WORKDIR" ]; then
+    WORKDIR="$RESUME_WORKDIR"
+    RESUME_FLAG=(-resume)
+  else
+    WORKDIR=/mnt/efs/work-$SLURM_JOB_ID
+    RESUME_FLAG=()
+  fi
+
+  # TMPDIR / APPTAINER_TMPDIR / APPTAINER_CACHEDIR are stamped onto the
+  # per-job scratch root by the slurmd Prolog + TaskProlog (NVMe when the
+  # node has instance-store, EFS fallback otherwise). The hardlink-heavy
+  # OCI-layer unpack that trips EFS's link-per-inode ceiling on parallel
+  # sarek pulls lands there, not on EFS. Epilog rm -rfs the whole root.
+  export NXF_VER={{.runtime.nxf_version}}
+  export NXF_SINGULARITY_CACHEDIR=/mnt/efs/nxf-cache/_lib
+  # Shard NXF_HOME by SLURM_JOB_ID to avoid concurrent `git pull` corrupting
+  # the shared asset cache when parallel nextflow heads run.
+  export NXF_HOME=/mnt/efs/nxf-cache/_home-$SLURM_JOB_ID
+  mkdir -p "$NXF_HOME"
+
+  PARAMS_FILE=""
+  {{if .params.pipeline_params_json}}
+  PARAMS_FILE=/mnt/efs/params-$SLURM_JOB_ID.json
+  cat > "$PARAMS_FILE" <<'EOF'
+  {{.params.pipeline_params_json}}
+  EOF
+  sed -i "s|\${SLURM_JOB_ID}|$SLURM_JOB_ID|g" "$PARAMS_FILE"
+  {{end}}
+
+  CONFIG_FILE=/mnt/efs/nextflow-$SLURM_JOB_ID.config
+  cat > "$CONFIG_FILE" <<'EOF'
+  {{.config}}
+  EOF
+  sed -i "s|\${SLURM_JOB_ID}|$SLURM_JOB_ID|g" "$CONFIG_FILE"
+
+  PROFILE={{.params.profile | quote}}
+  EXTRA_PROFILES={{.params.extra_profiles | quote}}
+  if [ -n "$EXTRA_PROFILES" ]; then
+    PROFILE="${EXTRA_PROFILES},${PROFILE}"
+  fi
+
+  OUTDIR_FLAG=()
+  if [ -z "$PARAMS_FILE" ] || ! grep -q '"outdir"' "$PARAMS_FILE"; then
+    OUTDIR_FLAG=(--outdir {{.outputs.dir | quote}})
+  fi
+
+  INPUT_FLAG=()
+  {{if .inputs.samplesheet_csv}}
+  SAMPLESHEET=/mnt/efs/samplesheet-$SLURM_JOB_ID.csv
+  cat > "$SAMPLESHEET" <<'EOF'
+  {{.inputs.samplesheet_csv}}
+  EOF
+  INPUT_FLAG=(--input "$SAMPLESHEET")
+  {{end}}
+
+  chmod -R a+rX "$NXF_HOME" 2>/dev/null || true
+
+  # Drop --igenomes_base when running with the upstream `test` profile —
+  # nf-core test profiles bundle small fixture URLs that don't live under
+  # iGenomes; overriding the base 404s the bundled paths.
+  IGENOMES_FLAG=()
+  case ",$EXTRA_PROFILES,$PROFILE," in
+    *,test,*|*,test_*,*) ;;
+    *) IGENOMES_FLAG=(--igenomes_base /mnt/s3-refs/igenomes) ;;
+  esac
+
+  PIPELINE_REPO={{.params.pipeline_repo | quote}}
+  PIPELINE_REPO=${PIPELINE_REPO:-{{.runtime.pipeline_repo | quote}}}
+  REVISION={{.params.revision | quote}}
+  REVISION=${REVISION:-{{.runtime.revision | quote}}}
+
+  # `none` lets tutorial pipelines (nextflow-io/hello, etc.) run without any
+  # container engine — they don't ship with nf-core's profile set.
+  PROFILE_FLAG=()
+  if [ "$PROFILE" != "none" ]; then
+    PROFILE_FLAG=(-profile "$PROFILE")
+  fi
+
+  nextflow run "$PIPELINE_REPO" \
+    -r "$REVISION" \
+    "${PROFILE_FLAG[@]}" \
+    -c "$CONFIG_FILE" \
+    -work-dir "$WORKDIR" \
+    "${RESUME_FLAG[@]}" \
+    ${PARAMS_FILE:+-params-file "$PARAMS_FILE"} \
+    "${OUTDIR_FLAG[@]}" \
+    "${INPUT_FLAG[@]}" \
+    "${IGENOMES_FLAG[@]}"

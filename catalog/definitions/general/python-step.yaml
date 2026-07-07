@@ -1,0 +1,135 @@
+id: python-step
+name: Python step
+description: |
+  Run a short Python script. Use this between heavier workloads to
+  evaluate prior step outputs, compute a derived input, or gate the next
+  step on a condition. When this template is wired into a workflow
+  recipe, exit 0 gates `afterok` downstream edges and a non-zero exit
+  gates `afternotok` edges — so a one-line `sys.exit(0 if good else 1)`
+  routes the chain.
+
+  Conventions when used as a workflow step:
+    - Prior step outputs live under $WORKFLOW_DIR/step-<N>-<id>/
+      (the workflow-collapse convention; the orchestrator exports
+      $WORKFLOW_DIR on chained submits).
+    - Write your own decision/outputs as JSON to
+      $OUTPUT_DIR/outputs.json so downstream steps can read it.
+    - $OUTPUT_DIR is exported to your script for convenience.
+vertical: general
+category: general
+workload_group: general
+modality: form
+tools: [python]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: python:3.11
+  cache_dir: /mnt/efs/_python-step-venv
+  entrypoint: python
+  notes: |
+    Stock python:3.11 (not -slim) so users can pip-install packages that
+    JIT-compile (numpy wheels with C extensions, triton, cython). The
+    persistent EFS venv is flock-guarded — first run creates it,
+    subsequent runs reuse it. Per-job extra packages requested via the
+    `extra_requirements` param; cached across jobs in the same venv.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=1
+  #SBATCH --mem=2G
+  #SBATCH --time=0:30:00
+  #SBATCH --nodes=1
+
+inputs: []
+
+parameters:
+  - key: extra_requirements
+    label: Extra pip packages
+    widget: text
+    advanced: true
+    default: ""
+    description: |
+      Optional space- or comma-separated pip requirements installed
+      before the script runs (e.g. "pandas==2.2.0 scipy==1.13.0").
+      Installed into the shared EFS venv on first sighting, cached
+      across all subsequent python-step jobs. Leave empty for
+      stdlib-only scripts.
+  - key: script_body
+    label: Python script
+    widget: textarea
+    required: true
+    default: |
+      print("hello from bridge")
+    description: |
+      Your Python source. Available env vars:
+        OUTPUT_DIR          — write artifacts / outputs.json here
+        WORKFLOW_DIR        — set when this step is part of a chain;
+                              prior steps' outputs live in subdirs
+        PREV_STEP_OUT_DIR   — convenience pointer to the immediate
+                              upstream step's output dir (chain only)
+      Exit 0 to pass, sys.exit(1) (or raise) to fail — downstream
+      recipe edges branch on the exit code via afterok / afternotok.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/python-step-{{.ctx.run_id}}"
+  artifacts:
+    - key: outputs
+      path: "{{.outputs.dir}}/outputs.json"
+      role: primary_output
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  export OUTPUT_DIR
+
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  export PIP_CACHE_DIR=/mnt/efs/_python-step-venv-cache
+  mkdir -p "$PIP_CACHE_DIR" "$(dirname "$VENV_DIR")"
+
+  IMAGE="docker://{{.runtime.base_image}}"
+
+  # Provision the venv once across all python-step jobs. flock-guarded
+  # so concurrent first-time submits don't race on pip's site-packages.
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+      apptainer exec "$IMAGE" bash -c "
+        set -euo pipefail
+        python{{.runtime.python_version}} -m venv '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+      "
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  # Install per-job extras into the same venv (idempotent; pip skips
+  # already-satisfied requirements).
+  EXTRA={{.params.extra_requirements | quote}}
+  if [ -n "$EXTRA" ]; then
+    # Normalize comma separators to spaces; pip accepts space-separated.
+    EXTRA_NORM=$(printf '%s' "$EXTRA" | tr ',' ' ')
+    # shellcheck disable=SC2086
+    apptainer exec "$IMAGE" "$VENV_DIR/bin/pip" \
+      install --quiet --cache-dir "$PIP_CACHE_DIR" $EXTRA_NORM
+  fi
+
+  # Materialize the user's script to a file so tracebacks carry real
+  # line numbers (running via `-c "..."` collapses everything to <string>).
+  # Marker is intentionally long + unique to avoid clashing with user code.
+  SCRIPT_PATH="$OUTPUT_DIR/step.py"
+  cat > "$SCRIPT_PATH" <<'__CLUSTERRA_PYTHON_STEP_EOF__'
+  {{.params.script_body}}
+  __CLUSTERRA_PYTHON_STEP_EOF__
+
+  cd "$OUTPUT_DIR"
+  exec apptainer exec "$IMAGE" \
+    "$VENV_DIR/bin/{{.runtime.entrypoint}}" "$SCRIPT_PATH" \
+    2>&1 | tee "$OUTPUT_DIR/stdout.log"

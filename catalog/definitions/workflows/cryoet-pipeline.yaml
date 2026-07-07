@@ -1,0 +1,32 @@
+id: cryoet-pipeline
+name: Cryo-ET pipeline (align -> subtomogram averaging)
+description: |
+  Open-source cryo-electron tomography structure determination:
+  AreTomo2 tilt-series alignment + tomogram reconstruction -> RELION-5
+  subtomogram averaging.
+
+  Honest seam: particle picking between the two steps is a human-in-the-loop
+  task (template matching / manual curation), not automated here. Run the
+  align step to get tomograms, pick particles, then point the STA step at
+  the picks (its `particles_star` input) and the reconstructed tomograms.
+  This recipe pins the canonical order; labs with template-matching picks
+  can compose their own chain via the strip UI.
+
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [AreTomo2, RELION]
+ready: true
+kind: workflow
+
+steps:
+  - step_id: align
+    template_id: relion-tomo-align
+    display_name: AreTomo2 align + reconstruct
+  - step_id: sta
+    template_id: relion-tomo-sta
+    display_name: RELION subtomogram averaging
+    depends_on: [align]
+    input_overrides:
+      tomograms_star: /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-align/tomograms.star

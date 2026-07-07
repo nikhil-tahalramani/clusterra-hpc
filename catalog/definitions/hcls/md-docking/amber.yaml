@@ -1,0 +1,83 @@
+id: amber
+name: AMBER molecular dynamics
+description: PMEMD MD on GPU partitions — implicit and explicit solvent, REMD, free-energy methods.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: cli
+tools: [AMBER, pmemd]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: hisplan/ambertools:23
+  notes: |
+    Default image is the open-source AmberTools (`mode: ambertools`). The
+    paid AMBER PMEMD/CUDA build (`mode: pmemd-cuda`) needs a BYOL container —
+    point your tenant overlay at e.g. ambermd/amber:24-cuda12 and tag the
+    license accordingly. Same script body works for both; the binary chosen
+    by `mode` differs.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=4:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+validation:
+  notes: |
+    AMBER MD trajectories are validated by RMSD-vs-time on the equilibrated
+    portion. The validation block is preserved as v1; full schema TBD.
+
+inputs:
+  - key: prmtop
+    role: prmtop
+    required: true
+    description: Amber topology (.prmtop / .parm7).
+  - key: inpcrd
+    role: inpcrd
+    required: true
+    description: Initial coordinates (.inpcrd / .rst7).
+  - key: mdin
+    role: mdp
+    required: true
+    description: MD input file (mdin).
+
+parameters:
+  - key: mode
+    widget: enum
+    options: [ambertools, pmemd-cuda]
+    default: ambertools
+    description: |
+      ambertools = open-source AmberTools sander (CPU/GPU). pmemd-cuda =
+      paid AMBER PMEMD CUDA build (BYOL — see runtime.notes).
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/amber-{{.ctx.run_id}}"
+  artifacts:
+    - key: trajectory
+      path: "{{.outputs.dir}}/md.nc"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  cd "$OUTPUT_DIR"
+  if [ "{{.params.mode}}" = "pmemd-cuda" ]; then
+    BIN=pmemd.cuda
+  else
+    BIN=sander
+  fi
+  exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" \
+    "docker://{{.runtime.image}}" \
+    "$BIN" -O \
+      -i {{.inputs.mdin | quote}} \
+      -p {{.inputs.prmtop | quote}} \
+      -c {{.inputs.inpcrd | quote}} \
+      -o "$OUTPUT_DIR/md.out" \
+      -x "$OUTPUT_DIR/md.nc" \
+      -r "$OUTPUT_DIR/md.rst"

@@ -1,0 +1,152 @@
+id: openfold3
+name: OpenFold3 (open weights, commercial-OK)
+description: |
+  AQLab + OpenFold Consortium's open-source biomolecular structure predictor.
+  Fully open weights (Apache 2 throughout), commercially usable — no
+  non-commercial weights gate. Predicts proteins, protein-protein,
+  protein-ligand, protein-nucleic, and arbitrary ligand co-folding.
+
+  Per FoldBench (Nat Comms 2026), OpenFold3 ranks among the most stable
+  across the all-atom benchmark suite (Boltz-2 spikes higher
+  on individual targets but produces more low-quality predictions). Status
+  preview (v0.4.x as of May 2026), actively pushed by a wider community
+  than Boltz (Flatiron + Columbia + Rutgers + NVIDIA NIM hosting).
+
+  When to pick OpenFold3 vs Boltz:
+  - OpenFold3: commercial use + stability across diverse targets + active
+    multi-org backing. Marginally slower than Boltz-1 today.
+  - Boltz-1/2: peak accuracy on protein-ligand (PoseBusters), faster
+    inference, slightly higher variance. Also MIT-licensed.
+  Use both as catalog options; let the customer A/B for their target class.
+
+  Validated against a pre-staged SIF on EFS (12 GB upstream image overruns
+  the cap-pod /tmp during apptainer pull, so we stage once via a sbatch
+  pre-pull job onto an instance-store family and let runtime jobs apptainer
+  exec the .sif path directly — no pull at job time).
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [OpenFold3]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  # SIF pre-staged on EFS via the openfold3 prepull workflow. apptainer
+  # exec accepts a .sif path natively — no docker:// resolution at job
+  # time. Keep the upstream digest in notes for traceability.
+  image: /mnt/efs/_sifs/openfold3-0.4.0.sif
+  notes: |
+    Pre-staged from openfoldconsortium/openfold3:0.4.0
+    (digest sha256:636f8ee0e272f046aef5387d6984cedfd8d705bf244e9539132c5045d057a0b5,
+    Docker Hub amd64, ~12 GB). NVIDIA also hosts a NIM build at
+    build.nvidia.com/openfold/openfold3 for the GPU-optimized fork. We
+    default to the consortium image — swap to NIM only if a customer brings
+    an NGC API key.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=12
+  #SBATCH --mem=64G
+  #SBATCH --time=4:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: input_yaml
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      OpenFold3 input YAML spec (sequences + ligands + ions + constraints).
+      Empty = SMOKE_MODE (openfold3 --help only).
+
+parameters:
+  - key: num_recycles
+    label: Recycle iterations
+    widget: number
+    default: 3
+    min: 1
+    max: 10
+  - key: num_diffusion_samples
+    label: Diffusion samples (ensemble size)
+    widget: number
+    default: 5
+    min: 1
+    max: 25
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/openfold3-{{.ctx.run_id}}"
+  artifacts:
+    - key: predicted_cif
+      path: "{{.outputs.dir}}/predicted.cif"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+
+  # No apptainer scratch prelude: runtime.image is a pre-staged .sif path
+  # on EFS, so there is no docker:// pull at job time and no SIF unpack
+  # into /tmp. The slurmd Prolog handles APPTAINER_TMPDIR/CACHEDIR if any
+  # apptainer tooling does need scratch.
+
+  # The openfoldconsortium/openfold3 image ships the CLI inside a conda
+  # env named `openfold3` at /opt/conda/envs/openfold3/bin/run_openfold —
+  # not on PATH because apptainer exec skips the Docker ENTRYPOINT
+  # (see ~/.claude/.../memory/apptainer_skips_docker_entrypoint.md).
+  # Calling the full path bypasses the conda-activation requirement.
+  OF3_BIN=/opt/conda/envs/openfold3/bin/run_openfold
+
+  if [ "${OPENFOLD3_SMOKE:-1}" = "1" ] || [ -z {{.inputs.input_yaml | quote}} ]; then
+    echo "[openfold3] SMOKE_MODE: run_openfold --help (set OPENFOLD3_SMOKE=0 + provide input_yaml for real prediction)"
+    exec apptainer exec --nv --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs \
+      "{{.runtime.image}}" \
+      "$OF3_BIN" --help
+  fi
+
+  INPUT={{.inputs.input_yaml | quote}}
+  [ -f "$INPUT" ] || { echo "input not readable: $INPUT" >&2; exit 1; }
+
+  # OF3 0.4.0 `predict` requires JSON via --query-json. slurmd host has no
+  # PyYAML; if a .yaml is provided we look for a sibling .json (which prep
+  # steps should stage). --num-recycles isn't a real flag on this CLI
+  # (verified May 12 2026 via predict --help, job 2062).
+  case "$INPUT" in
+    *.json) QUERY_JSON="$INPUT" ;;
+    *.yaml|*.yml)
+      QUERY_JSON="${INPUT%.*}.json"
+      [ -f "$QUERY_JSON" ] || { echo "expected sibling JSON not found: $QUERY_JSON" >&2; exit 1; }
+      ;;
+    *) echo "unknown input ext: $INPUT" >&2; exit 1 ;;
+  esac
+
+  # OF3 prompts interactively when downloading model weights to
+  # $OPENFOLD_CACHE on first use; slurmd HOME=/nonexistent + no stdin →
+  # default Aborted. Point cache at EFS so weights persist; pipe `yes` to
+  # auto-confirm. See drug-disco-bench job 2081 (May 12 2026) for repro.
+  CACHE=/mnt/efs/_openfold3-cache
+  mkdir -p "$CACHE"
+
+  # K8s 64 MB /dev/shm bus-errors PyTorch DataLoader workers. Apptainer
+  # rejects --mount type=tmpfs; bind a per-job /tmp dir onto /dev/shm.
+  SHM_DIR=$(mktemp -d -t of3-shm-XXXXX)
+  trap 'rm -rf "$SHM_DIR"' EXIT
+
+  # `yes |` answers the weight-download prompt; under pipefail, yes's
+  # SIGPIPE (141) at apptainer exit propagates as job failure. Disable
+  # pipefail for this command and surface apptainer's actual rc.
+  set +o pipefail
+  yes 2>/dev/null | apptainer exec --nv \
+    --bind "$TMPDIR:$TMPDIR" --bind /mnt/efs --bind "$SHM_DIR:/dev/shm" \
+    --env "HOME=$CACHE" --env "OPENFOLD_CACHE=$CACHE" \
+    "{{.runtime.image}}" \
+    "$OF3_BIN" predict \
+      --query-json "$QUERY_JSON" \
+      --output-dir "$OUTPUT_DIR" \
+      --num-diffusion-samples {{.params.num_diffusion_samples}}
+  RC=${PIPESTATUS[1]}
+  set -o pipefail
+  exit "$RC"

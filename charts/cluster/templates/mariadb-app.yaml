@@ -1,0 +1,27 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mariadb-{{ .Values.cluster.name }}
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    clusterra.io/cluster: {{ .Values.cluster.name }}
+    clusterra.io/component: mariadb
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/nikhil-tahalramani/clusterra-hpc.git'
+    targetRevision: {{ .Values.cluster.targetRevision | default "main" }}
+    # Shared MariaDB CR — every tenant references the same file. Destination
+    # namespace below routes the rendered CR into the tenant's own namespace.
+    path: core/fleet/charts/cluster/mariadb-manifests
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: {{ .Values.cluster.name }}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,410 @@
+---
+# DaemonSet slurmd: runs on every Karpenter worker node and registers the
+# full node's resources with slurmctld. Capacity-request pods (pause containers)
+# trigger Karpenter provisioning; this DaemonSet auto-lands once the node is ready.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: slurmd
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurmd
+    app.kubernetes.io/component: slurmd-daemonset
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: slurmd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: slurmd
+    spec:
+      # Only run on Karpenter workers (never control plane). Selector uses
+      # `karpenter.sh/nodepool` (Karpenter-applied at NodeClaim creation,
+      # before kubelet registers) instead of the userData-applied
+      # `clusterra.io/pool=cpu`. The distinction matters for Karpenter's
+      # binpacker: it simulates DaemonSet placement against labels it KNOWS
+      # the node will carry. A userData-applied label is invisible to that
+      # simulation, so Karpenter sized nodes to fit cap pods alone and
+      # slurmd was left Pending with `Insufficient cpu` (Apr 30 2026
+      # incident on clusde74 — 4× c2 cap pods on a t3.2xlarge filled
+      # allocatable, slurmd's 100m couldn't land, node never registered
+      # with Slurm, EC2 burned for hours). With karpenter.sh/nodepool the
+      # binpacker reserves slurmd's request and picks the next-bigger
+      # instance when needed.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: karpenter.sh/nodepool
+                operator: Exists
+      tolerations:
+      - key: karpenter.sh/unregistered
+        operator: Exists
+        effect: NoExecute
+      # GPU isolation taint applied by edge-agent. slurmd is the one
+      # workload that MUST run on both CPU and GPU nodes (it registers
+      # every worker into Slurm), so tolerate the taint here. CPU cap-pods
+      # do not — that's what stops them binpacking onto GPU nodes.
+      - key: clusterra.io/gpu
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      # ghcr.io pull auth for the private slurmd image. The ghcr-pull Secret
+      # is seeded by provisioner phase 5 in the `slurm` namespace; without
+      # this reference, kubelet tries anonymous pull and gets 401.
+      imagePullSecrets:
+      - name: ghcr-pull
+      hostNetwork: true
+      # Default (not ClusterFirstWithHostNet): slurmd needs external DNS to
+      # pull apptainer images from ghcr.io. K3s CoreDNS forwards `.` to its
+      # own pod's /etc/resolv.conf (127.0.0.53 — the host's systemd-resolved
+      # stub, unreachable from inside the CoreDNS pod), so cluster DNS can't
+      # resolve external names. With hostNetwork=true + dnsPolicy=Default, the
+      # pod shares the host netns and inherits the host's resolv.conf, which
+      # reaches systemd-resolved on 127.0.0.53 correctly. slurmd doesn't need
+      # cluster DNS (it talks to slurmctld via the hostAliases entry below).
+      dnsPolicy: Default
+      terminationGracePeriodSeconds: 120
+      hostAliases:
+      - ip: {{ (split ":" .Values.slurmctldHost)._0 | quote }}
+        hostnames:
+        - {{ printf "slurm-%s-controller.%s" .Values.clusterId .Values.clusterId | quote }}
+      initContainers:
+      # hostPath DirectoryOrCreate makes the dir root:root 0755 which blocks
+      # non-root job users (sbatch runs as the tenant user) from writing the
+      # SIF cache. chmod 1777 here so every job can create its pull while
+      # nothing can delete another's SIF. Matches the Karpenter userData
+      # pre-creation — this is the pod-level safety net for nodes that were
+      # provisioned before the userData change landed.
+      - name: sif-cache-perms
+        image: busybox:1.37
+        command: ["sh", "-c", "mkdir -p /var/lib/apptainer/sif-cache && chmod 1777 /var/lib/apptainer/sif-cache"]
+        volumeMounts:
+        - name: apptainer-sif-cache
+          mountPath: /var/lib/apptainer/sif-cache
+      containers:
+      - name: slurmd
+        image: {{ required "imageDigests.slurmd must be set (envs/{env}/use1/images.yaml)" .Values.imageDigests.slurmd | quote }}
+        imagePullPolicy: IfNotPresent
+        # Static slurm.conf mounted at /etc/slurm/slurm.conf (see slurmd-conf.yaml).
+        # Configless (--conf-server) dropped because Slinky's rendered conf hardcodes
+        # SlurmctldPort=6817, which collides with per-tenant NodePort allocation.
+        command:
+        - sh
+        - -c
+        - |
+          # Authoritative expectation: EC2 instance type via IMDSv2. NVIDIA GPU
+          # families = g3/g4/g5/g6/gr6/p3/p4/p5/p6. Trainium/Inferentia/Habana
+          # are NOT --nv-compatible so we treat them as cpu here.
+          TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)
+          ITYPE=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-type || true)
+          IID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-id || true)
+          # instance-life-cycle returns "spot" or "on-demand". A 404 fallback
+          # to on-demand keeps the field deterministic so cost lookup never
+          # silently misses.
+          LIFE=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-life-cycle 2>/dev/null || echo on-demand)
+
+          if [ -z "$ITYPE" ]; then
+            echo "FATAL slurmd-bootstrap: IMDS unreachable, cannot determine instance type" >&2
+            sleep infinity
+          fi
+
+          case "$ITYPE" in
+            # g7e/g8 are newer Graviton GPU families; missing them causes the
+            # /dev/nvidia0 fail-safe below to FATAL on a node that should have
+            # been routed to the gpu pool from the start. Keep this list as the
+            # belt to the NodePool's instance-category suspenders.
+            g3*|g4*|g5*|g6*|g7e*|g8*|gr6*|p3*|p4*|p5*|p6*) EXPECTED=gpu ;;
+            *)                                              EXPECTED=cpu ;;
+          esac
+
+          # Actual device presence. /dev/nvidia0 appears once the kernel
+          # module loads — wait up to 60s for the race on a fresh boot.
+          ACTUAL=cpu
+          for _ in $(seq 1 12); do
+            if [ -e /dev/nvidia0 ]; then ACTUAL=gpu; break; fi
+            sleep 5
+          done
+
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "FATAL slurmd-bootstrap: instance_type=$ITYPE expects partition=$EXPECTED but /dev/nvidia0 detection shows partition=$ACTUAL — refusing to register to prevent GPU/CPU misclassification on a billed node" >&2
+            AUTH=""
+            if [ -n "${CLUSTERRA_INTERNAL_TOKEN:-}" ]; then
+              AUTH="-H Authorization: Bearer ${CLUSTERRA_INTERNAL_TOKEN}"
+            fi
+            curl -sf -m 5 -X POST ${AUTH} \
+              -H "Content-Type: application/json" \
+              -d "{\"node\":\"$NODE_NAME\",\"instance_type\":\"$ITYPE\",\"expected\":\"$EXPECTED\",\"actual\":\"$ACTUAL\"}" \
+              "${CLUSTERRA_API}/v1/internal/clusters/${CLUSTER_ID}/node-misclassified" \
+              || true
+            sleep infinity
+          fi
+
+          # Map EC2 GPU family → canonical GPU model name advertised via Slurm
+          # GRES. Must match the string parseGRES emits as "model" in
+          # decisions.go so typed submits like --gres=gpu:a10g:1 resolve here.
+          # Missing families fall through to untyped Gres=gpu:N.
+          GPU_MODEL=""
+          case "$ITYPE" in
+            g5.*|g5g.*)        GPU_MODEL=a10g ;;
+            g6.*|gr6.*)        GPU_MODEL=l4   ;;
+            g6e.*)             GPU_MODEL=l40s ;;
+            g7e.*)             GPU_MODEL=rtxpro6000 ;;
+            g4dn.*)            GPU_MODEL=t4   ;;
+            g4ad.*)            GPU_MODEL=v520 ;;
+            g3.*)              GPU_MODEL=m60  ;;
+            p3.*)              GPU_MODEL=v100 ;;
+            p4d.*|p4de.*)      GPU_MODEL=a100 ;;
+            p5.*)              GPU_MODEL=h100 ;;
+            p5e.*|p5en.*)      GPU_MODEL=h200 ;;
+            p6.*)              GPU_MODEL=b200 ;;
+          esac
+
+          CONF_ARGS="Feature=$EXPECTED"
+
+          # Headroom: advertise to Slurm a slightly-smaller-than-/proc capacity
+          # so jobs sized to fit the advertised numbers fit kubelet's enforced
+          # limits. Without this, slurmd reads /proc and reports raw capacity
+          # — Slurm dispatches jobs that use the full advertised memory, kubelet
+          # OOM-kills them when they collide with the kube/system reserve, and
+          # CPU-pegged jobs get throttled by ~5%. See 2026-05-02-scaling-plan-v1.1.md.
+          #
+          # CPU_RESERVE=1: covers measured kubelet (~24m), system/containerd
+          # (~50-100m), slurmd (~100m) — well under 1 vCPU on every instance
+          # we provision; integer floor matches Slurm's uint16 CPU model.
+          # MEM_RESERVE_MIB=1328: kubeReserved 600 + systemReserved 400 +
+          # evictionHard 200 + slurmd request 128. Pinned in EC2NodeClass
+          # kubelet block + matching --kubelet-arg= flags in INSTALL_K3S_EXEC.
+          # If you change either, update both.
+          TOTAL_CPU=$(nproc)
+          TOTAL_MEM_MIB=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+          USABLE_CPU=$((TOTAL_CPU - 1))
+          USABLE_MEM_MIB=$((TOTAL_MEM_MIB - 1328))
+          CONF_ARGS="$CONF_ARGS CPUs=$USABLE_CPU RealMemory=$USABLE_MEM_MIB"
+
+          # Advertise NVMe RAID0 scratch capacity to slurmctld so jobs
+          # submitted with `--tmp=N` only land on nodes with enough
+          # instance-store room. Karpenter EC2NodeClass userData has
+          # already bind-mounted the RAID0 xfs at /mnt/scratch on NVMe-bearing
+          # families; on NVMe-less families /mnt/scratch is absent and we
+          # skip the advertisement (Slurm treats missing TmpDisk as 0).
+          if mountpoint -q /mnt/scratch; then
+            TMPMIB=$(($(stat -f -c '%a*%S' /mnt/scratch) / 1048576))
+            CONF_ARGS="$CONF_ARGS TmpDisk=$TMPMIB"
+          fi
+
+          if [ "$EXPECTED" = "gpu" ]; then
+            GPU_COUNT=$(ls /dev/nvidia[0-9]* 2>/dev/null | wc -l)
+            [ "$GPU_COUNT" -lt 1 ] && GPU_COUNT=1
+            if [ -n "$GPU_MODEL" ]; then
+              CONF_ARGS="$CONF_ARGS Gres=gpu:${GPU_MODEL}:${GPU_COUNT}"
+            else
+              CONF_ARGS="$CONF_ARGS Gres=gpu:${GPU_COUNT}"
+            fi
+
+            # Slurm rejects "file-less" GRES advertisements with a
+            # "Ignoring file-less GPU gpu:..." warning unless gres.conf
+            # describes the device files. Emit a minimal gres.conf with
+            # one File= line per detected /dev/nvidia* device. /etc/slurm
+            # is writable in the container layer (only individual files
+            # under it are read-only via subPath mounts), so this works
+            # alongside the configmap-mounted slurm.conf and cgroup.conf.
+            : > /etc/slurm/gres.conf
+            i=0
+            while [ "$i" -lt "$GPU_COUNT" ]; do
+              if [ -n "$GPU_MODEL" ]; then
+                echo "Name=gpu Type=$GPU_MODEL File=/dev/nvidia$i" >> /etc/slurm/gres.conf
+              else
+                echo "Name=gpu File=/dev/nvidia$i" >> /etc/slurm/gres.conf
+              fi
+              i=$((i+1))
+            done
+          fi
+
+          # billing: --instance-type/--instance-id populate first-class fields
+          # in slurmrestd /v0.0.44/nodes/; --extra carries lifecycle (the one
+          # bit not modeled as a slurmd flag). cluster-api reads these on
+          # every sync tick to derive per-job and cluster-total cost.
+          exec slurmd -Z -N $NODE_NAME --conf "$CONF_ARGS" \
+            --instance-type "$ITYPE" --instance-id "$IID" \
+            --extra "lifecycle=$LIFE" -D
+        securityContext:
+          privileged: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        # Activate the nvidia-container-runtime hook so host nvidia-smi
+        # and CUDA userspace libs are bind-mounted into the container on
+        # GPU nodes. No-op on CPU nodes (hook ignores when no /dev/nvidia*).
+        # `utility` covers nvidia-smi; `compute` covers CUDA libs needed
+        # by jobs (e.g. apptainer --nv, nccl).
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
+        # Cross-node SIF library — final, fully-built `.sif` files only.
+        # Populated lazily; first job to pull writes, subsequent jobs across
+        # all nodes reuse. Hardlink-heavy unpack does NOT happen here — that
+        # is staged per-job onto NVMe (or per-job EFS scratch) by
+        # /etc/clusterra/{prolog,task_prolog}.sh, which export
+        # APPTAINER_TMPDIR + APPTAINER_CACHEDIR onto the per-job root. The
+        # interactive templates (jupyter/nodered/rapids-singlecell) keep
+        # their own node-local SIF stash at /var/lib/apptainer/sif-cache
+        # (mounted below) — they reference it explicitly, so it isn't the
+        # default cache for batch jobs.
+        - name: NXF_SINGULARITY_CACHEDIR
+          value: "/mnt/efs/nxf-cache/_lib"
+        - name: SLURMCTLD_HOST
+          value: {{ .Values.slurmctldHost | quote }}
+        - name: CLUSTERRA_API
+          value: {{ .Values.edgeAgent.centralApiUrl | quote }}
+        - name: CLUSTER_ID
+          value: {{ .Values.clusterId | quote }}
+        - name: CLUSTERRA_INTERNAL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: clusterra-internal-token
+              key: token
+              optional: true
+        # Resource requests only, NO limits — slurmd reads /proc to detect
+        # full node resources. Limits would restrict cgroup visibility.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        lifecycle:
+          # On spot reclaim / Karpenter disruption, mark the node DRAIN so
+          # slurmctld stops scheduling new steps, then wait up to ~110s (within
+          # the 120s grace window) for in-flight steps to finish. Finally flip
+          # to DOWN so any remaining step is reaped with exit 143/247 — which
+          # Nextflow's errorStrategy treats as retryable. `scontrol delete`
+          # (the previous behaviour) wiped the node before slurmctld could
+          # close out the step, producing NODE_FAIL which Nextflow does not
+          # retry.
+          preStop:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  scontrol update node=$NODE_NAME state=DRAIN reason="spot-or-karpenter-disruption"
+                  for i in $(seq 1 110); do
+                    STATE=$(scontrol show node=$NODE_NAME -o | grep -oE 'State=[^ ]+' | cut -d= -f2)
+                    case "$STATE" in
+                      *IDLE*|*DRAINED*|*DOWN*) break ;;
+                    esac
+                    sleep 1
+                  done
+                  scontrol update node=$NODE_NAME state=DOWN reason="terminating"
+                  # Dynamic-node hygiene: delete the entry so the partition
+                  # bitmap doesn't accumulate ghost nodes. The orphan sweep in
+                  # cluster-api (scaling/worker.go sweepOrphanSlurmNodes) is the
+                  # backstop if preStop is skipped on hard kills.
+                  scontrol delete node=$NODE_NAME || true
+        volumeMounts:
+        - name: slurmd-conf
+          mountPath: /etc/slurm/slurm.conf
+          subPath: slurm.conf
+          readOnly: true
+        - name: slurmd-conf
+          mountPath: /etc/slurm/cgroup.conf
+          subPath: cgroup.conf
+          readOnly: true
+        - name: slurm-key
+          mountPath: /etc/slurm/slurm.key
+          subPath: slurm.key
+          readOnly: true
+        # dockerconfigjson from the same secret kubelet uses for the slurmd
+        # image pull; surfaced here so sbatch scripts that run apptainer
+        # against private ghcr images (e.g. notebook:dev) can extract the
+        # auth token and set APPTAINER_DOCKER_{USERNAME,PASSWORD}. Shared
+        # fleet PAT — no per-user creds inside jobs.
+        - name: ghcr-pull
+          mountPath: /etc/clusterra/ghcr
+          readOnly: true
+        - name: efs-scratch
+          mountPath: /mnt/efs
+        # Instance-store NVMe RAID0 scratch (Karpenter instanceStorePolicy=
+        # RAID0). DirectoryOrCreate so slurmd pods on NVMe-less nodes still
+        # start — the host has no /mnt/scratch in that case, kubelet creates
+        # an empty dir on the EBS root, and slurmd's TmpDisk advertisement
+        # (above) is omitted so the scheduler won't land --tmp= jobs there.
+        - name: nvme-scratch
+          mountPath: /mnt/scratch
+        # Mountpoint-for-S3 view of s3://ngi-igenomes (read-only, mounted at
+        # boot by Karpenter userData — see stage-b-k8s/main.tf). HostToContainer
+        # propagation is required so the FUSE mount entry made on the host
+        # surfaces inside this pod's mount namespace; without it the path
+        # appears as an empty directory and Nextflow re-stages from S3.
+        - name: s3-refs
+          mountPath: /mnt/s3-refs
+          readOnly: true
+          mountPropagation: HostToContainer
+        # Node-local SIF cache for interactive templates (Jupyter). First job
+        # on a Karpenter node pays the apptainer pull + mksquashfs cost once;
+        # every subsequent job reuses the cached SIF. hostPath so the cache
+        # survives slurmd pod restarts and is shared across concurrent jobs
+        # on the same node.
+        - name: apptainer-sif-cache
+          mountPath: /var/lib/apptainer/sif-cache
+        # PyTorch DataLoader workers + NCCL collectives mmap into /dev/shm.
+        # The container runtime's default 64 MiB tmpfs bus-errors any
+        # non-trivial batch (jobs 2095/2101, OF3 prep, May 12 2026). Apptainer
+        # inherits this from slurmd's namespace, so the fix has to land here
+        # rather than per-template. 8 GiB is enough headroom for L40s/A10G/H100
+        # single-GPU shapes; bump if 4×/8× shapes start OOM-ing collectives.
+        # Counts against pod memory limit, but there is no limit set (see
+        # resources: requests-only above) so this is effectively node memory.
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: slurmd-conf
+        configMap:
+          name: slurmd-conf
+          items:
+          - key: slurm.conf
+            path: slurm.conf
+          - key: cgroup.conf
+            path: cgroup.conf
+      - name: slurm-key
+        secret:
+          secretName: slurm-secret
+          defaultMode: 0400
+          items:
+          - key: slurm.key
+            path: slurm.key
+      - name: ghcr-pull
+        secret:
+          secretName: ghcr-pull
+          defaultMode: 0444
+          items:
+          - key: .dockerconfigjson
+            path: config.json
+      - name: efs-scratch
+        hostPath:
+          path: /mnt/efs
+          type: DirectoryOrCreate
+      - name: nvme-scratch
+        hostPath:
+          path: /mnt/scratch
+          type: DirectoryOrCreate
+      - name: apptainer-sif-cache
+        hostPath:
+          path: /var/lib/apptainer/sif-cache
+          type: DirectoryOrCreate
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+      - name: s3-refs
+        hostPath:
+          path: /mnt/s3-refs
+          type: Directory

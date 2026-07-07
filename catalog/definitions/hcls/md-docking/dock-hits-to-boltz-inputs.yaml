@@ -1,0 +1,349 @@
+id: dock-hits-to-boltz-inputs
+name: Rank docks → Boltz-2 inputs
+description: |
+  Drug-discovery bridge: rank Uni-Dock poses by Vina score, take the top-K
+  hits, and emit per-complex Boltz-2 YAML inputs (protein + ligand SMILES)
+  with the affinity head enabled.
+
+  Pipeline:
+    1. Glob `*_out.pdbqt` files under dock_dir (Uni-Dock per-pose output).
+    2. Parse REMARK VINA RESULT from each to extract docking score.
+    3. Join on the ligand library manifest (filename → SMILES, source_id).
+    4. Apply Lipinski / Veber filters (optional, off by default to keep
+       the bench cohort intact; recipe authors enable for real screens).
+    5. Sort by ascending score; take top-K.
+    6. Write boltz-inputs/<rank>_<source_id>.yaml — one per top-K hit.
+    7. Write outputs.json with picked / rejected provenance.
+
+  Boltz-2 input YAML shape (v2.0+ schema):
+    version: 1
+    sequences:
+      - protein: {id: A, sequence: <one-letter codes>}
+      - ligand:  {id: L, smiles: <SMILES>}
+    properties:
+      - affinity: {binder: L}
+
+  outputs.json schema (v1):
+    boltz_inputs_dir: absolute path to boltz-inputs/
+    picked:           [{rank, source_id, score_kcal_mol, pdbqt_path, yaml_path, smiles}]
+    rejected:         [{source_id, reason}]
+    metadata:         {dock_dir, manifest_path, n_total_poses, top_k,
+                       score_threshold, lipinski_filter, source_protein}
+
+  Precondition: ligand library directory must ship a `manifest.csv` with
+  columns `filename,smiles,source_id` (at minimum). drug-disco-bench-prep
+  stages exactly this layout for the bench fixture; new libraries must
+  follow the same shape.
+
+  Pair with: unidock (or autodock-gpu / gnina) upstream; boltz-2-affinity
+  downstream.
+
+vertical: hcls
+category: drug-discovery
+workload_group: md-docking
+modality: form
+tools: [Python, RDKit]
+ready: true
+kind: batch
+display: connector
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: python:3.11
+  cache_dir: /mnt/efs/_dock-hits-to-boltz-venv
+  entrypoint: python
+  requirements:
+    - "rdkit==2024.9.3"
+    - "pyyaml==6.0.2"
+  notes: |
+    rdkit for SMILES canonicalization + Lipinski/Veber descriptors; pyyaml
+    for emitting Boltz-2 YAML inputs. Persistent EFS venv; flock-guarded
+    first-run.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=4G
+  #SBATCH --time=0:20:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: dock_dir
+    role: generic_path
+    required: true
+    description: |
+      Directory of Uni-Dock per-pose `<name>_out.pdbqt` files (with
+      REMARK VINA RESULT lines). When wired downstream of unidock in a
+      workflow, set this to
+      /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-<dock-step>.
+
+  - key: ligand_manifest
+    role: generic_path
+    required: true
+    description: |
+      Path to a CSV with columns `filename,smiles,source_id` (extra
+      columns ignored). The `filename` column joins back to dock_dir's
+      `<name>_out.pdbqt` via stem-match (filename minus extension matches
+      pose stem minus `_out`).
+
+  - key: bridge_outputs_json
+    role: generic_path
+    required: true
+    description: |
+      Path to cif-to-receptor-pdbqt's outputs.json (carries the protein
+      sequence the Boltz-2 YAMLs need). When wired downstream of
+      prep-receptor in a workflow, set to
+      /mnt/efs/{{.ctx.user_email}}/{{.ctx.workflow_run_id}}/step-prep-receptor/outputs.json.
+
+parameters:
+  - key: top_k
+    label: Top-K hits to rescore
+    widget: number
+    default: 100
+    min: 1
+    max: 1000
+    description: |
+      How many ranked Uni-Dock hits to forward to Boltz-2. The
+      drug-discovery bench cohort uses 100 (matches the bench fixture);
+      production screens commonly use 50-500.
+
+  - key: score_threshold
+    label: Score threshold (kcal/mol; negative)
+    widget: number
+    default: 0.0
+    min: -20.0
+    max: 0.0
+    description: |
+      Minimum docking score (more negative = better binding). 0.0 keeps
+      every pose; -8.0 typically filters to "kinase-grade" hits. Applied
+      BEFORE the top-K cut.
+
+  - key: lipinski_filter
+    label: Apply Lipinski rule-of-5 filter
+    widget: bool
+    default: false
+    description: |
+      MW≤500, logP≤5, HBD≤5, HBA≤10. Drops violations before top-K.
+      Default off so the bench cohort stays intact for cost-per-run
+      comparability. Real screens often want this on.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/dock-hits-to-boltz-inputs-{{.ctx.run_id}}"
+  artifacts:
+    - key: boltz_inputs
+      path: "{{.outputs.dir}}/boltz-inputs"
+      role: primary_output
+    - key: provenance
+      path: "{{.outputs.dir}}/outputs.json"
+      role: generic
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  export OUTPUT_DIR
+
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  export PIP_CACHE_DIR=/mnt/efs/_dock-hits-to-boltz-pip-cache
+  mkdir -p "$PIP_CACHE_DIR" "$(dirname "$VENV_DIR")"
+
+  IMAGE="docker://{{.runtime.base_image}}"
+
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+      apptainer exec "$IMAGE" bash -c "
+        set -euo pipefail
+        python{{.runtime.python_version}} -m venv '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' \
+          {{range .runtime.requirements}}'{{.}}' {{end}}
+      "
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  SCRIPT_PATH="$OUTPUT_DIR/bridge.py"
+  cat > "$SCRIPT_PATH" <<'__BRIDGE_PY_EOF__'
+  import csv
+  import json
+  import os
+  import pathlib
+  import re
+  import sys
+  from datetime import datetime, timezone
+
+  import yaml
+  from rdkit import Chem
+  from rdkit.Chem import Crippen, Descriptors, Lipinski
+
+  OUTPUT_DIR = pathlib.Path(os.environ["OUTPUT_DIR"])
+  BOLTZ_DIR = OUTPUT_DIR / "boltz-inputs"
+  BOLTZ_DIR.mkdir(parents=True, exist_ok=True)
+
+  DOCK_DIR = pathlib.Path(os.environ["BRIDGE_DOCK_DIR"])
+  MANIFEST = pathlib.Path(os.environ["BRIDGE_MANIFEST"])
+  PREP_JSON = pathlib.Path(os.environ["BRIDGE_PREP_JSON"])
+  TOP_K = int(os.environ.get("BRIDGE_TOP_K") or "100")
+  SCORE_THRESHOLD = float(os.environ.get("BRIDGE_SCORE_THRESHOLD") or "0.0")
+  LIPINSKI = (os.environ.get("BRIDGE_LIPINSKI", "false").lower() == "true")
+
+  # 1. Load upstream protein sequence from the receptor prep bridge.
+  if not PREP_JSON.is_file():
+      sys.exit(f"bridge: upstream prep outputs.json not found: {PREP_JSON}")
+  prep_out = json.loads(PREP_JSON.read_text())
+  protein_seq = prep_out.get("protein_sequence", "").strip()
+  if not protein_seq:
+      sys.exit(f"bridge: upstream prep outputs.json missing 'protein_sequence'")
+  print(f"protein sequence: {len(protein_seq)} aa", flush=True)
+
+  # 2. Load ligand library manifest (filename → SMILES + source_id).
+  if not MANIFEST.is_file():
+      sys.exit(f"bridge: ligand manifest not found: {MANIFEST}")
+  manifest = {}
+  with MANIFEST.open() as f:
+      reader = csv.DictReader(f)
+      for row in reader:
+          filename = (row.get("filename") or "").strip()
+          smiles = (row.get("smiles") or "").strip()
+          source_id = (row.get("source_id") or "").strip() or filename
+          if not filename or not smiles:
+              continue
+          stem = pathlib.Path(filename).stem  # strip .pdbqt
+          manifest[stem] = {"smiles": smiles, "source_id": source_id}
+  if not manifest:
+      sys.exit(f"bridge: manifest at {MANIFEST} loaded zero rows; check columns: filename,smiles,source_id")
+  print(f"manifest: {len(manifest)} ligands", flush=True)
+
+  # 3. Glob dock poses, parse Vina scores.
+  pose_re = re.compile(r"REMARK VINA RESULT:\s+(-?\d+\.\d+)")
+  poses = []
+  for pose_file in sorted(DOCK_DIR.glob("*_out.pdbqt")):
+      stem = pose_file.stem.removesuffix("_out")
+      lig = manifest.get(stem)
+      if not lig:
+          continue
+      with pose_file.open() as f:
+          head = f.read(4096)
+      m = pose_re.search(head)
+      if not m:
+          continue
+      score = float(m.group(1))
+      poses.append({
+          "stem": stem,
+          "source_id": lig["source_id"],
+          "smiles": lig["smiles"],
+          "score": score,
+          "pdbqt_path": str(pose_file),
+      })
+  if not poses:
+      sys.exit(f"bridge: no scorable poses found under {DOCK_DIR} matching manifest stems")
+  print(f"scored poses: {len(poses)}", flush=True)
+
+  # 4. Score threshold filter (more negative = better binder).
+  rejected = []
+  filtered = []
+  for p in poses:
+      if p["score"] > SCORE_THRESHOLD:
+          rejected.append({"source_id": p["source_id"], "reason": f"score {p['score']:.2f} > threshold {SCORE_THRESHOLD:.2f}"})
+          continue
+      filtered.append(p)
+  print(f"after score filter: {len(filtered)}", flush=True)
+
+  # 5. Lipinski/Veber filter (optional).
+  if LIPINSKI:
+      kept = []
+      for p in filtered:
+          mol = Chem.MolFromSmiles(p["smiles"])
+          if mol is None:
+              rejected.append({"source_id": p["source_id"], "reason": "rdkit failed to parse SMILES"})
+              continue
+          mw = Descriptors.MolWt(mol)
+          logp = Crippen.MolLogP(mol)
+          hbd = Lipinski.NumHDonors(mol)
+          hba = Lipinski.NumHAcceptors(mol)
+          if mw > 500 or logp > 5 or hbd > 5 or hba > 10:
+              rejected.append({
+                  "source_id": p["source_id"],
+                  "reason": f"Lipinski violation (MW={mw:.0f}, logP={logp:.2f}, HBD={hbd}, HBA={hba})",
+              })
+              continue
+          kept.append(p)
+      filtered = kept
+      print(f"after Lipinski filter: {len(filtered)}", flush=True)
+
+  # 6. Sort by ascending score, take top-K.
+  filtered.sort(key=lambda p: p["score"])
+  picked = filtered[:TOP_K]
+  for p in filtered[TOP_K:]:
+      rejected.append({"source_id": p["source_id"], "reason": f"beyond top-{TOP_K}"})
+  print(f"picked top-{TOP_K}: {len(picked)}", flush=True)
+
+  # 7. Emit per-complex Boltz-2 YAMLs (affinity head on; Boltz writes its
+  #    MSA into the in-dir cache on first sighting of each unique chain).
+  picked_records = []
+  for rank, p in enumerate(picked, start=1):
+      safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", p["source_id"])
+      yaml_path = BOLTZ_DIR / f"{rank:03d}_{safe_id}.yaml"
+      complex_spec = {
+          "version": 1,
+          "sequences": [
+              {"protein": {"id": "A", "sequence": protein_seq}},
+              {"ligand":  {"id": "L", "smiles": p["smiles"]}},
+          ],
+          "properties": [
+              {"affinity": {"binder": "L"}},
+          ],
+      }
+      with yaml_path.open("w") as f:
+          yaml.safe_dump(complex_spec, f, sort_keys=False)
+      picked_records.append({
+          "rank": rank,
+          "source_id": p["source_id"],
+          "score_kcal_mol": p["score"],
+          "pdbqt_path": p["pdbqt_path"],
+          "yaml_path": str(yaml_path),
+          "smiles": p["smiles"],
+      })
+
+  # 8. Provenance manifest.
+  outputs = {
+      "schema_version": 1,
+      "produced_at": datetime.now(timezone.utc).isoformat(),
+      "boltz_inputs_dir": str(BOLTZ_DIR),
+      "picked": picked_records,
+      "rejected": rejected,
+      "metadata": {
+          "dock_dir": str(DOCK_DIR),
+          "manifest_path": str(MANIFEST),
+          "n_total_poses": len(poses),
+          "top_k": TOP_K,
+          "score_threshold": SCORE_THRESHOLD,
+          "lipinski_filter": LIPINSKI,
+          "source_protein": {
+              "sequence_len": len(protein_seq),
+              "source_outputs_json": str(PREP_JSON),
+          },
+      },
+  }
+  (OUTPUT_DIR / "outputs.json").write_text(json.dumps(outputs, indent=2))
+  print(f"outputs.json: {OUTPUT_DIR / 'outputs.json'}", flush=True)
+  print("DONE", flush=True)
+  __BRIDGE_PY_EOF__
+
+  export BRIDGE_DOCK_DIR={{.inputs.dock_dir | quote}}
+  export BRIDGE_MANIFEST={{.inputs.ligand_manifest | quote}}
+  export BRIDGE_PREP_JSON={{.inputs.bridge_outputs_json | quote}}
+  export BRIDGE_TOP_K={{.params.top_k}}
+  export BRIDGE_SCORE_THRESHOLD={{.params.score_threshold}}
+  export BRIDGE_LIPINSKI={{.params.lipinski_filter}}
+
+  cd "$OUTPUT_DIR"
+  exec apptainer exec --bind /mnt/efs "$IMAGE" \
+    "$VENV_DIR/bin/{{.runtime.entrypoint}}" "$SCRIPT_PATH" \
+    2>&1 | tee "$OUTPUT_DIR/stdout.log"

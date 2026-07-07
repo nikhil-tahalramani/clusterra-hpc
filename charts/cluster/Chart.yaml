@@ -1,0 +1,6 @@
+apiVersion: v2
+name: clusterra-cluster
+description: Per-tenant umbrella chart — renders ArgoCD child apps for Slurm and MariaDB
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

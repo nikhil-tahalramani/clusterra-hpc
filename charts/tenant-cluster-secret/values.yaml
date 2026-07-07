@@ -1,0 +1,5 @@
+# Required: tenant cluster_id (matches the SM secret path
+# clusterra/cluster/{clusterId}/kubeconfig and the ArgoCD cluster Secret name
+# tenant-{clusterId}). Set per-tenant by the tenant-cluster-secrets
+# ApplicationSet from the plugin generator.
+clusterId: ""

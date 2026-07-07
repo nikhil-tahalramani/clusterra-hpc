@@ -1,0 +1,34 @@
+id: cryoem-pipeline
+name: Cryo-EM pipeline
+description: |
+  Open-source cryo-EM structure determination:
+  RELION → Topaz → cryoDRGN → ModelAngelo.
+
+  Tool ordering varies by lab; this recipe pins the linear path. Users
+  with a Topaz-first workflow should compose their own chain via the
+  strip UI.
+
+vertical: hcls
+category: cryo-em
+workload_group: cryo-em
+modality: form
+tools: [RELION, Topaz, cryoDRGN, ModelAngelo]
+ready: true
+kind: workflow
+
+steps:
+  - step_id: relion
+    template_id: relion
+    display_name: RELION 3D refine
+  - step_id: topaz
+    template_id: topaz
+    display_name: Topaz pick
+    depends_on: [relion]
+  - step_id: cryodrgn
+    template_id: cryodrgn
+    display_name: cryoDRGN heterogeneity
+    depends_on: [topaz]
+  - step_id: modelangelo
+    template_id: modelangelo
+    display_name: ModelAngelo build
+    depends_on: [cryodrgn]

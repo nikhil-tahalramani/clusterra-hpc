@@ -1,0 +1,171 @@
+id: rawconvert
+name: Raw → mzML Convert (Thermo / Bruker)
+description: |
+  Step 1 of the scp-dia chain. Converts vendor-format LC-MS files to the open
+  mzML / HDF formats consumed by downstream search engines.
+
+  Two modes selected by the `vendor` parameter:
+    - thermo (default): ThermoRawFileParser 1.4.5 on `.raw` files. Apache-2.0,
+      mono + RawFileReader bundled. Container `quay.io/biocontainers/
+      thermorawfileparser:1.4.5--ha8f3691_0` (BioContainers pattern, verified
+      May 2026 — see memory `template_image_uri_lessons.md`).
+    - bruker: alphatims 1.0.8 (Apache-2.0) on `.d` directories. No upstream
+      container exists; installed into an EFS venv via the apptainer-exec +
+      pip pattern (memory `cap_pod_apptainer_build_blocked.md`).
+
+  Array-job native: every raw file under `input_dir` becomes one Slurm array
+  task. With `max_concurrent=32` a 1000-file PXD030604 batch finishes in
+  ~16 minutes (30 s/file × 1000 / 32-wide).
+
+  Output convention: writes per-file mzML / hdf into
+  $WORKFLOW_DIR/step-1-rawconvert/mzml/. Step-3 (dia-search) auto-discovers
+  by path.
+
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [ThermoRawFileParser, alphatims]
+ready: false
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://quay.io/biocontainers/thermorawfileparser:1.4.5--ha8f3691_0
+  notes: |
+    Bruker .d mode runs alphatims out of an EFS venv inside the SAME
+    image (apptainer-exec pip pattern). When `vendor=bruker`, the script
+    pulls condaforge/miniforge3 separately and skips the trfp container.
+    sha256 to be locked at first successful smoke; tag-only pin for now.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=4G
+  #SBATCH --time=0:15:00
+  #SBATCH --nodes=1
+  {{- if gt (int .params.file_count) 1 }}
+  #SBATCH --array=1-{{.params.file_count}}%{{.params.max_concurrent}}
+  {{- end }}
+
+inputs:
+  - key: input_dir
+    role: generic_path
+    required: true
+    description: |
+      EFS directory containing vendor files. For Thermo: `.raw` files (any
+      basename); for Bruker: `.d` directories. Manifest is enumerated by
+      `ls -1 $input_dir/*.{raw,d}` at task 0 and frozen to
+      $WORKFLOW_DIR/step-1-rawconvert/raw_manifest.txt; subsequent array
+      tasks read row N from that manifest.
+
+parameters:
+  - key: vendor
+    widget: enum
+    options: [thermo, bruker]
+    default: thermo
+    description: Selects ThermoRawFileParser (.raw) vs alphatims (.d).
+  - key: file_count
+    widget: number
+    default: 1
+    min: 1
+    max: 5000
+    description: |
+      Number of files in input_dir. >1 emits #SBATCH --array=1-N. Caller
+      should compute this from the manifest before submit; passing 1 runs
+      the first file solo.
+  - key: max_concurrent
+    widget: number
+    default: 32
+    min: 1
+    max: 256
+    description: Slurm array %K throttle. Bounds EFS read fan-out + spot ask.
+  - key: output_format
+    widget: enum
+    options: [mzml-indexed, mzml-noindex, mgf]
+    default: mzml-indexed
+    description: ThermoRawFileParser -f flag. Ignored for vendor=bruker.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/rawconvert-{{.ctx.run_id}}"
+  artifacts:
+    - key: manifest
+      path: "{{.outputs.dir}}/raw_manifest.txt"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_DIR={{.inputs.input_dir | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  VENDOR={{.params.vendor | quote}}
+  OUT_FORMAT={{.params.output_format | quote}}
+
+  # Workflow-mode awareness: when wired into the scp-dia chain, write to
+  # the per-workflow step dir so downstream steps can auto-discover. When
+  # launched standalone, fall back to outputs.dir.
+  STEP_DIR="${WORKFLOW_DIR:-$OUTPUT_DIR}/step-1-rawconvert"
+  [ "${WORKFLOW_DIR:-}" = "" ] && STEP_DIR="$OUTPUT_DIR"
+  mkdir -p "$STEP_DIR/mzml"
+  MANIFEST="$STEP_DIR/raw_manifest.txt"
+
+  # Manifest discovery — only task 1 writes it (or the solo run). Other
+  # array tasks block on its existence via a brief flock-style poll.
+  if [ "${SLURM_ARRAY_TASK_ID:-1}" = "1" ] || [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+    case "$VENDOR" in
+      thermo) find "$INPUT_DIR" -maxdepth 1 -name "*.raw" | sort > "$MANIFEST" ;;
+      bruker) find "$INPUT_DIR" -maxdepth 1 -type d -name "*.d" | sort > "$MANIFEST" ;;
+      *) echo "unknown vendor: $VENDOR" >&2; exit 2 ;;
+    esac
+    echo "[rawconvert] wrote manifest with $(wc -l < "$MANIFEST") entries"
+  else
+    for _ in $(seq 1 30); do
+      [ -s "$MANIFEST" ] && break
+      sleep 1
+    done
+    [ -s "$MANIFEST" ] || { echo "manifest never appeared: $MANIFEST" >&2; exit 3; }
+  fi
+
+  IDX="${SLURM_ARRAY_TASK_ID:-1}"
+  RAW=$(sed -n "${IDX}p" "$MANIFEST")
+  if [ -z "$RAW" ]; then
+    echo "[rawconvert] no manifest row $IDX (empty input_dir?); exiting clean"
+    exit 0
+  fi
+  BASE=$(basename "$RAW")
+  echo "[rawconvert] task $IDX → $BASE"
+
+  case "$VENDOR" in
+    thermo)
+      case "$OUT_FORMAT" in
+        mzml-indexed) F=2 ;;
+        mzml-noindex) F=1 ;;
+        mgf)          F=0 ;;
+        *) echo "bad output_format: $OUT_FORMAT" >&2; exit 2 ;;
+      esac
+      OUT="$STEP_DIR/mzml/${BASE%.raw}.mzML"
+      [ "$F" = "0" ] && OUT="$STEP_DIR/mzml/${BASE%.raw}.mgf"
+      apptainer exec "{{.runtime.image}}" \
+        ThermoRawFileParser -i="$RAW" -b="$OUT" -f=$F
+      ;;
+    bruker)
+      # alphatims venv pattern; first task pays the install, subsequent
+      # tasks reuse the EFS cache. See cap_pod_apptainer_build_blocked
+      # memory — no apptainer build --fakeroot on cap-pods.
+      VENV="/mnt/efs/_alphatims-venv/1.0.8"
+      MAMBA_ROOT="/mnt/efs/{{.ctx.user_email}}/_alphatims-mamba"
+      mkdir -p "$VENV" "$MAMBA_ROOT"
+      export HOME="$MAMBA_ROOT" MAMBA_ROOT_PREFIX="$MAMBA_ROOT"
+      OUT="$STEP_DIR/mzml/${BASE%.d}.hdf"
+      apptainer exec docker://condaforge/miniforge3 bash -c "
+        set -euo pipefail
+        export PYTHONUSERBASE=$VENV PIP_CACHE_DIR=$MAMBA_ROOT/pip-cache
+        mkdir -p \$PYTHONUSERBASE \$PIP_CACHE_DIR
+        python -c 'import alphatims' 2>/dev/null || pip install --user --quiet alphatims==1.0.8
+        python -m alphatims export hdf '$RAW' --output '$OUT'
+      "
+      ;;
+  esac
+
+  echo "[rawconvert] task $IDX complete: $OUT"

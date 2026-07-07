@@ -1,0 +1,241 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: slurm-{{ .Values.cluster.name }}
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    clusterra.io/cluster: {{ .Values.cluster.name }}
+    clusterra.io/component: slurm
+spec:
+  project: default
+  source:
+    chart: slurm
+    repoURL: {{ .Values.slurm.chart.repoURL }}
+    targetRevision: {{ .Values.slurm.chart.version | default "1.1.0" | quote }}
+    helm:
+      values: |
+        # Slinky chart v1.1.0 bug: vendor.nvidia.dcgm.enabled defaults to
+        # false, but the Go template helper treats the string "false" as
+        # truthy, so DCGM prolog/epilog scripts are always injected.
+        # Setting enabled to empty string works around this.
+        vendor:
+          nvidia:
+            dcgm:
+              enabled: ""
+        # Externally managed JWT key — prevents the operator from
+        # rotating the secret on every CR reconcile, which causes
+        # 511 cascades across slurmctld / restapi / cluster-api.
+        slurmKey:
+          create: false
+          secretRef:
+            name: clusterra-slurm-key
+            key: slurm.key
+        jwtKey:
+          create: false
+          secretRef:
+            name: clusterra-jwt-key
+            key: jwt.key
+        controller:
+          enabled: true
+          replicas: {{ .Values.slurm.controller.replicas }}
+          slurmctld:
+            image:
+              # Repo + tag come from envs/{env}/{regionShort}/images.yaml via
+              # the clusters ApplicationSet $values overlay. Slinky's chart
+              # consumes image as repo+tag (no digest support) — the tag is
+              # an immutable :sha-<short> bumped on every CI build.
+              repository: {{ .Values.slurmctldRepo | default "ghcr.io/nikhil-tahalramani/clusterra/slurmctld" | quote }}
+              tag: {{ .Values.slurmctldTag | default .Values.slurm.controller.slurmctld.imageTag | default "dev" | quote }}
+          persistence:
+            storageClass: {{ .Values.slurm.controller.storageClass }}
+          # /etc/hosts entry so the feasibility-ghost NodeName below resolves at
+          # slurmctld startup. Slurm 25.11 dropped `cloud_reg_addrs` (defunct);
+          # without a resolvable name, _set_node_addrs() fails getaddrinfo and
+          # silently drops the node from config_list — and the trap stays open.
+          # 192.0.2.1 (RFC 5737 TEST-NET-1) is never contacted: the CLOUD entry
+          # has no ResumeProgram so the scheduler never tries to allocate it.
+          #
+          # KEY PATH NOTE: must use `controller.podSpec.*` — Slinky's
+          # `format-podSpec` helper toYaml's the whole .spec verbatim into the
+          # Controller CR's spec.template.spec, then the operator does a
+          # StrategicMergePatch onto the rendered slurmctld pod. Earlier
+          # attempts via `controller.template.spec.hostAliases` silently
+          # dropped (that path isn't in the chart's whitelist). Verified
+          # against slinky-operator helm/slurm/templates/_helpers.tpl.
+          podSpec:
+            hostAliases:
+            - ip: "192.0.2.1"
+              hostnames:
+              - cloud-tpl-cpu
+              - cloud-tpl-gpu
+          # Pin SlurmdTimeout explicitly so the orphan-sweep logic in
+          # cluster-api (scaling/worker.go sweepOrphanSlurmNodes) has a
+          # predictable window after which a lost slurmd transitions to
+          # NOT_RESPONDING. Matches Slurm's default but surfaces it here so
+          # a future Slinky default change doesn't silently widen the
+          # ghost-node detection window. First-wins: if Slinky ever starts
+          # rendering SlurmdTimeout itself, this append becomes a no-op.
+          extraConf: |
+            SlurmdTimeout=300
+            # Per-job scratch on Karpenter-provisioned NVMe RAID0 (xfs).
+            # Slurm exports $TMPDIR=$TmpFS/$SLURM_JOB_ID for jobs that
+            # don't set their own. Customer slurmd advertises TmpDisk=<MiB>
+            # only on NVMe-bearing nodes, so --tmp=N pends on non-`*d`
+            # families until a `*d` is provisioned.
+            TmpFS=/mnt/scratch
+            # Raise array cap above Slurm's default 1001 so Nextflow pipelines
+            # using `process.array = 1000` (set in nextflow-pipeline.yaml) don't
+            # hit the limit on a single mid-size fan-out (e.g. Mutect2 scatter).
+            MaxArraySize=10000
+            # Enable typed GRES so `--gres=gpu:a10g:1` resolves against
+            # node-advertised `Gres=gpu:<model>:<count>` instead of being
+            # rejected at submit. slurmd entrypoint derives <model> from the
+            # EC2 instance type (see slurmd-daemonset.yaml).
+            GresTypes=gpu
+            # Dynamic slurmd registers with `--conf "Feature=cpu|gpu"` (Feature
+            # is a valid node-spec key; Partitions= is not). NodeSet resolves
+            # membership dynamically by Feature on every registration, so the
+            # partition bitmap tracks the fleet without any static Nodes= list.
+            # `-p cpu` validates at submit time against part_list regardless of
+            # how many nodes are registered, which fixes cold-start / scale-to-zero.
+            NodeSet=cpu Feature=cpu
+            NodeSet=gpu Feature=gpu
+            PartitionName=cpu Nodes=cpu Default=YES MaxTime=UNLIMITED State=UP
+            PartitionName=gpu Nodes=gpu             MaxTime=UNLIMITED State=UP
+            # Feasibility ghost: cons_tres rejects sbatch at submit when no
+            # registered node satisfies (CPU fits, mem exceeds → asymmetric trap
+            # in node_scheduler.c:_pick_best_nodes). With slurmd -Z the
+            # configured ceiling = the registered fleet's biggest shape, so a
+            # 2C/40G submit lands as "Memory specification can not be satisfied"
+            # instead of pending for the scaler. This entry sits in config_list
+            # with a generous CPU/RealMemory ceiling; Slurm auto-drains it
+            # (NOT_RESPONDING → DRAIN) so the scheduler never picks it. Hostname
+            # mapped via hostAliases above; without that, getaddrinfo() fails at
+            # slurmctld start and the entry is silently dropped. cluster-api
+            # filters this name from user-facing API responses (jobs reason text,
+            # node listings) so the literal "cloud-tpl-cpu" doesn't surface.
+            NodeName=cloud-tpl-cpu CPUs=2048 RealMemory=4194304 TmpDisk=4194304 Feature=cpu State=CLOUD
+            # GPU twin of the feasibility ghost. Sarek's PARABRICKS_FQ2BAM
+            # (process_high label = 12 CPU / 72 GB) submitted via Nextflow's
+            # slurm executor with --gres=gpu:<type>:1 hits the same cons_tres
+            # trap against the gpu partition: with no registered gpu node, the
+            # scheduler rejects at submit time with "Requested node
+            # configuration is not available" instead of pending for the scaler.
+            #
+            # Under GresTypes=gpu, untyped Gres=gpu:N does NOT satisfy typed
+            # submits like --gres=gpu:a10g:1 (cons_tres requires a node
+            # advertising the same typed resource). The ghost must therefore
+            # declare every GPU model real slurmd may register (see the
+            # ITYPE→GPU_MODEL switch in slurmd-daemonset.yaml). Comma-separated
+            # multi-typed Gres lets a single State=CLOUD entry satisfy any
+            # typed or untyped --gres=gpu:* submit. State=CLOUD + Feature=gpu
+            # auto-drains the node so the scheduler never tries to dispatch
+            # to it. cluster-api filters the name from API responses.
+            NodeName=cloud-tpl-gpu CPUs=2048 RealMemory=4194304 TmpDisk=4194304 Gres=gpu:a10g:8,gpu:l4:8,gpu:l40s:8,gpu:rtxpro6000:8,gpu:t4:8,gpu:v100:8,gpu:a100:8,gpu:h100:8,gpu:h200:8,gpu:b200:8,gpu:m60:8,gpu:v520:8 Feature=gpu State=CLOUD
+            # Persist user-set --comment to slurmdbd so the console can read
+            # it from /accounting/jobs (history tab). Without this flag,
+            # slurmctld accepts --comment but never ships it to accounting,
+            # leaving slurmdb's `comment.job` empty. The Nextflow template
+            # injects `--comment nf-parent-<headJobId>` on every child task
+            # for History-tab grouping (see nextflow-pipeline.yaml).
+            AccountingStoreFlags=job_comment
+            # Bundle the user's full passwd/group record into every launch
+            # credential so libnss_slurm on slurmd can serve getpwuid/getpwnam
+            # via the local sack socket. Removes the need for central to
+            # `kubectl exec` into each slurmd pod to seed /etc/passwd —
+            # apptainer-suid's host-side user.Lookup() inside the job step
+            # gets resolved by nss_slurm instead. Pairs with the nsswitch
+            # `slurm` splice in clusterra-slurmd/Dockerfile.
+            LaunchParameters=enable_nss_slurm
+            # NVMe-conditional TMPDIR. Prolog (root, per-job-per-node) creates
+            # /mnt/scratch/job-N on NVMe-bearing nodes (Karpenter `*d` families
+            # mkfs.xfs the raid in userData) and /mnt/efs/tmp/job-N elsewhere.
+            # TaskProlog runs as the user and prints `export TMPDIR=...` which
+            # Slurm splices into the task environment. Epilog rm -rf's the
+            # scratch dir (best-effort; tolerates already-deleted).
+            #
+            # Scripts ship in the clusterra-slurmd image at /etc/clusterra/*.sh
+            # — bumping them is a slurmd image roll, not a slurm.conf reload.
+            # Replaces ~30 lines of duplicated TMPDIR resolution bash that
+            # parabricks-deepvariant.yaml + happy-giab-validation.yaml carried.
+            Prolog=/etc/clusterra/prolog.sh
+            TaskProlog=/etc/clusterra/task_prolog.sh
+            Epilog=/etc/clusterra/epilog.sh
+          # NodePort exposure for customer slurmd over VPC peering lives in
+          # slurm-controller-nodeport.yaml, a chart-owned Service alongside
+          # the operator-managed ClusterIP. Overriding controller.service
+          # here tripped a dup-port-name bug in the Slinky operator's
+          # port merge that blocked Service creation entirely.
+        nodesets:
+          slinky:
+            enabled: false
+        # Suppress Slinky's default `all` partition (Nodes=ALL, Default=YES).
+        # Our Feature-based cpu/gpu NodeSets in extraConf above are the
+        # canonical partitions — see internal design notes.
+        partitions:
+          all:
+            enabled: false
+        accounting:
+          enabled: true
+          replicas: {{ .Values.slurm.accounting.replicas }}
+        mariadb:
+          enabled: false
+        restapi:
+          enabled: true
+          replicas: {{ .Values.slurm.restapi.replicas }}
+          # slurmrestd has a known upstream RSS-growth issue (SchedMD bug
+          # 16976) — long-lived daemon, per-thread glibc arenas retain freed
+          # allocations, RSS climbs monotonically with request volume. On a
+          # t4g.medium central, it hit 800MB in ~10min and OOM-killed
+          # cluster-api repeatedly. Two-part containment:
+          #
+          #   MALLOC_ARENA_MAX=2 caps glibc arenas (default 8×CPU) so freed
+          #   memory actually returns to the OS; standard fix for
+          #   multithreaded C daemons.
+          #
+          #   resources.limits.memory=384Mi lets kubelet OOM-restart the pod
+          #   before it eats the node. Restart is ~5s; cluster-api retries
+          #   transparently. Combined with the cluster-api response cache,
+          #   restarts should be rare (>1/day) and invisible to users.
+          slurmrestd:
+            env:
+              - name: MALLOC_ARENA_MAX
+                value: "2"
+            resources:
+              requests:
+                memory: 128Mi
+              limits:
+                memory: 384Mi
+        # Login pod lives on customer K3s (fleet/charts/customer-workloads/
+        # templates/login-deployment.yaml) — Slinky LoginSet disabled here.
+        #
+        # Per-job cost stamping (admin_comment) used to live here as a
+        # PrologSlurmctld bash script. It was deleted: slurmctld either
+        # didn't invoke the script reliably or reaped its detached subshell
+        # before the `scontrol update` could land, even with `setsid`.
+        # Stamping now happens in cluster-api's scaling worker
+        # (scaling/worker.go: stampJobAdminComments) which runs every 20s
+        # with full slurm-client access — same end result, no foreign-land
+        # bash-in-YAML-in-operator wiring.
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: {{ .Values.cluster.name }}
+  ignoreDifferences:
+    - group: slinky.slurm.net
+      kind: Controller
+      jqPathExpressions:
+        - .spec.external
+        - .spec.epilogSlurmctldScriptRefs
+        - .spec.prologSlurmctldScriptRefs
+        - .spec.persistence.storageClass
+    - kind: Secret
+      jsonPointers:
+        - /data
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

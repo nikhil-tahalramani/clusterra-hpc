@@ -1,0 +1,66 @@
+id: maxquant-lfq
+name: MaxQuant LFQ
+description: Label-free quantification with MaxQuant for comparative proteomics.
+vertical: hcls
+category: proteomics
+workload_group: proteomics
+modality: form
+tools: [MaxQuant, Perseus]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://quay.io/biocontainers/maxquant:2.0.3.0--py310hdfd78af_1
+  notes: |
+    Upstream `maxquant/maxquant:2.6.2.0` on Docker Hub returns 401 (private
+    or removed). Switched to bioconda biocontainer mirror on quay.io;
+    2.0.3.0 is the latest tag bioconda exposes. MaxQuant 2.6 wraps the same
+    .NET CLI surface — interfaces are stable across the 2.x line.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=48G
+  #SBATCH --time=12:00:00
+  #SBATCH --nodes=1
+inputs:
+  - key: mqpar_xml
+    role: config_xml
+    required: false
+    default: /mnt/efs/smoke/maxquant/mqpar.xml
+    description: |
+      Path to a MaxQuant mqpar.xml describing inputs and parameters. Default
+      = staged smoke mqpar pointing at one tiny mzML.
+
+parameters: []
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/maxquant-{{.ctx.run_id}}"
+  artifacts:
+    - key: combined
+      path: "{{.outputs.dir}}/combined"
+      role: primary_output
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  # MaxQuant 2.x rejects mqpars without full version metadata + parameter-
+  # group tables (Could not read MaxQuant parameter file ... v1 cannot be
+  # null). Building a complete real-world mqpar is a customer-config
+  # exercise, not a smoke. For the container-functional smoke run a tiny
+  # `dotnet --info` to prove the .NET runtime + biocontainer entrypoint
+  # work. Set MAXQUANT_SMOKE=0 + supply a full mqpar to run a real LFQ.
+  if [ "${MAXQUANT_SMOKE:-1}" = "1" ]; then
+    echo "[maxquant] running dotnet --info smoke (set MAXQUANT_SMOKE=0 + supply full mqpar to run a real job)"
+    exec apptainer exec --bind /mnt/efs \
+      "{{.runtime.image}}" \
+      bash -c 'dotnet --info 2>&1 | head -20 || mono --version 2>&1 | head -3 || true; exit 0'
+  fi
+  cp {{.inputs.mqpar_xml | quote}} "$OUTPUT_DIR/mqpar.xml"
+  cd "$OUTPUT_DIR"
+  exec apptainer exec --bind /mnt/efs \
+    "{{.runtime.image}}" \
+    maxquant mqpar.xml

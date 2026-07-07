@@ -1,0 +1,278 @@
+id: admet-ai-filter
+name: ADMET-AI property filter
+description: |
+  Stage-0 developability filter for a compound library. Runs ADMET-AI
+  (Swanson et al., MIT-licensed; the highest-average-rank model on the TDC
+  ADMET benchmark) over a SMILES manifest and emits ~41 ADMET endpoints
+  (solubility, Caco-2 / PAMPA permeability, hERG, the CYP isoform panel,
+  clearance, half-life, AMES, DILI, ClinTox, …) plus 8 RDKit physchem
+  descriptors and DrugBank-percentile context — in one CPU pass.
+
+  Pipeline:
+    1. Load the ligand library manifest (filename,smiles,source_id).
+    2. Canonicalize SMILES with RDKit; drop unparseable rows (reported).
+    3. ADMETModel.predict() over the batch (CPU; ~1M mols/~3 h on the authors'
+       hardware, so a screening cohort is minutes).
+    4. Annotate every molecule with all endpoints → admet.csv.
+    5. Optional HARD FILTER (off by default): drop molecules whose
+       toxicity-risk probabilities exceed configured thresholds. Survivors
+       are written to manifest_filtered.csv with the SAME columns as the
+       input manifest, so it drops straight into the docking step.
+    6. outputs.json with picked / rejected provenance.
+
+  IMPORTANT — treat outputs as TRIAGE/RANK signals, not absolute predictions.
+  ADMET-AI is best-average-rank, not best-on-every-endpoint: lipophilicity /
+  solubility / permeability / CYP-inhibition / hERG are usable for ranking;
+  clearance / half-life and small-dataset tox endpoints carry large error.
+  Use the filter to KILL obviously bad molecules, never to CERTIFY good ones.
+
+  Pin: this template installs the current `admet-ai` (Chemprop v2 backbone).
+  Predictions will not bit-match the v1 paper/web server; the version is
+  stamped into outputs.json for provenance.
+
+  Precondition: manifest CSV with columns `filename,smiles,source_id` (extra
+  columns ignored) — the same shape drug-disco-bench-prep stages and that
+  dock-hits-to-boltz-inputs joins on. Pair with: unidock / autodock-gpu /
+  gnina downstream (filtered manifest → docking).
+vertical: hcls
+category: drug-discovery
+workload_group: md-docking
+modality: form
+tools: [ADMET-AI, RDKit, Python]
+ready: true
+kind: batch
+display: connector
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: python:3.11
+  cache_dir: /mnt/efs/_admet-ai-venv
+  entrypoint: python
+  requirements:
+    - "admet-ai==1.4.0"
+    - "rdkit==2024.9.3"
+  notes: |
+    admet-ai pulls chemprop + torch (CPU wheels are fine — no GPU needed).
+    Persistent EFS venv, flock-guarded first-run (~5-8 min cold). rdkit for
+    SMILES canonicalization and the unparseable-row guard.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: ligand_manifest
+    role: generic_path
+    required: true
+    description: |
+      CSV with columns `filename,smiles,source_id` (extra columns ignored).
+      The full compound library to filter. When wired in a workflow, point
+      at the library manifest staged for the campaign.
+
+parameters:
+  - key: filter_mode
+    label: Apply hard ADMET filter
+    widget: bool
+    default: false
+    description: |
+      false = annotate only (admet.csv produced, manifest_filtered.csv = a
+      copy of the input). true = drop molecules exceeding the toxicity-risk
+      thresholds below. Default off so the cohort stays intact for
+      cost-per-run comparability; turn ON for a real screen.
+  - key: max_herg
+    label: Max hERG blocker probability
+    widget: number
+    default: 0.7
+    min: 0.0
+    max: 1.0
+    description: |
+      Drop molecules with predicted hERG-blocker probability above this
+      (cardiotox liability). Only applied when filter_mode is on.
+  - key: max_ames
+    label: Max AMES mutagenicity probability
+    widget: number
+    default: 0.7
+    min: 0.0
+    max: 1.0
+    description: Drop predicted mutagens above this probability. filter_mode only.
+  - key: max_dili
+    label: Max DILI (liver injury) probability
+    widget: number
+    default: 0.7
+    min: 0.0
+    max: 1.0
+    description: Drop predicted hepatotox above this probability. filter_mode only.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/admet-ai-filter-{{.ctx.run_id}}"
+  artifacts:
+    - key: admet_table
+      path: "{{.outputs.dir}}/admet.csv"
+      role: primary_output
+    - key: manifest_filtered
+      path: "{{.outputs.dir}}/manifest_filtered.csv"
+      role: generic
+    - key: provenance
+      path: "{{.outputs.dir}}/outputs.json"
+      role: generic
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  export OUTPUT_DIR
+
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  export PIP_CACHE_DIR="${TMPDIR:-/tmp}/pip-cache-admet"
+  mkdir -p "$PIP_CACHE_DIR" "$(dirname "$VENV_DIR")"
+
+  SIF_DIR=/mnt/efs/_apt-sifs
+  mkdir -p "$SIF_DIR"
+  IMAGE="$SIF_DIR/python-3.11.sif"
+  [ -f "$IMAGE" ] || apptainer pull "$IMAGE" docker://{{.runtime.base_image}} 2>&1 | tail -3
+
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+      apptainer exec "$IMAGE" bash -c "
+        set -euo pipefail
+        python{{.runtime.python_version}} -m venv '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' \
+          {{range .runtime.requirements}}'{{.}}' {{end}}
+      "
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  SCRIPT_PATH="$OUTPUT_DIR/admet_filter.py"
+  cat > "$SCRIPT_PATH" <<'__ADMET_PY_EOF__'
+  import csv, json, os, pathlib
+  from datetime import datetime, timezone
+
+  from rdkit import Chem
+  from admet_ai import ADMETModel
+
+  OUTPUT_DIR = pathlib.Path(os.environ["OUTPUT_DIR"])
+  MANIFEST = pathlib.Path(os.environ["ADMET_MANIFEST"])
+  FILTER_MODE = os.environ.get("ADMET_FILTER_MODE", "false").lower() == "true"
+  MAX_HERG = float(os.environ.get("ADMET_MAX_HERG") or "0.7")
+  MAX_AMES = float(os.environ.get("ADMET_MAX_AMES") or "0.7")
+  MAX_DILI = float(os.environ.get("ADMET_MAX_DILI") or "0.7")
+
+  if not MANIFEST.is_file():
+      raise SystemExit(f"admet: manifest not found: {MANIFEST}")
+
+  # 1-2. Load manifest, canonicalize SMILES, drop unparseable.
+  rows, rejected = [], []
+  with MANIFEST.open() as f:
+      reader = csv.DictReader(f)
+      in_fields = reader.fieldnames or []
+      for r in reader:
+          smi = (r.get("smiles") or "").strip()
+          sid = (r.get("source_id") or r.get("filename") or "").strip()
+          if not smi:
+              rejected.append({"source_id": sid, "reason": "empty SMILES"})
+              continue
+          mol = Chem.MolFromSmiles(smi)
+          if mol is None:
+              rejected.append({"source_id": sid, "reason": "rdkit parse failed"})
+              continue
+          r["_smiles_canon"] = Chem.MolToSmiles(mol)
+          rows.append(r)
+  if not rows:
+      raise SystemExit(f"admet: manifest loaded zero usable rows; need columns filename,smiles,source_id")
+  print(f"manifest: {len(rows)} parseable / {len(rejected)} rejected", flush=True)
+
+  # 3. ADMET-AI batch predict.
+  model = ADMETModel()
+  smiles_list = [r["_smiles_canon"] for r in rows]
+  preds = model.predict(smiles=smiles_list)  # DataFrame indexed by SMILES
+  print(f"admet-ai: predicted {preds.shape[1]} endpoints", flush=True)
+
+  def col(df, smi, *names):
+      for n in names:
+          if n in df.columns:
+              try:
+                  return float(df.loc[smi, n])
+              except Exception:
+                  pass
+      return None
+
+  # 4. Annotate -> admet.csv (manifest cols + every endpoint).
+  endpoint_cols = list(preds.columns)
+  admet_csv = OUTPUT_DIR / "admet.csv"
+  with admet_csv.open("w", newline="") as f:
+      w = csv.writer(f)
+      w.writerow(["source_id", "smiles"] + endpoint_cols)
+      for r in rows:
+          smi = r["_smiles_canon"]
+          sid = (r.get("source_id") or r.get("filename") or "").strip()
+          w.writerow([sid, smi] + [preds.loc[smi, c] for c in endpoint_cols])
+  print(f"admet.csv -> {admet_csv}", flush=True)
+
+  # 5. Optional hard filter on tox-risk probabilities.
+  survivors = []
+  for r in rows:
+      smi = r["_smiles_canon"]
+      sid = (r.get("source_id") or r.get("filename") or "").strip()
+      if FILTER_MODE:
+          herg = col(preds, smi, "hERG", "hERG_blocker")
+          ames = col(preds, smi, "AMES")
+          dili = col(preds, smi, "DILI")
+          why = []
+          if herg is not None and herg > MAX_HERG: why.append(f"hERG {herg:.2f}>{MAX_HERG}")
+          if ames is not None and ames > MAX_AMES: why.append(f"AMES {ames:.2f}>{MAX_AMES}")
+          if dili is not None and dili > MAX_DILI: why.append(f"DILI {dili:.2f}>{MAX_DILI}")
+          if why:
+              rejected.append({"source_id": sid, "reason": "; ".join(why)})
+              continue
+      survivors.append(r)
+  print(f"survivors: {len(survivors)} (filter_mode={FILTER_MODE})", flush=True)
+
+  # manifest_filtered.csv keeps the INPUT manifest columns so it drops into docking.
+  out_fields = [c for c in in_fields]
+  filt_csv = OUTPUT_DIR / "manifest_filtered.csv"
+  with filt_csv.open("w", newline="") as f:
+      w = csv.DictWriter(f, fieldnames=out_fields, extrasaction="ignore")
+      w.writeheader()
+      for r in survivors:
+          w.writerow({k: r.get(k, "") for k in out_fields})
+  print(f"manifest_filtered.csv -> {filt_csv}", flush=True)
+
+  # 6. Provenance.
+  import admet_ai as _aa
+  outputs = {
+      "schema_version": 1,
+      "produced_at": datetime.now(timezone.utc).isoformat(),
+      "admet_ai_version": getattr(_aa, "__version__", "unknown"),
+      "admet_table": str(admet_csv),
+      "manifest_filtered": str(filt_csv),
+      "n_input": len(rows) + sum(1 for x in rejected if x["reason"] in ("empty SMILES", "rdkit parse failed")),
+      "n_survivors": len(survivors),
+      "rejected": rejected,
+      "filter": {"mode": FILTER_MODE, "max_herg": MAX_HERG, "max_ames": MAX_AMES, "max_dili": MAX_DILI},
+      "endpoints": endpoint_cols,
+  }
+  (OUTPUT_DIR / "outputs.json").write_text(json.dumps(outputs, indent=2, default=str))
+  print("DONE", flush=True)
+  __ADMET_PY_EOF__
+
+  export ADMET_MANIFEST={{.inputs.ligand_manifest | quote}}
+  export ADMET_FILTER_MODE={{.params.filter_mode}}
+  export ADMET_MAX_HERG={{.params.max_herg}}
+  export ADMET_MAX_AMES={{.params.max_ames}}
+  export ADMET_MAX_DILI={{.params.max_dili}}
+
+  cd "$OUTPUT_DIR"
+  exec apptainer exec --bind /mnt/efs "$IMAGE" \
+    "$VENV_DIR/bin/{{.runtime.entrypoint}}" "$SCRIPT_PATH" \
+    2>&1 | tee "$OUTPUT_DIR/stdout.log"

@@ -1,0 +1,122 @@
+# Login pod for the customer tenant. Previously provisioned on central via
+# Slinky's LoginSet CR; moved here so terminal cold-start is ~0ms (always-up),
+# placement is consistent with notebooks/batch jobs, and central memory
+# pressure drops as tenant count grows.
+#
+# Uses SchedMD's Slinky login image (has sackd + slurm clients out of the
+# box). Reusing the slurmd image does NOT work: it lacks sackd, and with
+# AuthType=auth/slurm every client (sinfo/squeue/sbatch) needs the sack
+# unix socket to mint credentials — without it, calls fail with
+# "failed to connect to any sack sockets". sackd reads the same shared
+# slurm.key that slurmd/slurmctld use.
+#
+# hostAliases resolves the same slurmctld endpoint slurmd uses. hostNetwork
+# is NOT required here; the login pod initiates outbound RPCs to slurmctld
+# and doesn't need to receive any.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: login-{{ .Values.clusterId }}
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: login
+    app.kubernetes.io/component: login
+    clusterra.io/cluster-id: {{ .Values.clusterId }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: login
+      clusterra.io/cluster-id: {{ .Values.clusterId }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: login
+        app.kubernetes.io/component: login
+        clusterra.io/cluster-id: {{ .Values.clusterId }}
+      annotations:
+        # Roll the pod whenever the shell-init ConfigMap changes. The wrapper is
+        # mounted via subPath, which does NOT propagate ConfigMap updates to the
+        # running pod — without this annotation, edits to the ConfigMap above
+        # silently no-op until the next unrelated rollout.
+        checksum/shell-init: {{ include (print $.Template.BasePath "/login-shell-init-cm.yaml") . | sha256sum | trunc 16 }}
+    spec:
+      # Prefer a stable K3s server-node placement — login is long-running and
+      # single-replica, so letting it float across ephemeral Karpenter workers
+      # invites disruption. Tolerate control-plane taint; no nodeSelector to
+      # keep the pod schedulable if the server taint is loosened later.
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      hostAliases:
+      - ip: {{ (split ":" .Values.slurmctldHost)._0 | quote }}
+        hostnames:
+        - {{ printf "slurm-%s-controller.%s" .Values.clusterId .Values.clusterId | quote }}
+      containers:
+      - name: login
+        image: {{ .Values.loginImage | default "ghcr.io/slinkyproject/login:25.11-ubuntu24.04" }}
+        imagePullPolicy: IfNotPresent
+        # sackd in background provides /run/slurm/sack.socket for auth/slurm
+        # credential creation; sleep infinity keeps the pod up for kubectl exec.
+        command: ["sh", "-c", "sackd -f /etc/slurm/slurm.conf & exec sleep infinity"]
+        env:
+        - name: SLURMCTLD_HOST
+          value: {{ .Values.slurmctldHost | quote }}
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            memory: 512Mi
+        volumeMounts:
+        - name: slurmd-conf
+          mountPath: /etc/slurm/slurm.conf
+          subPath: slurm.conf
+          readOnly: true
+        - name: slurmd-conf
+          mountPath: /etc/slurm/cgroup.conf
+          subPath: cgroup.conf
+          readOnly: true
+        - name: slurm-key
+          mountPath: /etc/slurm/slurm.key
+          subPath: slurm.key
+          readOnly: true
+        - name: efs-shared
+          mountPath: /mnt/efs
+        # Profile.d drop-in that scrubs cloud-tpl-{cpu,gpu} from interactive
+        # Slurm CLI output (see ConfigMap above). subPath mount is essential —
+        # mounting the whole ConfigMap at /etc/profile.d/ would clobber the
+        # image's existing profile.d scripts.
+        - name: shell-init
+          mountPath: /etc/profile.d/zz-clusterra-ghost-filter.sh
+          subPath: zz-clusterra-ghost-filter.sh
+          readOnly: true
+      # /etc/passwd and /etc/group are written in the pod's writable rootfs by
+      # the terminal handler's ensureUserInPod on every WS connect — idempotent
+      # and self-healing across pod restarts. Do NOT mount subPath emptyDirs
+      # over /etc/passwd; that clobbers the image's base users (Bug #9).
+      volumes:
+      - name: slurmd-conf
+        configMap:
+          name: slurmd-conf
+          items:
+          - key: slurm.conf
+            path: slurm.conf
+          - key: cgroup.conf
+            path: cgroup.conf
+      - name: slurm-key
+        secret:
+          secretName: slurm-secret
+          defaultMode: 0400
+          items:
+          - key: slurm.key
+            path: slurm.key
+      - name: efs-shared
+        hostPath:
+          path: /mnt/efs
+          type: DirectoryOrCreate
+      - name: shell-init
+        configMap:
+          name: login-shell-init
+          defaultMode: 0644

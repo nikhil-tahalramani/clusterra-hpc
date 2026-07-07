@@ -1,0 +1,114 @@
+id: nodered
+name: Node-RED
+description: Drag-and-drop automation flows that submit Clusterra jobs and react to events. Pre-wired against this cluster's REST API.
+vertical: hcls
+category: interactive
+workload_group: interactive
+modality: vendor-gui
+tools: [node-red, automation]
+ready: true
+kind: interactive
+
+runtime:
+  kind: interactive_image
+  image: ghcr.io/nikhil-tahalramani/clusterra/nodered@sha256:11d16008c549661e462d5a8ec0caa889230e76d8386c222ecc544f57fcc94daa
+  registry_auth: ghcr
+
+sbatch: |
+  #SBATCH --partition=interactive
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=8G
+  #SBATCH --time=24:00:00
+  #SBATCH --nodes=1
+inputs: []
+
+parameters:
+  - key: profile
+    widget: enum
+    options: [cpu-small, cpu-medium]
+    default: cpu-small
+    description: cpu-small=2cpu/8GB, cpu-medium=4cpu/16GB.
+  - key: port
+    widget: number
+    default: 0
+    advanced: true
+
+routing:
+  path_prefix: /nodered
+  port_param: port
+  ready_callback: true
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  PORT=$(shuf -i 10000-60000 -n 1)
+  NODE_IP=$(hostname -I | awk '{print $1}')
+
+  AUTH=""
+  if [ -n "${CLUSTERRA_INTERNAL_TOKEN:-}" ]; then
+    AUTH="-H Authorization: Bearer ${CLUSTERRA_INTERNAL_TOKEN}"
+  fi
+
+  USER_DIR=/mnt/efs/{{.ctx.user_email}}/.node-red
+  mkdir -p "$USER_DIR"
+  rm -f "$USER_DIR/clusterra-creds.json"
+
+  (
+    for i in $(seq 1 300); do
+      if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:${PORT}/"; then
+        break
+      fi
+      sleep 1
+    done
+    READY_RESP=$(curl -sf -X POST ${AUTH} \
+      -H "Content-Type: application/json" \
+      -d "{\"node_ip\":\"${NODE_IP}\",\"port\":${PORT},\"cluster_id\":\"{{.ctx.cluster_id}}\",\"user_email\":\"{{.ctx.user_email}}\",\"template_id\":\"nodered\"}" \
+      "${CLUSTERRA_API}/v1/internal/sessions/${SLURM_JOB_ID}/ready") \
+      || { echo "ready callback failed" >&2; exit 0; }
+    AUTH_TOKEN=$(printf '%s' "${READY_RESP:-}" | sed -n 's/.*"auth_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+    umask 077
+    cat > "$USER_DIR/clusterra-creds.json" <<JSON
+  {
+    "api_url": "${CLUSTERRA_API}",
+    "cluster_id": "{{.ctx.cluster_id}}",
+    "user_email": "{{.ctx.user_email}}",
+    "auth_token": "${AUTH_TOKEN}"
+  }
+  JSON
+  ) &
+
+  if [ -r /etc/clusterra/ghcr/config.json ]; then
+    AUTH_B64=$(sed -n 's/.*"auth"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/clusterra/ghcr/config.json | head -n1)
+    if [ -n "${AUTH_B64:-}" ]; then
+      GHCR_AUTH=$(printf '%s' "$AUTH_B64" | base64 -d 2>/dev/null || true)
+      if [ -n "${GHCR_AUTH:-}" ]; then
+        export APPTAINER_DOCKER_USERNAME="${GHCR_AUTH%%:*}"
+        export APPTAINER_DOCKER_PASSWORD="${GHCR_AUTH#*:}"
+      fi
+    fi
+  fi
+
+  CACHE_DIR=/var/lib/apptainer/sif-cache
+  mkdir -p "$CACHE_DIR"
+  TAG_HASH=$(printf '%s' "{{.runtime.image}}" | sha256sum | cut -c1-12)
+  SIF="$CACHE_DIR/nodered-$TAG_HASH.sif"
+  IMG="{{.runtime.image}}"
+  case "$IMG" in
+    *:dev|*:latest|*:prod) FORCE_PULL=1 ;;
+    *) FORCE_PULL=0 ;;
+  esac
+  (
+    flock -x 200
+    if [ ! -f "$SIF" ] || [ "$FORCE_PULL" = "1" ]; then
+      apptainer pull --force "$SIF" docker://{{.runtime.image}}
+    fi
+  ) 200>"$CACHE_DIR/.lock-$TAG_HASH"
+
+  exec apptainer exec \
+    --bind /mnt/efs:/mnt/efs \
+    --env BASE_URL=/nodered/{{.ctx.cluster_id}}/${SLURM_JOB_ID} \
+    --env PORT=${PORT} \
+    --env NODE_RED_USER_DIR=/mnt/efs/{{.ctx.user_email}}/.node-red \
+    "$SIF" \
+    /usr/local/bin/clusterra-nodered-entrypoint

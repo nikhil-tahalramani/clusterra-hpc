@@ -1,0 +1,186 @@
+id: openmmpbsa
+name: openmmpbsa — MM-PBSA / MM-GBSA binding free energy
+description: |
+  End-state binding free-energy estimation (ΔG_bind) on a GROMACS trajectory via
+  gmx_MMPBSA — a GROMACS-friendly wrapper around AmberTools' MMPBSA.py. Pipeline
+  assumption: user supplies a pre-equilibrated GROMACS trajectory (xtc) and a
+  matching .tpr (or .top) + .ndx. Pinned to a GPU cap-pod so trajectories stay
+  on the same NVMe scratch as upstream gromacs jobs.
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: form
+tools: [gmx_MMPBSA, GROMACS, AmberTools]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.10"
+  base_image: docker://mambaorg/micromamba:1.5.10
+  cache_dir: /mnt/efs/_gmx-mmpbsa-env/v1.6.4
+  requirements: ["gmx_MMPBSA==1.6.4"]
+  notes: |
+    gmx_MMPBSA is NOT on bioconda; verified May 2026 that
+    docker.io/valdesmsc/gmx_mmpbsa and quay.io/biocontainers/gmx_mmpbsa 404.
+    We materialize a conda env on EFS (ambertools=23 + gromacs=2023 + pip
+    install gmx_MMPBSA) once per tenant; subsequent jobs reuse it.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:a10g:1
+inputs:
+  - key: topology
+    role: generic_path
+    required: true
+    description: GROMACS topology (.tpr preferred; .top requires sibling .itp/forcefield).
+  - key: trajectory
+    role: generic_path
+    required: true
+    description: Pre-equilibrated production trajectory (.xtc).
+  - key: index
+    role: generic_path
+    required: true
+    description: Index file (.ndx) defining receptor + ligand groups.
+  - key: top_file
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      GROMACS .top file (with sibling .itp + toppar/). gmx_MMPBSA -cp expects
+      a .top, not a .tpr — leave empty only if `topology` is itself a .top.
+      For .tpr workflows, point this at the matching .top from grompp.
+  - key: mmpbsa_in
+    role: generic_path
+    required: false
+    default: ""
+    description: Optional gmx_MMPBSA input file. Empty = sane default rendered (igb=5, PB defaults).
+
+parameters:
+  - key: receptor_group
+    widget: text
+    default: "Protein"
+    description: Group name from the .ndx file.
+  - key: ligand_group
+    widget: text
+    default: "LIG"
+    description: Group name from the .ndx file for the ligand.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/mmpbsa-{{.ctx.run_id}}"
+  artifacts:
+    - key: results_dat
+      path: "{{.outputs.dir}}/FINAL_RESULTS_MMPBSA.dat"
+      role: primary_output
+    - key: results_csv
+      path: "{{.outputs.dir}}/FINAL_RESULTS_MMPBSA.csv"
+      role: metrics_file
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  TOPOLOGY={{.inputs.topology | quote}}
+  TRAJECTORY={{.inputs.trajectory | quote}}
+  INDEX={{.inputs.index | quote}}
+  TOP_FILE={{.inputs.top_file | quote}}
+  MMPBSA_IN={{.inputs.mmpbsa_in | quote}}
+  RECEPTOR_GROUP={{.params.receptor_group | quote}}
+  LIGAND_GROUP={{.params.ligand_group | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+
+  for f in "$TOPOLOGY" "$TRAJECTORY" "$INDEX"; do
+    [ -r "$f" ] || { echo "input not readable: $f" >&2; exit 1; }
+  done
+
+  mkdir -p "$OUTPUT_DIR"
+  cd "$OUTPUT_DIR"
+
+  if [ -z "$MMPBSA_IN" ]; then
+    MMPBSA_IN="$OUTPUT_DIR/mmpbsa.in"
+    cat > "$MMPBSA_IN" <<'EOF'
+  Sample input file for MM-PBSA / MM-GBSA via gmx_MMPBSA (Clusterra default)
+  &general
+    sys_name="clusterra-mmpbsa",
+    startframe=1, interval=1,
+    forcefields="oldff/leaprc.ff99SB,leaprc.gaff",
+    temperature=298.15,
+  /
+  &gb
+    igb=5, saltcon=0.150,
+  /
+  &pb
+    istrng=0.150, fillratio=4.0,
+  /
+  EOF
+  fi
+
+  ENV_PREFIX={{.runtime.cache_dir | quote}}
+  ENV_LOCK="${ENV_PREFIX}.lock"
+  ENV_READY="${ENV_PREFIX}/.ready"
+  mkdir -p "$(dirname "$ENV_PREFIX")"
+
+  if [ ! -f "$ENV_READY" ]; then
+    (
+      flock -x 9
+      if [ ! -f "$ENV_READY" ]; then
+        echo "[mmpbsa] building conda env at $ENV_PREFIX (one-time, ~5-8 min)"
+        apptainer exec \
+          --bind /mnt/efs:/mnt/efs \
+          --bind "$TMPDIR:$TMPDIR" \
+          "{{.runtime.base_image}}" \
+          bash -c "
+            set -euo pipefail
+            export MAMBA_ROOT_PREFIX=$TMPDIR/mamba
+            mkdir -p \$MAMBA_ROOT_PREFIX
+            # mpi4py is installed FROM CONDA-FORGE (pre-built, no compile) so
+            # gmx_MMPBSA's pip pull doesn't try to rebuild it against a
+            # non-existent x86_64-conda-linux-gnu-cc. We then install
+            # gmx_MMPBSA with --no-deps and explicitly add its pure-Python
+            # deps from PyPI. Verified May 8 2026 (job 1703 -> 1707).
+            micromamba create -y -p '$ENV_PREFIX' -c conda-forge \
+              python={{.runtime.python_version}} ambertools=23 gromacs=2023 \
+              mpi4py openmpi numpy scipy matplotlib pandas seaborn \
+              parmed pip
+            micromamba run -p '$ENV_PREFIX' pip install --no-cache-dir --no-deps \
+              gmx_MMPBSA==1.6.4
+            # gmx_MMPBSA runtime imports beyond what conda-forge ships
+            micromamba run -p '$ENV_PREFIX' pip install --no-cache-dir \
+              tqdm pdb4amber
+          "
+        touch "$ENV_READY"
+      fi
+    ) 9>"$ENV_LOCK"
+  fi
+
+  # gmx_MMPBSA disallows -cs and -cp pointing to the same file. If the user
+  # didn't supply a separate .top, fall back to passing topology to -cp only
+  # when it's a .top; otherwise omit -cp and let gmx_MMPBSA derive parm from
+  # the .tpr.
+  CP_ARG=()
+  if [ -n "$TOP_FILE" ]; then
+    CP_ARG=(-cp "$TOP_FILE")
+  elif [[ "$TOPOLOGY" == *.top ]]; then
+    CP_ARG=(-cp "$TOPOLOGY")
+  fi
+
+  exec apptainer exec --nv \
+    --bind /mnt/efs:/mnt/efs \
+    --bind "$TMPDIR:$TMPDIR" \
+    --bind "$OUTPUT_DIR:$OUTPUT_DIR" \
+    "{{.runtime.base_image}}" \
+    micromamba run -p "$ENV_PREFIX" \
+      gmx_MMPBSA -O \
+        -i  "$MMPBSA_IN" \
+        -cs "$TOPOLOGY" \
+        -ct "$TRAJECTORY" \
+        -ci "$INDEX" \
+        -cg "$RECEPTOR_GROUP" "$LIGAND_GROUP" \
+        "${CP_ARG[@]}" \
+        -o  "$OUTPUT_DIR/FINAL_RESULTS_MMPBSA.dat" \
+        -eo "$OUTPUT_DIR/FINAL_RESULTS_MMPBSA.csv" \
+        -nogui

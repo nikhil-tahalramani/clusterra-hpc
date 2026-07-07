@@ -1,0 +1,310 @@
+id: cif-to-receptor-pdbqt
+name: Receptor prep (CIF → PDBQT)
+description: |
+  Drug-discovery bridge: convert a folded protein structure (CIF from
+  OpenFold3 / AlphaFold / Boltz) into an AutoDock-ready receptor PDBQT for
+  Uni-Dock / Vina / AutoDock-GPU.
+
+  Pipeline:
+    1. Read CIF with gemmi; extract specified chain; strip ligands/waters.
+    2. pH-aware protonation via PDB2PQR (AMBER FF).
+    3. AD4 atom types + Gasteiger charges via Meeko mk_prepare_receptor.
+    4. Compute protein bounding box + padded grid → outputs.json.
+    5. Extract one-letter sequence (for downstream Boltz inputs).
+
+  When wired into a workflow downstream of openfold3 / openfold3-bench, the
+  script auto-discovers `predicted.cif` under $PREV_STEP_OUT_DIR. Pass an
+  explicit `cif_path` to run standalone against a pre-computed structure.
+
+  outputs.json schema (v1):
+    receptor_pdbqt:   absolute path on EFS
+    protein_sequence: one-letter codes (target chain)
+    grid_box:         {center_{x,y,z}, size_{x,y,z}}   — Å, recommended only
+    metadata:         {source_cif, chain, ph, box_padding_angstroms,
+                       n_residues, n_atoms, tools.<lib>}
+
+  Downstream wiring tips:
+    • Uni-Dock's center_{x,y,z} / size_{x,y,z} params can be auto-prefilled
+      from outputs.json.grid_box once the connector UI surfaces "carry
+      bridge outputs into downstream params" (tracked).
+    • Bounding-box grid is appropriate for blind docking; for kinase
+      ATP-pocket or similar targeted screens, override center/size with
+      known pocket coordinates on the docking step.
+
+vertical: hcls
+category: drug-discovery
+workload_group: md-docking
+modality: form
+tools: [gemmi, PDB2PQR, Meeko]
+ready: true
+kind: batch
+display: connector
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: python:3.11
+  cache_dir: /mnt/efs/_cif-to-pdbqt-venv
+  entrypoint: python
+  requirements:
+    - "gemmi==0.6.7"
+    - "meeko==0.6.1"
+    - "pdb2pqr==3.6.2"
+    - "numpy==1.26.4"
+  notes: |
+    Persistent EFS venv with the receptor-prep stack pinned. flock-guarded
+    first-run provisioning; reused across all bridge invocations.
+    Meeko provides mk_prepare_receptor.py (PDB → PDBQT with AD4 typing +
+    Gasteiger). PDB2PQR provides pH-aware protonation. gemmi handles CIF
+    parsing + chain selection + bounding box.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=4G
+  #SBATCH --time=0:15:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: cif_path
+    role: generic_path
+    required: false
+    description: |
+      Explicit path to the input CIF (or PDB). Leave empty when wired
+      downstream of openfold3 / openfold3-bench in a workflow — the script
+      auto-discovers $PREV_STEP_OUT_DIR/predicted.cif.
+
+parameters:
+  - key: chain
+    label: Protein chain ID
+    widget: text
+    default: "A"
+    description: |
+      Single-character chain identifier to extract. AlphaFold-multimer /
+      OpenFold3 outputs are often multi-chain; pick the receptor chain
+      relevant to the docking target.
+
+  - key: ph
+    label: Target pH for protonation
+    widget: number
+    default: 7.4
+    min: 4.0
+    max: 10.0
+    description: |
+      pH used by PDB2PQR's propka pass to assign histidine tautomers and
+      ionizable side-chain protonation states. 7.4 is physiological;
+      lower (~5.5) for lysosomal targets, higher (~8.5) for mitochondrial.
+
+  - key: box_padding_angstroms
+    label: Bounding-box padding (Å)
+    widget: number
+    default: 5.0
+    min: 0.0
+    max: 30.0
+    description: |
+      Padding added around the protein's bounding box to compute the
+      recommended docking grid. 5 Å is reasonable for whole-protein blind
+      docking; raise to 15-20 Å for very small targets or when known
+      pockets sit near the surface.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/cif-to-receptor-pdbqt-{{.ctx.run_id}}"
+  artifacts:
+    - key: receptor_pdbqt
+      path: "{{.outputs.dir}}/receptor.pdbqt"
+      role: primary_output
+    - key: provenance
+      path: "{{.outputs.dir}}/outputs.json"
+      role: generic
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  export OUTPUT_DIR
+
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  export PIP_CACHE_DIR=/mnt/efs/_cif-to-pdbqt-pip-cache
+  mkdir -p "$PIP_CACHE_DIR" "$(dirname "$VENV_DIR")"
+
+  IMAGE="docker://{{.runtime.base_image}}"
+
+  # Provision the venv on first run, flock-guarded against concurrent first-time
+  # submits. Pinned requirements live in this template's runtime.requirements;
+  # bash heredoc invokes pip with them inline so the contract is self-contained
+  # (no requirements.txt staging).
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+      apptainer exec "$IMAGE" bash -c "
+        set -euo pipefail
+        python{{.runtime.python_version}} -m venv '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' \
+          {{range .runtime.requirements}}'{{.}}' {{end}}
+      "
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  # Materialize the bridge script so tracebacks carry real line numbers.
+  SCRIPT_PATH="$OUTPUT_DIR/bridge.py"
+  cat > "$SCRIPT_PATH" <<'__BRIDGE_PY_EOF__'
+  import json
+  import os
+  import pathlib
+  import subprocess
+  import sys
+  from datetime import datetime, timezone
+
+  import gemmi
+
+  OUTPUT_DIR = pathlib.Path(os.environ["OUTPUT_DIR"])
+  OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+  CHAIN = (os.environ.get("BRIDGE_CHAIN") or "A").strip() or "A"
+  PH = float(os.environ.get("BRIDGE_PH") or "7.4")
+  BOX_PADDING = float(os.environ.get("BRIDGE_BOX_PADDING") or "5.0")
+
+  # 1. Resolve input CIF: explicit param wins; otherwise auto-discover from
+  # the workflow's prior step output directory.
+  input_cif = (os.environ.get("BRIDGE_CIF_PATH") or "").strip()
+  if not input_cif:
+      prev = os.environ.get("PREV_STEP_OUT_DIR") or ""
+      if not prev:
+          sys.exit("bridge: cif_path empty and PREV_STEP_OUT_DIR unset — cannot resolve input")
+      candidate = pathlib.Path(prev) / "predicted.cif"
+      if not candidate.is_file():
+          sys.exit(f"bridge: auto-discover failed — {candidate} not found")
+      input_cif = str(candidate)
+  print(f"input CIF: {input_cif}", flush=True)
+
+  # 2. Parse CIF, isolate target chain, strip ligands/waters.
+  structure = gemmi.read_structure(input_cif)
+  structure.setup_entities()
+  if len(structure) == 0:
+      sys.exit("bridge: CIF parsed but contains no models")
+
+  available = [c.name for m in structure for c in m]
+  if CHAIN not in available:
+      sys.exit(f"bridge: chain {CHAIN!r} not present in CIF; available chains: {available}")
+
+  # Strip non-target chains in place; strip waters/ligands across the structure.
+  for model in structure:
+      for chain_name in list(c.name for c in model):
+          if chain_name != CHAIN:
+              model.remove_chain(chain_name)
+  structure.remove_ligands_and_waters()
+
+  # 3. Extract sequence + bounding-box coordinates from the filtered structure.
+  three_to_one = {
+      "ALA": "A", "CYS": "C", "ASP": "D", "GLU": "E", "PHE": "F", "GLY": "G",
+      "HIS": "H", "ILE": "I", "LYS": "K", "LEU": "L", "MET": "M", "ASN": "N",
+      "PRO": "P", "GLN": "Q", "ARG": "R", "SER": "S", "THR": "T", "VAL": "V",
+      "TRP": "W", "TYR": "Y",
+  }
+  seq_chars, xs, ys, zs = [], [], [], []
+  for model in structure:
+      for chain in model:
+          for residue in chain:
+              one = three_to_one.get(residue.name.upper())
+              if one is None:
+                  continue
+              seq_chars.append(one)
+              for atom in residue:
+                  xs.append(atom.pos.x)
+                  ys.append(atom.pos.y)
+                  zs.append(atom.pos.z)
+  if not seq_chars or not xs:
+      sys.exit(f"bridge: no standard protein residues found in chain {CHAIN}")
+  sequence = "".join(seq_chars)
+
+  cx = (max(xs) + min(xs)) / 2.0
+  cy = (max(ys) + min(ys)) / 2.0
+  cz = (max(zs) + min(zs)) / 2.0
+  sx = (max(xs) - min(xs)) + 2 * BOX_PADDING
+  sy = (max(ys) - min(ys)) + 2 * BOX_PADDING
+  sz = (max(zs) - min(zs)) + 2 * BOX_PADDING
+
+  # 4. Write clean PDB (target chain, protein only).
+  clean_pdb = OUTPUT_DIR / "clean.pdb"
+  structure.write_pdb(str(clean_pdb))
+  print(f"clean PDB: {clean_pdb} ({len(seq_chars)} residues, {len(xs)} atoms)", flush=True)
+
+  # 5. pH-aware protonation via PDB2PQR (AMBER FF).
+  protonated_pdb = OUTPUT_DIR / "protonated.pdb"
+  pqr_out = OUTPUT_DIR / "protonated.pqr"
+  pdb2pqr_cmd = [
+      "pdb2pqr",
+      "--ff=AMBER",
+      f"--with-ph={PH}",
+      "--keep-chain",
+      f"--pdb-output={protonated_pdb}",
+      str(clean_pdb),
+      str(pqr_out),
+  ]
+  print(f"running: {' '.join(pdb2pqr_cmd)}", flush=True)
+  subprocess.run(pdb2pqr_cmd, check=True)
+
+  # 6. PDBQT via Meeko mk_prepare_receptor.
+  receptor_pdbqt = OUTPUT_DIR / "receptor.pdbqt"
+  meeko_cmd = [
+      "mk_prepare_receptor.py",
+      "--read_pdb", str(protonated_pdb),
+      "--write_pdbqt", str(receptor_pdbqt),
+      "--allow_bad_res",
+  ]
+  print(f"running: {' '.join(meeko_cmd)}", flush=True)
+  subprocess.run(meeko_cmd, check=True)
+  if not receptor_pdbqt.is_file() or receptor_pdbqt.stat().st_size == 0:
+      sys.exit(f"bridge: meeko did not produce a valid PDBQT at {receptor_pdbqt}")
+
+  # 7. Provenance manifest.
+  outputs = {
+      "schema_version": 1,
+      "produced_at": datetime.now(timezone.utc).isoformat(),
+      "receptor_pdbqt": str(receptor_pdbqt),
+      "protein_sequence": sequence,
+      "grid_box": {
+          "center_x": round(cx, 3),
+          "center_y": round(cy, 3),
+          "center_z": round(cz, 3),
+          "size_x": round(sx, 3),
+          "size_y": round(sy, 3),
+          "size_z": round(sz, 3),
+      },
+      "metadata": {
+          "source_cif": input_cif,
+          "chain": CHAIN,
+          "ph": PH,
+          "box_padding_angstroms": BOX_PADDING,
+          "n_residues": len(seq_chars),
+          "n_atoms": len(xs),
+          "tools": {"gemmi": gemmi.__version__},
+      },
+      "notes": [
+          "v1: PDB2PQR (AMBER) for pH-aware protonation; Meeko mk_prepare_receptor for PDBQT.",
+          "grid_box is the protein bounding box + padding — sized for blind docking.",
+          "For pocket-targeted docking, override center/size on the docking step.",
+      ],
+  }
+  (OUTPUT_DIR / "outputs.json").write_text(json.dumps(outputs, indent=2))
+  print(f"outputs.json: {OUTPUT_DIR / 'outputs.json'}", flush=True)
+  print("DONE", flush=True)
+  __BRIDGE_PY_EOF__
+
+  # Surface params + workflow context to the bridge via BRIDGE_* env vars
+  # (avoids YAML template expansion inside the python heredoc).
+  export BRIDGE_CIF_PATH={{.inputs.cif_path | quote}}
+  export BRIDGE_CHAIN={{.params.chain | quote}}
+  export BRIDGE_PH={{.params.ph}}
+  export BRIDGE_BOX_PADDING={{.params.box_padding_angstroms}}
+
+  cd "$OUTPUT_DIR"
+  exec apptainer exec --bind /mnt/efs "$IMAGE" \
+    "$VENV_DIR/bin/{{.runtime.entrypoint}}" "$SCRIPT_PATH" \
+    2>&1 | tee "$OUTPUT_DIR/stdout.log"

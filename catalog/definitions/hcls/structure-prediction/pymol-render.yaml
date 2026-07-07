@@ -1,0 +1,163 @@
+id: pymol-render
+name: PyMOL render (structure visualization)
+description: |
+  Headless PyMOL ray-traced cartoon/surface renders for protein structures
+  and complexes. Built for hero figures of predicted structures, crystal-vs-
+  prediction overlays, peptide-in-groove zooms, binding-pocket views,
+  ligand-pose ensembles, and MD-trajectory snapshots — anything you'd
+  normally do interactively in PyMOL but want as a reproducible,
+  parameter-driven Slurm job.
+
+  CPU-only. Even a 1600×1200 ray-trace of an ~830-residue TCR–pMHC ternary
+  complex completes in under 2 minutes on a t-class spot node.
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+cost_anchor: ~$0.01 / hero render (CPU spot, t-class, warm SIF; first-pull adds ~$0.01 once)
+modality: form
+tools: [PyMOL]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: pegi3s/pymol@sha256:c9d53ff76d69daca779b88076ce9ac67ba53208b63b5fae430888499613efc26
+  notes: |
+    Debian + PyMOL 2.3.0 Open-Source, prebuilt by pegi3s
+    (https://github.com/pegi3s/dockerfiles/tree/master/pymol).
+    ~190 MB SIF, cached at /mnt/efs/_sifs/pegi3s-pymol.sif.
+    Verified May 28 2026 on Clusterra cap-pods (clusde74, jobs 2882+).
+
+    Why not the mamba/conda route: `mamba install pymol-open-source` from
+    conda-forge hung on the solver for 13+ minutes on a 2-vCPU cap-pod
+    (jobs 2880/2879/2877). The pegi3s prebuilt image bypasses the solver
+    entirely — pull-once, render-many.
+
+    Why not quay.io/biocontainers/pymol-open-source: that repo has zero
+    published tags via the Quay v2 API despite being listed on bioconda
+    (verified May 28 2026 — see template_image_uri_lessons memory).
+
+    Apptainer flags `--no-home --writable-tmpfs` defend against the
+    slurmd-prolog `/mnt/scratch/job-$ID` gate bug on instance-store-less
+    cap-pod shapes (t2.2xlarge, m4.10xlarge); harmless once that's fixed.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=4G
+  #SBATCH --time=0:15:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: working_directory
+    role: generic_path
+    required: false
+    default: /mnt/efs
+    description: |
+      Directory bound read-write into the container. Reference any input
+      structures (.cif, .pdb, .sdf) by absolute path under this root in
+      your script.
+
+parameters:
+  - key: script_body
+    label: PyMOL script (Python, uses the `cmd` API)
+    widget: textarea
+    required: true
+    default: |
+      """Example: predicted-vs-crystal overlay of a TCR–pMHC complex (7QPJ)."""
+      import os
+      from pymol import cmd
+
+      cmd.load("/mnt/efs/bench/tcr-pmhc-postcutoff/crystals/7QPJ.cif", "crystal")
+      cmd.load(
+          "/mnt/efs/bench/tcr-pmhc-postcutoff/of3-outputs/7QPJ/7QPJ/seed_42/"
+          "7QPJ_seed_42_sample_3_model.cif",
+          "pred",
+      )
+
+      # Align CA atoms; the return value is (rms_after, n_atoms_aligned, ...)
+      rms = cmd.align("pred and name CA", "crystal and name CA")
+      print(f"CA RMSD = {rms[0]:.2f} A over {rms[1]} atoms")
+
+      cmd.hide("everything")
+      cmd.show("cartoon")
+      cmd.bg_color("white")
+      cmd.set("ray_opaque_background", 0)
+
+      cmd.color("gray80", "crystal")
+      cmd.color("marine",  "pred and chain A")   # MHC-I alpha
+      cmd.color("violet",  "pred and chain B")   # beta2-microglobulin
+      cmd.color("yellow",  "pred and chain C")   # peptide
+      cmd.color("forest",  "pred and chain D")   # TCR alpha
+      cmd.color("orange",  "pred and chain E")   # TCR beta
+      cmd.show("sticks", "pred and chain C")
+
+      cmd.orient("pred and chain C")
+      cmd.zoom("pred", 6)
+      cmd.ray(1600, 1200)
+      cmd.png(os.path.join(os.environ["OUTPUT_DIR"], "hero.png"), dpi=200)
+    description: |
+      Python source using the PyMOL `cmd` API. Available env:
+        OUTPUT_DIR  — write PNG renders here (already mkdir'd)
+
+      Conventions:
+        - Use absolute paths under /mnt/efs (or whatever working_directory
+          you set) for input structures.
+        - Container runs `pymol -cq <script>` (quiet, no GUI) — do NOT call
+          `pymol.finish_launching()`.
+        - For best ray-trace quality on dense complexes, set:
+            cmd.set("ambient", 0.35)
+            cmd.set("specular", 0.15)
+            cmd.set("cartoon_smooth_loops", 1)
+        - For transparent crystal background under prediction overlay:
+            cmd.set("cartoon_transparency", 0.5, "crystal")
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/pymol-render-{{.ctx.run_id}}"
+  artifacts:
+    - key: renders
+      path: "{{.outputs.dir}}/*.png"
+      role: primary_output
+      description: PyMOL ray-traced PNG renders (filenames set by your script).
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+
+  SIF_PATH=/mnt/efs/_sifs/pegi3s-pymol.sif
+  mkdir -p "$(dirname "$SIF_PATH")"
+  IMAGE_URI="docker://{{.runtime.image}}"
+
+  # ---- Stage 1: SIF pull (flock-guarded; one-time per cluster) ----
+  (
+    flock -x 9
+    if [ ! -s "$SIF_PATH" ]; then
+      echo "[pymol] pulling SIF (one-time, ~190 MB) → $SIF_PATH"
+      apptainer pull --force "$SIF_PATH" "$IMAGE_URI"
+    fi
+  ) 9>"$SIF_PATH.lock"
+
+  # ---- Stage 2: materialise script (so PyMOL tracebacks carry real line numbers) ----
+  SCRIPT_PATH="$OUTPUT_DIR/script.py"
+  cat > "$SCRIPT_PATH" <<'__CLUSTERRA_PYMOL_SCRIPT_EOF__'
+  {{.params.script_body}}
+  __CLUSTERRA_PYMOL_SCRIPT_EOF__
+
+  # ---- Stage 3: run PyMOL headless ----
+  WORKING_DIR={{.inputs.working_directory | quote}}
+  cd "$OUTPUT_DIR"
+
+  exec apptainer exec \
+    --no-home --writable-tmpfs \
+    --bind "$WORKING_DIR:$WORKING_DIR" \
+    --bind "$OUTPUT_DIR:$OUTPUT_DIR" \
+    --env "OUTPUT_DIR=$OUTPUT_DIR" \
+    "$SIF_PATH" \
+    pymol -cq "$SCRIPT_PATH" \
+    2>&1 | tee "$OUTPUT_DIR/stdout.log"

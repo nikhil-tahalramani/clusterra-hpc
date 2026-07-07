@@ -1,0 +1,284 @@
+id: mace-off
+name: MACE-OFF — universal MLIP for organic molecules
+description: |
+  Machine-learning interatomic potential (MLIP) for organic chemistry via
+  MACE-OFF23 (Kovács et al., 2023; ACEsuit/mace, MIT). Runs single-point
+  energies/forces, geometry optimization, or short MD on an ASE-readable
+  structure (xyz/pdb/cif) using a pre-trained foundation model. Sits adjacent
+  to GROMACS/AMBER/OpenFE in the md-docking stack as an opt-in universal
+  potential — drop-in for small organic systems without a hand-tuned force
+  field.
+
+  Installed into a persistent EFS venv on first use; the ~3-5 min `pip install
+  mace-torch` cost amortizes across every subsequent job. Pre-trained
+  MACE-OFF23 model weights cache at /mnt/efs/_mace-cache/ (downloaded on first
+  use via mace-torch's foundation_models registry, ~10-100 MB depending on
+  size tier).
+vertical: hcls
+category: md-docking
+workload_group: md-docking
+modality: form
+cost_anchor: ~$0.02 / single-point energy on A10G
+tools: [MACE, MACE-OFF, ASE]
+ready: true
+kind: batch
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  # python:3.11 (NOT slim) — mace-torch pulls torch which JIT-compiles CUDA
+  # extensions at import time and ASE's geometry-optimization paths can hit
+  # torch.compile under newer versions. The slim variant strips gcc and fails
+  # at first kernel build (same pattern as Boltz, see
+  # dl_ami_skip_pytorch_base.md / boltz.yaml comment block). Full python:3.11
+  # ships gcc/g++/make in the same APT base layer.
+  #
+  # Per DL-AMI policy: cap-pod hosts already provide CUDA + NVIDIA drivers,
+  # and `apptainer exec --nv` mounts the host CUDA userspace into the
+  # container. mace-torch's torch wheel ships the matching CUDA runtime
+  # alongside, so nothing else needs to be system-installed.
+  base_image: python:3.11
+  requirements:
+    - mace-torch
+  cache_dir: /mnt/efs/_mace-venv
+  entrypoint: python
+  notes: |
+    Upstream ships no maintained Docker image for MACE-OFF. Standard
+    pip-into-EFS-venv pattern (see boltz.yaml). mace-torch (the ACEsuit
+    package) pulls torch, e3nn, ase, and prettytable on first install — total
+    venv ~3.5-4 GB. Concurrent first-time jobs serialize on a flock so they
+    don't race; subsequent jobs reuse the venv in ~5s vs ~5 min cold.
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:1
+
+inputs:
+  - key: input_structure
+    role: generic_path
+    required: true
+    description: |
+      Path on /mnt/efs to an ASE-readable structure file (.xyz, .pdb, .cif,
+      .mol, .sdf, or any other format ase.io.read accepts). Single-molecule
+      or single-frame; for multi-frame trajectories ASE reads the last frame.
+
+parameters:
+  - key: model_size
+    label: MACE-OFF23 model size
+    widget: enum
+    options: [small, medium, large]
+    default: medium
+    description: |
+      Pre-trained MACE-OFF23 foundation model size. small ~4M params (~10 MB
+      checkpoint, fastest); medium ~14M (~50 MB, default — paper's headline
+      accuracy/cost sweet spot); large ~50M (~150 MB, slowest but most
+      accurate). All three trained on the SPICE organic-chemistry dataset.
+  - key: operation
+    label: Operation
+    widget: enum
+    options: [singlepoint, optimize, md]
+    default: singlepoint
+    description: |
+      singlepoint = compute energy + forces on the input geometry as-is.
+      optimize = BFGS geometry optimization to fmax (default 0.05 eV/A).
+      md = short Langevin MD (NVT, 300 K, 0.5 fs step) for `md_steps` steps.
+  - key: device
+    label: Compute device
+    widget: enum
+    options: [cuda, cpu]
+    default: cuda
+    description: |
+      cuda = run on the allocated A10G/L40s/etc. cpu = force CPU (useful for
+      ~10-atom molecules where dispatch overhead dominates).
+  - key: dtype
+    label: Floating-point precision
+    widget: enum
+    options: [float32, float64]
+    default: float64
+    description: |
+      MACE-OFF23 was trained in float64; default keeps numerical match to the
+      paper. float32 ~2x faster on A10G for medium/large but loses ~0.1 meV
+      per-atom on geometry-optimization end-points.
+  - key: opt_fmax
+    label: Geometry-opt force convergence (eV/A)
+    widget: number
+    default: 0.05
+    advanced: true
+    description: BFGS halts when max force component < fmax. Ignored unless operation=optimize.
+  - key: opt_steps
+    label: Geometry-opt max steps
+    widget: number
+    default: 200
+    advanced: true
+    description: BFGS step ceiling. Ignored unless operation=optimize.
+  - key: md_steps
+    label: MD steps
+    widget: number
+    default: 1000
+    advanced: true
+    description: Langevin NVT step count (0.5 fs each, 300 K). Ignored unless operation=md.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/mace-off-{{.ctx.run_id}}"
+  artifacts:
+    - key: log
+      path: "{{.outputs.dir}}/mace.log"
+      role: log
+    - key: trajectory
+      path: "{{.outputs.dir}}/trajectory.xyz"
+      role: primary_output
+      description: |
+        ASE extxyz trajectory. singlepoint = 1 frame (the input geometry with
+        attached energy/forces). optimize = N+1 frames (initial + each BFGS
+        step). md = `md_steps`/10 frames (10-step write interval).
+    - key: energy_json
+      path: "{{.outputs.dir}}/energy.json"
+      role: metrics_file
+      description: |
+        Final-frame energy (eV), per-atom energy (eV/atom), max force (eV/A),
+        atom count, model_size, device, dtype, wall-clock seconds, operation.
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  INPUT_STRUCTURE={{.inputs.input_structure | quote}}
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  [ -r "$INPUT_STRUCTURE" ] || { echo "input_structure not readable: $INPUT_STRUCTURE" >&2; exit 1; }
+  mkdir -p "$OUTPUT_DIR"
+
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  WEIGHTS_CACHE=/mnt/efs/_mace-cache
+  export PIP_CACHE_DIR=/mnt/efs/_mace-venv-cache
+  mkdir -p "$PIP_CACHE_DIR" "$WEIGHTS_CACHE" "$(dirname "$VENV_DIR")"
+  # mace-torch's foundation_models.get_model() downloads weights to
+  # ~/.cache/mace/ by default — redirect that to EFS via XDG_CACHE_HOME so
+  # they persist across jobs.
+  export XDG_CACHE_HOME="$WEIGHTS_CACHE"
+
+  IMAGE="docker://{{.runtime.base_image}}"
+
+  # Provision venv on EFS once, flock-guarded so concurrent first-time jobs
+  # don't race. apptainer exec --nv mounts the host CUDA userspace; pip
+  # pulls torch + matching CUDA wheels into the venv on first install.
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/python" ] || ! "$VENV_DIR/bin/python" -c 'import mace' 2>/dev/null; then
+      apptainer exec --nv "$IMAGE" bash -c "
+        set -euo pipefail
+        python{{.runtime.python_version}} -m venv --system-site-packages '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' mace-torch
+      "
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  # Driver script — keep the heredoc heredoc-quoted so bash doesn't try to
+  # expand the Python content; all parameters cross the boundary via env vars.
+  RUN_PY="$OUTPUT_DIR/run.py"
+  cat > "$RUN_PY" <<'PYEOF'
+  import json, os, sys, time
+  from pathlib import Path
+
+  import ase.io
+  import numpy as np
+  import torch
+  from ase.optimize import BFGS
+  from ase.md.langevin import Langevin
+  from ase import units
+  from mace.calculators import mace_off
+
+  inp        = os.environ["MACE_INPUT"]
+  outdir     = Path(os.environ["MACE_OUTDIR"])
+  operation  = os.environ["MACE_OPERATION"]
+  model_size = os.environ["MACE_MODEL_SIZE"]
+  device     = os.environ["MACE_DEVICE"]
+  dtype      = os.environ["MACE_DTYPE"]
+  fmax       = float(os.environ["MACE_OPT_FMAX"])
+  opt_steps  = int(os.environ["MACE_OPT_STEPS"])
+  md_steps   = int(os.environ["MACE_MD_STEPS"])
+
+  outdir.mkdir(parents=True, exist_ok=True)
+  traj_path = outdir / "trajectory.xyz"
+  energy_path = outdir / "energy.json"
+
+  atoms = ase.io.read(inp)
+  print(f"loaded {inp}: {len(atoms)} atoms, formula={atoms.get_chemical_formula()}")
+
+  # If cuda was asked but unavailable (e.g. SLURM allocated us a CPU node),
+  # fall back to CPU rather than dying — the job is still useful.
+  if device == "cuda" and not torch.cuda.is_available():
+      print("cuda requested but torch.cuda.is_available() is False; falling back to cpu", file=sys.stderr)
+      device = "cpu"
+
+  print(f"loading MACE-OFF23 {model_size} on {device} ({dtype})...")
+  calc = mace_off(model=model_size, device=device, default_dtype=dtype)
+  atoms.calc = calc
+
+  t0 = time.time()
+  if operation == "singlepoint":
+      e = atoms.get_potential_energy()
+      f = atoms.get_forces()
+      ase.io.write(traj_path, atoms, format="extxyz")
+      max_force = float(np.max(np.linalg.norm(f, axis=1)))
+  elif operation == "optimize":
+      # Stream every BFGS step into the extxyz trajectory.
+      ase.io.write(traj_path, atoms, format="extxyz")
+      def _append(a=atoms):
+          ase.io.write(traj_path, a, format="extxyz", append=True)
+      opt = BFGS(atoms, logfile=str(outdir / "bfgs.log"))
+      opt.attach(_append, interval=1)
+      opt.run(fmax=fmax, steps=opt_steps)
+      e = atoms.get_potential_energy()
+      max_force = float(np.max(np.linalg.norm(atoms.get_forces(), axis=1)))
+  elif operation == "md":
+      # 0.5 fs step, 300 K Langevin NVT, 0.01/fs friction (standard ASE defaults).
+      dyn = Langevin(atoms, 0.5 * units.fs, temperature_K=300.0, friction=0.01,
+                     trajectory=None, logfile=str(outdir / "md.log"))
+      ase.io.write(traj_path, atoms, format="extxyz")
+      def _append(a=atoms):
+          ase.io.write(traj_path, a, format="extxyz", append=True)
+      dyn.attach(_append, interval=10)
+      dyn.run(md_steps)
+      e = atoms.get_potential_energy()
+      max_force = float(np.max(np.linalg.norm(atoms.get_forces(), axis=1)))
+  else:
+      print(f"unknown operation: {operation}", file=sys.stderr)
+      sys.exit(2)
+  wall = time.time() - t0
+
+  metrics = {
+      "operation":      operation,
+      "model_size":     model_size,
+      "device":         device,
+      "dtype":          dtype,
+      "atoms":          len(atoms),
+      "formula":        atoms.get_chemical_formula(),
+      "energy_ev":      float(e),
+      "energy_ev_per_atom": float(e) / max(1, len(atoms)),
+      "max_force_ev_per_ang": max_force,
+      "wall_seconds":   round(wall, 3),
+  }
+  with open(energy_path, "w") as fh:
+      json.dump(metrics, fh, indent=2)
+  print(json.dumps(metrics, indent=2))
+  PYEOF
+
+  export MACE_INPUT="$INPUT_STRUCTURE"
+  export MACE_OUTDIR="$OUTPUT_DIR"
+  export MACE_OPERATION={{.params.operation | quote}}
+  export MACE_MODEL_SIZE={{.params.model_size | quote}}
+  export MACE_DEVICE={{.params.device | quote}}
+  export MACE_DTYPE={{.params.dtype | quote}}
+  export MACE_OPT_FMAX={{.params.opt_fmax | quote}}
+  export MACE_OPT_STEPS={{.params.opt_steps | quote}}
+  export MACE_MD_STEPS={{.params.md_steps | quote}}
+
+  cd "$OUTPUT_DIR"
+  apptainer exec --nv --bind /mnt/efs:/mnt/efs --bind "$TMPDIR:$TMPDIR" \
+    "$IMAGE" \
+    "$VENV_DIR/bin/python" "$RUN_PY" 2>&1 | tee "$OUTPUT_DIR/mace.log"

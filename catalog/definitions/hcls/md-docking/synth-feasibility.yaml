@@ -1,0 +1,341 @@
+id: synth-feasibility
+name: Synthesizability — SAscore + AiZynthFinder
+description: |
+  Two-tier "can we make it?" gate for shortlisted candidates, run before the
+  make/synthesis handoff.
+
+  Tier 1 (cheap, all molecules): RDKit SAscore (Ertl & Schuffenhauer; 1=easy →
+  10=hard) + QED drug-likeness. Millisecond/mol. Used to PREFILTER which
+  molecules are worth a full retrosynthesis search.
+
+  Tier 2 (full, survivors only): AiZynthFinder 4.x (AstraZeneca, MIT-licensed —
+  the most production-hardened open CASP engine) does a Monte-Carlo tree search
+  for a synthetic route to purchasable building blocks. Reports is_solved
+  (a route to in-stock reagents was found) + number of steps. Uses the public
+  USPTO expansion/filter policies + the public ZINC building-block stock that
+  `download_public_data` fetches; supply your own stock HDF5 to constrain to
+  YOUR purchasable catalog (Enamine/Mcule/in-house).
+
+  Pipeline:
+    1. Load manifest (filename,smiles,source_id); canonicalize, drop unparseable.
+    2. SAscore + QED for every molecule.
+    3. Prefilter: molecules with SAscore <= max_sa_score advance to full search.
+    4. aizynthcli over the survivors → routes + is_solved + n_steps.
+    5. synth.csv (per-molecule scores + solved flag), manifest_filtered.csv
+       (the synthesizable survivors, input-manifest columns preserved),
+       outputs.json provenance.
+
+  Both scores are imperfect proxies (a 2023 critical assessment found every
+  synthesizability score is) — treat is_solved as the stronger signal and
+  SAscore as triage. A purchasable library is mostly solvable by definition;
+  this gate matters most for generated / heavily-decorated molecules.
+
+  Precondition: manifest CSV with `filename,smiles,source_id`. Pair with: the
+  Boltz-2 / OpenFE survivors upstream; the make-step dossier downstream.
+vertical: hcls
+category: drug-discovery
+workload_group: md-docking
+modality: form
+tools: [AiZynthFinder, RDKit, Python]
+ready: true
+kind: batch
+display: connector
+
+runtime:
+  kind: venv
+  python_version: "3.11"
+  base_image: python:3.11
+  cache_dir: /mnt/efs/_aizynth-venv
+  entrypoint: python
+  requirements:
+    - "aizynthfinder==4.3.2"
+  notes: |
+    aizynthfinder pulls its own pinned rdkit + pandas + tree-search deps (do
+    NOT pin rdkit separately — it conflicts with aizynthfinder's range; SAscore
+    ships in any rdkit's Contrib/SA_Score). CPU fine. Persistent EFS venv,
+    flock-guarded first-run (~8-12 min cold).
+    Public models + ZINC stock are downloaded once into a shared EFS cache
+    via `download_public_data` and reused across runs.
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=32G
+  #SBATCH --time=4:00:00
+  #SBATCH --nodes=1
+
+inputs:
+  - key: ligand_manifest
+    role: generic_path
+    required: true
+    description: |
+      CSV with `filename,smiles,source_id`. The shortlist to assess for
+      synthesizability (typically the post-FEP survivors, tens of molecules).
+  - key: stock_hdf5
+    role: generic_path
+    required: false
+    default: ""
+    description: |
+      Optional path to YOUR building-block stock as an AiZynthFinder HDF5
+      (e.g. an Enamine/Mcule export prepared with `smiles2stock`). Empty =
+      use the public ZINC stock fetched by download_public_data. Constraining
+      to your real catalog is what makes is_solved mean "WE can make it."
+
+parameters:
+  - key: max_sa_score
+    label: Max SAscore for full search
+    widget: number
+    default: 6.0
+    min: 1.0
+    max: 10.0
+    description: |
+      Molecules with SAscore above this skip the (slower) full retrosynthesis
+      and are marked not-advanced. 6.0 is a permissive prefilter; tighten to
+      4.5 for an aggressive cut.
+  - key: require_solved
+    label: Drop molecules with no synthetic route
+    widget: bool
+    default: false
+    description: |
+      false = annotate only (manifest_filtered = SAscore-passing survivors).
+      true = manifest_filtered keeps ONLY molecules AiZynthFinder solved
+      (route to in-stock reagents found). Turn on to hand the wet lab only
+      makeable candidates.
+  - key: time_limit_s
+    label: Per-molecule search time limit (s)
+    widget: number
+    default: 120
+    min: 30
+    max: 600
+    description: AiZynthFinder MCTS wall-clock cap per target molecule.
+
+outputs:
+  dir: "/mnt/efs/{{.ctx.user_email}}/synth-feasibility-{{.ctx.run_id}}"
+  artifacts:
+    - key: synth_table
+      path: "{{.outputs.dir}}/synth.csv"
+      role: primary_output
+    - key: manifest_filtered
+      path: "{{.outputs.dir}}/manifest_filtered.csv"
+      role: generic
+    - key: routes
+      path: "{{.outputs.dir}}/aizynth_output.json.gz"
+      role: generic
+    - key: provenance
+      path: "{{.outputs.dir}}/outputs.json"
+      role: generic
+    - key: stdout
+      path: "{{.outputs.dir}}/stdout.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  OUTPUT_DIR={{.outputs.dir | quote}}
+  mkdir -p "$OUTPUT_DIR"
+  export OUTPUT_DIR
+
+  VENV_DIR={{.runtime.cache_dir | quote}}
+  DATA_DIR=/mnt/efs/_aizynth-data
+  export PIP_CACHE_DIR="${TMPDIR:-/tmp}/pip-cache-aizynth"
+  mkdir -p "$PIP_CACHE_DIR" "$(dirname "$VENV_DIR")" "$DATA_DIR"
+  export AIZYNTH_DATA_DIR="$DATA_DIR"
+
+  SIF_DIR=/mnt/efs/_apt-sifs
+  mkdir -p "$SIF_DIR"
+  IMAGE="$SIF_DIR/python-3.11.sif"
+  [ -f "$IMAGE" ] || apptainer pull "$IMAGE" docker://{{.runtime.base_image}} 2>&1 | tail -3
+
+  (
+    flock -x 9
+    if [ ! -x "$VENV_DIR/bin/aizynthcli" ]; then
+      apptainer exec "$IMAGE" bash -c "
+        set -euo pipefail
+        python{{.runtime.python_version}} -m venv '$VENV_DIR'
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$VENV_DIR/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' \
+          {{range .runtime.requirements}}'{{.}}' {{end}}
+      "
+    fi
+    # aizynthfinder 4.3.2 pulls onnxruntime 1.16.3, whose manylinux .so marks an
+    # executable stack the cap-pod kernel rejects ("cannot enable executable
+    # stack" — verified job 3019/3027; patchelf 0.17.2 on PyPI lacks
+    # --clear-execstack). onnxruntime >=1.17 dropped the exec-stack flag, so we
+    # force-upgrade. Idempotent; if it conflicts the synth.py fallback covers it.
+    CUR_ORT=$(apptainer exec "$IMAGE" "$VENV_DIR/bin/pip" show onnxruntime 2>/dev/null | awk '/^Version/{print $2}')
+    if [ "$CUR_ORT" != "1.19.2" ]; then
+      apptainer exec "$IMAGE" "$VENV_DIR/bin/pip" install --quiet --cache-dir "$PIP_CACHE_DIR" 'onnxruntime==1.19.2' || true
+    fi
+    # One-time public-data download (USPTO policies + ZINC stock + config.yml).
+    if [ ! -f "$DATA_DIR/config.yml" ]; then
+      apptainer exec --bind /mnt/efs "$IMAGE" \
+        "$VENV_DIR/bin/download_public_data" "$DATA_DIR"
+    fi
+  ) 9>"$VENV_DIR.lock"
+
+  SCRIPT_PATH="$OUTPUT_DIR/synth.py"
+  cat > "$SCRIPT_PATH" <<'__SYNTH_PY_EOF__'
+  import csv, json, os, pathlib, subprocess, sys
+  from datetime import datetime, timezone
+
+  from rdkit import Chem, RDConfig
+  from rdkit.Chem import QED
+  sys.path.append(os.path.join(RDConfig.RDContribDir, "SA_Score"))
+  import sascorer  # noqa: E402
+
+  OUTPUT_DIR = pathlib.Path(os.environ["OUTPUT_DIR"])
+  MANIFEST = pathlib.Path(os.environ["SYNTH_MANIFEST"])
+  DATA_DIR = pathlib.Path(os.environ["AIZYNTH_DATA_DIR"])
+  STOCK = (os.environ.get("SYNTH_STOCK") or "").strip()
+  MAX_SA = float(os.environ.get("SYNTH_MAX_SA") or "6.0")
+  REQUIRE_SOLVED = os.environ.get("SYNTH_REQUIRE_SOLVED", "false").lower() == "true"
+  TIME_LIMIT = int(os.environ.get("SYNTH_TIME_LIMIT") or "120")
+  VENV_BIN = pathlib.Path(os.environ["SYNTH_VENV_BIN"])
+
+  if not MANIFEST.is_file():
+      raise SystemExit(f"synth: manifest not found: {MANIFEST}")
+
+  rows, rejected = [], []
+  with MANIFEST.open() as f:
+      reader = csv.DictReader(f)
+      in_fields = reader.fieldnames or []
+      for r in reader:
+          smi = (r.get("smiles") or "").strip()
+          sid = (r.get("source_id") or r.get("filename") or "").strip()
+          mol = Chem.MolFromSmiles(smi) if smi else None
+          if mol is None:
+              rejected.append({"source_id": sid, "reason": "rdkit parse failed"})
+              continue
+          r["_smiles_canon"] = Chem.MolToSmiles(mol)
+          r["_sa"] = round(sascorer.calculateScore(mol), 3)
+          r["_qed"] = round(QED.qed(mol), 3)
+          rows.append(r)
+  if not rows:
+      raise SystemExit("synth: zero parseable rows; need columns filename,smiles,source_id")
+  print(f"manifest: {len(rows)} parseable / {len(rejected)} unparseable", flush=True)
+
+  # Tier-1 prefilter: which advance to full retrosynthesis.
+  advance = [r for r in rows if r["_sa"] <= MAX_SA]
+  print(f"SAscore<={MAX_SA}: {len(advance)} advance to full search", flush=True)
+
+  # Tier-2: aizynthcli over the survivors.
+  solved_map = {}  # canon SMILES -> {"is_solved": bool, "n_steps": int|None}
+  if advance:
+      smi_file = OUTPUT_DIR / "search_smiles.txt"
+      smi_file.write_text("\n".join(r["_smiles_canon"] for r in advance) + "\n")
+      out_gz = OUTPUT_DIR / "aizynth_output.json.gz"
+      cmd = [str(VENV_BIN / "aizynthcli"),
+             "--config", str(DATA_DIR / "config.yml"),
+             "--smiles", str(smi_file),
+             "--output", str(out_gz)]
+      env = dict(os.environ)
+      env["AIZYNTHFINDER_TIME_LIMIT"] = str(TIME_LIMIT)  # honored by config search.time_limit
+      print("running:", " ".join(cmd), flush=True)
+      aizynth_ok = True
+      try:
+          subprocess.run(cmd, check=True, env=env)
+      except Exception as e:
+          aizynth_ok = False
+          print(f"WARN: aizynthcli failed ({e}); falling back to SAscore-only "
+                f"(is_solved left blank).", flush=True)
+      if aizynth_ok:
+          try:
+              import gzip
+              with gzip.open(out_gz, "rt") as gf:
+                  data = json.load(gf)
+              # aizynthcli writes pandas orient='table': {"schema":..,"data":[row,..]}.
+              # (pd.read_json chokes on the nested 'trees' column — parse directly.)
+              if isinstance(data, dict) and isinstance(data.get("data"), list):
+                  records = data["data"]
+              elif isinstance(data, list):
+                  records = data
+              else:
+                  records = []
+              for rec in records:
+                  tgt = str(rec.get("target", "")).strip()
+                  cmol = Chem.MolFromSmiles(tgt)
+                  key = Chem.MolToSmiles(cmol) if cmol else tgt
+                  ns = rec.get("number_of_steps", rec.get("number of steps"))
+                  solved_map[key] = {
+                      "is_solved": bool(rec.get("is_solved", False)),
+                      "n_steps": (int(ns) if ns is not None and str(ns) not in ("nan", "None") else None),
+                  }
+              print(f"parsed {len(solved_map)} aizynth results", flush=True)
+          except Exception as e:
+              print(f"WARN: could not parse aizynth output ({e}); marking solved=unknown", flush=True)
+
+  # synth.csv
+  synth_csv = OUTPUT_DIR / "synth.csv"
+  with synth_csv.open("w", newline="") as f:
+      w = csv.writer(f)
+      w.writerow(["source_id", "smiles", "sa_score", "qed", "advanced_to_search", "is_solved", "n_steps"])
+      for r in rows:
+          smi = r["_smiles_canon"]
+          adv = r["_sa"] <= MAX_SA
+          s = solved_map.get(smi, {})
+          w.writerow([
+              (r.get("source_id") or r.get("filename") or "").strip(), smi,
+              r["_sa"], r["_qed"], adv,
+              s.get("is_solved", "" if adv else False), s.get("n_steps", ""),
+          ])
+  print(f"synth.csv -> {synth_csv}", flush=True)
+
+  # manifest_filtered: survivors keep input-manifest columns.
+  def keep(r):
+      if r["_sa"] > MAX_SA:
+          return False
+      if REQUIRE_SOLVED:
+          return solved_map.get(r["_smiles_canon"], {}).get("is_solved", False)
+      return True
+  survivors = [r for r in rows if keep(r)]
+  filt_csv = OUTPUT_DIR / "manifest_filtered.csv"
+  with filt_csv.open("w", newline="") as f:
+      w = csv.DictWriter(f, fieldnames=in_fields, extrasaction="ignore")
+      w.writeheader()
+      for r in survivors:
+          w.writerow({k: r.get(k, "") for k in in_fields})
+  print(f"survivors: {len(survivors)} (require_solved={REQUIRE_SOLVED}) -> {filt_csv}", flush=True)
+
+  outputs = {
+      "schema_version": 1,
+      "produced_at": datetime.now(timezone.utc).isoformat(),
+      "synth_table": str(synth_csv),
+      "manifest_filtered": str(filt_csv),
+      "n_input": len(rows),
+      "n_advanced": len(advance),
+      "n_survivors": len(survivors),
+      "rejected": rejected,
+      "params": {"max_sa_score": MAX_SA, "require_solved": REQUIRE_SOLVED,
+                 "time_limit_s": TIME_LIMIT, "custom_stock": bool(STOCK)},
+  }
+  (OUTPUT_DIR / "outputs.json").write_text(json.dumps(outputs, indent=2, default=str))
+  print("DONE", flush=True)
+  __SYNTH_PY_EOF__
+
+  # Optionally splice a custom building-block stock into the config.
+  STOCK_PATH={{.inputs.stock_hdf5 | quote}}
+  if [ -n "$STOCK_PATH" ]; then
+    [ -r "$STOCK_PATH" ] || { echo "stock_hdf5 not readable: $STOCK_PATH" >&2; exit 1; }
+    echo "[synth] custom stock supplied: $STOCK_PATH (appended to config stock)" >&2
+    apptainer exec --bind /mnt/efs "$IMAGE" "$VENV_DIR/bin/python" - "$DATA_DIR/config.yml" "$STOCK_PATH" <<'__CFG_EOF__'
+  import sys, yaml
+  cfg_path, stock = sys.argv[1], sys.argv[2]
+  with open(cfg_path) as f: cfg = yaml.safe_load(f) or {}
+  cfg.setdefault("stock", {})["custom"] = stock
+  with open(cfg_path, "w") as f: yaml.safe_dump(cfg, f)
+  print("config stock updated", flush=True)
+  __CFG_EOF__
+  fi
+
+  export SYNTH_MANIFEST={{.inputs.ligand_manifest | quote}}
+  export SYNTH_STOCK="$STOCK_PATH"
+  export SYNTH_MAX_SA={{.params.max_sa_score}}
+  export SYNTH_REQUIRE_SOLVED={{.params.require_solved}}
+  export SYNTH_TIME_LIMIT={{.params.time_limit_s}}
+  export SYNTH_VENV_BIN="$VENV_DIR/bin"
+
+  cd "$OUTPUT_DIR"
+  exec apptainer exec --bind /mnt/efs "$IMAGE" \
+    "$VENV_DIR/bin/{{.runtime.entrypoint}}" "$SCRIPT_PATH" \
+    2>&1 | tee "$OUTPUT_DIR/stdout.log"

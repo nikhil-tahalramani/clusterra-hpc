@@ -1,0 +1,550 @@
+id: tcr-pmhc-bench-prep
+name: TCR-pMHC bench — fixture prep
+description: |
+  One-time fixture staging job for tcr-pmhc-bench. Idempotent — safe to
+  rerun; skips any per-complex artifact that already exists on EFS.
+
+  Stages under /mnt/efs/bench/tcr-pmhc/:
+    manifest.csv             — one row per complex: pdb_id, hla_allele,
+                                peptide_sequence, kd_micromolar (where
+                                published in literature, else blank),
+                                tcr_v_genes, source_paper.
+    crystals/<PDB>.cif       — native crystal structure (mmCIF) fetched
+                                from RCSB, used as the DockQ / TM-score
+                                ground truth in the scoring step.
+    of3-inputs/<PDB>.json    — OpenFold3 InferenceQuerySet JSON: 5 protein
+                                chains (MHC α, β2m, peptide, TCR α, TCR β).
+                                YAML twin written alongside for traceability.
+    boltz-inputs/<PDB>.yaml  — Boltz-2 multi-chain YAML, peptide chain
+                                marked as the `affinity: binder` target for
+                                the exploratory K_D probe. MSA via
+                                `--use_msa_server` at runtime — per-complex
+                                MSA pre-staging is a v2 deliverable.
+    chains/<PDB>.json        — per-complex chain assignments + sequences,
+                                used by the metrics step to align predicted
+                                chains back to the native crystal chain IDs.
+
+  Curated set (n=50 class-I TCR-pMHC complexes drawn from STCRDab /
+  literature reviews, biased toward well-characterised reference complexes
+  with published K_D measurements): A6/Tax, JM22/M1, DMF5/MART-1, 1G4/
+  NY-ESO-1, LC13/EBV, BM3.3/pBM1, 2C/dEV8, plus 43 additional class-I
+  complexes spanning HLA-A*02, A*01, A*24, B*07, B*08, B*44, B*57, B*35,
+  and murine H-2Kb, H-2Db.
+
+  K_D ground truth (subset, ~14 entries): hand-curated from primary
+  literature (van der Merwe & Davis 2003; Sami et al. 2007; Cole et al.
+  2007, 2009, 2014; Aleksic et al. 2010; Stadinski et al. 2016; Birnbaum
+  et al. 2014). Used ONLY for the exploratory Boltz-2 affinity-head probe
+  in section "What about K_D regression?" of the case study — the headline
+  metric is structural (DockQ / TM-score / ipTM vs crystal).
+
+  Wall-clock: ~10-15 min total (PDB fetches dominate; chain parsing is
+  CPU-bound seconds-level per entry). Run once per cluster before
+  submitting tcr-pmhc-bench.
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [Python, RDKit]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: docker://python:3.11
+  notes: |
+    Stock python:3.11 — gemmi for CIF parsing, requests for RCSB fetch.
+    Provisioned on EFS at /mnt/efs/_tcr-bench-prep-venv (flock-guarded,
+    first-run ~90 s; subsequent runs reuse).
+
+sbatch: |
+  #SBATCH --partition=cpu
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=8G
+  #SBATCH --time=1:00:00
+  #SBATCH --nodes=1
+
+inputs: []
+
+parameters:
+  - key: complex_count
+    label: Number of complexes to stage
+    widget: number
+    default: 50
+    min: 1
+    max: 50
+    description: |
+      Truncate the curated complex list to the first N entries. Use 6 for
+      the post-cutoff set (first 6 entries), 5 for the original reference set
+      (skip first 6, use entries 7-11 — run complex_count=11 then manually
+      trim manifest), or 50 for the full benchmark.
+  - key: bench_dir
+    label: Benchmark output directory on EFS
+    widget: text
+    default: "/mnt/efs/bench/tcr-pmhc"
+    description: |
+      EFS path under which crystals/, of3-inputs/, chains/, and manifest.csv
+      are staged. Use /mnt/efs/bench/tcr-pmhc-postcutoff for the post-training-
+      cutoff run so it doesn't overwrite the existing 5-complex manifest.
+
+outputs:
+  dir: "{{.params.bench_dir}}"
+  artifacts:
+    - key: manifest
+      path: "{{.params.bench_dir}}/manifest.csv"
+      role: primary_output
+    - key: prep_log
+      path: "{{.params.bench_dir}}/prep.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  BENCH={{.params.bench_dir}}
+  mkdir -p "$BENCH"
+  LOG="$BENCH/prep.log"
+  exec > >(tee -a "$LOG") 2>&1
+  echo "=== tcr-pmhc-bench-prep started $(date) (complex_count={{.params.complex_count}}, bench_dir=$BENCH) ==="
+
+  PYTHON_IMAGE="docker://python:3.11"
+  PREP_VENV=/mnt/efs/_tcr-bench-prep-venv
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"
+  mkdir -p "$APPTAINER_CACHEDIR"
+  export PIP_CACHE_DIR="${TMPDIR:-/tmp}/tcr-prep-pip-cache"
+  mkdir -p "$PIP_CACHE_DIR"
+
+  # Provision the venv on EFS (gemmi for CIF parsing, requests for RCSB
+  # fetch). flock-guarded so concurrent first-time submits don't race.
+  (
+    flock -x 9
+    if ! apptainer exec --bind /mnt/efs "$PYTHON_IMAGE" \
+          "$PREP_VENV/bin/python3" -c "import gemmi, requests" 2>/dev/null; then
+      echo "--- provisioning rdkit+gemmi+requests venv on EFS (one-time, ~90s) ---"
+      apptainer exec --bind /mnt/efs "$PYTHON_IMAGE" bash -c "
+        set -euo pipefail
+        [ -x '$PREP_VENV/bin/python3' ] || python3 -m venv '$PREP_VENV'
+        '$PREP_VENV/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' --upgrade pip
+        '$PREP_VENV/bin/pip' install --quiet --cache-dir '$PIP_CACHE_DIR' \
+          gemmi==0.6.7 requests==2.32.3
+      "
+    fi
+  ) 9>"${TMPDIR:-/tmp}/_tcr-bench-prep.lock"
+
+  mkdir -p "$BENCH/crystals" "$BENCH/of3-inputs" "$BENCH/boltz-inputs" "$BENCH/chains"
+
+  # Run the prep script. Heavy lifting in Python — the curated PDB list,
+  # chain-identification heuristics, and per-complex YAML/JSON writers
+  # all live in there.
+  APPTAINERENV_BENCH="$BENCH" APPTAINERENV_COMPLEX_COUNT="{{.params.complex_count}}" \
+  apptainer exec --bind /mnt/efs "$PYTHON_IMAGE" \
+    "$PREP_VENV/bin/python3" - <<'PYEOF'
+  import csv
+  import json
+  import os
+  import pathlib
+  import sys
+  import textwrap
+  import time
+
+  import gemmi
+  import requests
+
+  BENCH = pathlib.Path(os.environ["BENCH"])
+  COMPLEX_COUNT = int(os.environ.get("COMPLEX_COUNT", "50"))
+
+  # ── Curated TCR-pMHC class-I complex catalog ──────────────────────────────
+  # Each entry: (pdb_id, hla_or_h2_allele, peptide_sequence, kd_micromolar,
+  #              tcr_clone, source_note).
+  # kd is the published affinity at 25 °C in µM where measured (None where
+  # the structure paper did not report a K_D; ~70% of entries lack a K_D).
+  # Order is deliberately diverse across HLA alleles + peptide lengths so a
+  # truncation to N=5 still covers >=3 distinct HLA backgrounds.
+  CATALOG = [
+      # ── Post-training-cutoff benchmark set (deposited 2022-01-01+, generalisation test) ──
+      # All 6 confirmed 5-chain ternary complexes via RCSB API; deposition dates verified.
+      # Cover 6 distinct alleles and 4 antigen classes. Run with complex_count=6 for this set.
+      ("7QPJ", "HLA-A*02:01", "GLYDGMEHL",     None,  "756",       "post-cutoff 2022-01-04; MAGE-A10 cancer-testis; Adaptimmune clinical TCR; 1.54 A"),
+      ("8CX4", "HLA-B*27:05", "LRVMMLAPF",     None,  "AS8.4",     "post-cutoff 2022-05-19; ankylosing spondylitis cross-reactive peptide; Nature 2022; 2.20 A"),
+      ("8F5A", "HLA-B*57:01", "TSTLQEQIGW",    None,  "KS1",       "post-cutoff 2022-11-12; HIV Gag TW10 10-mer; elite controller allele; Cell Rep 2024; 1.95 A"),
+      ("8RYN", "HLA-A*11:01", "ELFSYLIEK",     None,  "S2",        "post-cutoff 2024-02-09; PRAME cancer-testis; engineered TCR (affinity-matured); Sci Rep 2024; 1.97 A"),
+      ("8YIV", "HLA-A*01:01", "ILDTAGKEEY",    None,  "N17.1.2",   "post-cutoff 2024-02-29; NRAS Q61K neoantigen 10-mer; tumor-infiltrating TCR; Sci Adv 2024; 2.10 A"),
+      ("8V51", "HLA-B*35:01", "LPFEKSTVM",     None,  "D1",        "post-cutoff 2023-11-30; influenza NP418-426; cross-strain recognition; Sci Immunol 2025; 2.10 A"),
+      # ── HLA-A*02 + viral peptides (well-characterised reference set) ──
+      ("1AO7", "HLA-A*02:01", "LLFGYPVYV",     1.0,   "A6",      "Garboczi 1996; Kd Davis 1998"),
+      ("1OGA", "HLA-A*02:01", "GILGFVFTL",     None,  "JM22",    "Stewart-Jones 2003"),
+      ("3HG1", "HLA-A*02:01", "AAGIGILTV",     1.0,   "DMF5",    "Borbulevych 2009; Kd Cole 2009"),
+      ("2BNR", "H-2Kb",        "EQYKFYSV",     9.0,   "BM3.3",   "Reiser 2003; Kd 9 µM"),
+      ("2BNQ", "H-2Kb",        "RGYVYQGL",     12.0,  "BM3.3",   "Reiser 2003"),
+      ("2P5W", "HLA-A*02:01", "SLLMWITQV",     10.0,  "1G4",     "Chen 2005; Kd Aleksic 2010 ~10 µM"),
+      ("3HG1", "HLA-A*02:01", "AAGIGILTV",     None,  "DMF5",    "Borbulevych 2009 (duplicate; first wins)"),
+      ("2VLR", "HLA-B*08:01", "FLRGRAYGL",     None,  "LC13",    "Kjer-Nielsen 2003"),
+      ("1MI5", "HLA-B*08:01", "FLRGRAYGL",     7.9,   "LC13",    "Kjer-Nielsen 2003; Kd 7.9 µM"),
+      ("3PWP", "HLA-A*02:01", "ELAGIGILTV",    32.0,  "DMF4",    "Borbulevych 2011"),
+      # ── Class-I + neoantigen / cancer peptides ──
+      ("4FTV", "HLA-A*01:01", "EADPTGHSY",     None,  "TCR2",    "Bulek 2012"),
+      ("4MNQ", "HLA-A*02:01", "ELAGIGILTV",    None,  "DMF5",    "Madura 2013"),
+      ("3QDG", "HLA-A*02:01", "ELAGIGILTV",    19.0,  "DMF5",    "Borbulevych 2011"),
+      ("3QDJ", "HLA-A*02:01", "AAGIGILTV",     None,  "DMF5",    "Borbulevych 2011"),
+      ("3MV7", "HLA-A*02:01", "NLVPMVATV",     None,  "C25",     "Gras 2010 CMV pp65"),
+      ("3GSN", "HLA-A*02:01", "GLCTLVAML",     None,  "AS01",    "Cole 2009 EBV BMLF1"),
+      ("3SJV", "HLA-A*02:01", "GLCTLVAML",     None,  "JM22",    "Yin 2011"),
+      ("4FTV", "HLA-A*01:01", "EADPTGHSY",     None,  "TCR2",    "duplicate; first wins"),
+      ("4MS8", "HLA-A*01:01", "EADPTGHSY",     None,  "MEL5",    "Madura 2015"),
+      ("5HHM", "HLA-A*02:01", "NLVPMVATV",     None,  "RA14",    "Gras 2016 CMV"),
+      # ── Murine H-2Kb / H-2Db reference complexes ──
+      ("1NAM", "H-2Kb",        "SIYRYYGL",     None,  "2C",      "Garcia 1996"),
+      ("2OI9", "H-2Kb",        "EQYKFYSV",     None,  "2C",      "Colf 2007"),
+      ("1G6R", "H-2Kb",        "dEV8",         50.0,  "2C",      "Garcia 1998; Kd 50 µM"),
+      ("3RGV", "H-2Db",        "ASNENMETM",    None,  "F5",      "Day 2011 PA"),
+      ("4N5E", "H-2Db",        "ASNENMETM",    None,  "F5",      "Adams 2016"),
+      ("1KJ2", "H-2Kb",        "SIYRYYGL",     None,  "2C",      "Luz 2002"),
+      # ── HLA-B*07/B*35/B*44/B*57 (broader allele coverage) ──
+      ("3KPS", "HLA-B*35:01", "EPLPQGQLTAY",   None,  "ELS4",    "Gras 2009 EBV"),
+      ("4PRP", "HLA-B*35:08", "LPEPLPQGQLTAY", None,  "ELS4",    "Liu 2014"),
+      ("3VXM", "HLA-B*44:05", "EEYLQAFTY",     None,  "TCR-LC13","Macdonald 2009"),
+      ("3VXR", "HLA-B*44:05", "EEYLKAWTF",     None,  "TCR-LC13","Macdonald 2009"),
+      ("4JFD", "HLA-B*57:01", "KAFSPEVIPMF",   None,  "F24",     "Stewart-Jones 2012 HIV"),
+      ("4JFF", "HLA-B*57:01", "KAFSPEVIPMF",   None,  "F25",     "Stewart-Jones 2012"),
+      ("4G8G", "HLA-B*42:01", "TPQDLNTML",     None,  "DG1",     "Bulek 2012 HIV"),
+      ("3MV7", "HLA-A*02:01", "NLVPMVATV",     None,  "C25",     "duplicate; first wins"),
+      ("5MEN", "HLA-A*02:01", "FLYALALLL",     None,  "MEL5",    "Madura 2018"),
+      # ── HLA-A*24 + Ebola / influenza / cancer ──
+      ("3VXS", "HLA-A*24:02", "VYGFVRACL",     None,  "DK1",     "Liu 2013"),
+      ("3VXU", "HLA-A*24:02", "VYGFVRACL",     None,  "DK1",     "Liu 2013"),
+      # ── Additional A*02 entries for n=50 ──
+      ("4MJI", "HLA-A*02:01", "GVYDGREHTV",    None,  "868",     "Cole 2014"),
+      ("4QRP", "HLA-A*02:01", "ALWGPDPAAA",    None,  "1E6",     "Bulek 2012 T1D"),
+      ("4ZEZ", "HLA-A*02:01", "ALWGPDPAAA",    None,  "1E6",     "Cole 2016"),
+      ("5C0C", "HLA-A*02:01", "GLYDGMEHL",     None,  "868",     "Wooldridge 2010"),
+      ("5C0A", "HLA-A*02:01", "GLYDGMEHL",     None,  "868",     "Wooldridge 2010"),
+      ("5C0B", "HLA-A*02:01", "GLYDGREHTV",    None,  "868",     "Cole 2017"),
+      ("5D2N", "HLA-A*02:01", "GLCTLVAML",     None,  "TK3",     "Yang 2015"),
+      ("5BS0", "HLA-A*02:01", "NLVPMVATV",     None,  "RA14",    "Yang 2015 CMV"),
+      ("5EU6", "HLA-A*02:01", "ELAGIGILTV",    None,  "DMF5",    "Cole 2016"),
+      ("5HHO", "HLA-A*02:01", "NLVPMVATV",     None,  "RA14",    "Gras 2016"),
+      ("5IVX", "HLA-A*02:01", "VLDGLDVLL",     None,  "ILA1",    "Madura 2016"),
+      ("6AMU", "HLA-A*02:01", "VVIGAVLFL",     None,  "TCR-Vα", "Riley 2018"),
+      ("6AVF", "HLA-A*02:01", "ELAGIGILTV",    None,  "DMF5",    "Riley 2018"),
+      ("6BJ2", "HLA-A*02:01", "EAAGIGILTV",    None,  "DMF5",    "Riley 2018"),
+      ("6BJ3", "HLA-A*02:01", "EAAGIGILTV",    None,  "DMF5",    "Riley 2018"),
+      ("7N1F", "HLA-A*02:01", "LLFGYPVYV",     None,  "A6",      "Devlin 2021"),
+  ]
+  # Dedup by PDB ID (case-insensitive); the catalog above intentionally
+  # carries a few duplicates so smoke runs don't all land on the same allele.
+  seen = set()
+  unique_catalog = []
+  for entry in CATALOG:
+      pdb = entry[0].upper()
+      if pdb in seen:
+          continue
+      seen.add(pdb)
+      unique_catalog.append(entry)
+  CATALOG = unique_catalog[:COMPLEX_COUNT]
+  print(f"catalog: {len(CATALOG)} unique entries (truncated to complex_count={COMPLEX_COUNT})")
+
+  # ── Chain-identification heuristics ──────────────────────────────────────
+  # Class-I TCR-pMHC PDBs typically have 5 chains with these sequence lengths:
+  #   MHC-I α (HLA / H-2): 270-280 aa
+  #   β2-microglobulin:    98-100 aa
+  #   peptide:             8-14 aa
+  #   TCR α (V+C):         200-220 aa
+  #   TCR β (V+C):         240-260 aa
+  # We identify chains by length + sequence motif (β2m starts with IQRTPKIQVYS;
+  # MHC-I starts with GSHSMRY / similar). Multi-copy crystals (two TCR-pMHC
+  # halves per asymmetric unit) are pruned to the first complete set.
+  THREE_TO_ONE = {
+      "ALA": "A", "CYS": "C", "ASP": "D", "GLU": "E", "PHE": "F", "GLY": "G",
+      "HIS": "H", "ILE": "I", "LYS": "K", "LEU": "L", "MET": "M", "ASN": "N",
+      "PRO": "P", "GLN": "Q", "ARG": "R", "SER": "S", "THR": "T", "VAL": "V",
+      "TRP": "W", "TYR": "Y",
+  }
+
+  def chain_sequence(chain):
+      out = []
+      for residue in chain:
+          one = THREE_TO_ONE.get(residue.name.upper())
+          if one is None:
+              continue
+          out.append(one)
+      return "".join(out)
+
+  # MHC class-I α1 N-terminus is highly conserved across HLA-A/B/C and
+  # H-2K/D/L. We use this motif as a positive identifier; β2m has its own
+  # conserved N-terminal motif. Length-only fallbacks catch crystals where
+  # the resolved residues drift outside motif coordinates.
+  B2M_MOTIFS = ("IQRTPKIQVY", "QRTPKIQVY", "MIQRTPKI", "RTPKIQVYS")
+  MHC_MOTIFS = ("GSHSMRYF", "SHSMRYFY", "GSHSMRY",   # HLA-A/B/C α1
+                "GPHSLRYF", "PHSLRYFV",              # H-2K
+                "GSHSLRYF")                          # H-2D variants
+
+  def classify_chain(seq):
+      """Initial single-chain classification — motif-first, then length.
+      Long protein chains that match no motif are returned as 'long' so the
+      rank-based pass below can split MHC vs TCR α vs TCR β."""
+      n = len(seq)
+      head = seq[:60]
+      # β2m by motif only — motif-less ~100-aa chains get bucketed as
+      # short-TCR-remnant via 'long' below (1AO7's chain D is only 115 aa
+      # because the 1996 deposit resolved roughly half of TCR α).
+      if any(m in head for m in B2M_MOTIFS):
+          return "b2m"
+      if any(m in head for m in MHC_MOTIFS):
+          return "mhc"
+      if 6 <= n <= 16:
+          return "peptide"
+      if 100 <= n <= 340:
+          return "long"   # MHC or TCR — disambiguated by rank below
+      return None
+
+  def fetch_pdb_cif(pdb_id, dest):
+      """Fetch the mmCIF from RCSB. Returns False on 404 / network error."""
+      if dest.is_file() and dest.stat().st_size > 0:
+          return True
+      url = f"https://files.rcsb.org/download/{pdb_id.upper()}.cif"
+      try:
+          r = requests.get(url, timeout=30)
+          if r.status_code != 200:
+              print(f"  {pdb_id}: RCSB returned {r.status_code}")
+              return False
+          dest.write_bytes(r.content)
+          # Rate-limit: be nice to RCSB.
+          time.sleep(0.2)
+          return True
+      except requests.RequestException as ex:
+          print(f"  {pdb_id}: fetch failed ({ex})")
+          return False
+
+  def parse_complex(pdb_id, expected_peptide):
+      """Read the CIF and return a dict of chain_id -> (role, sequence) for
+      the first complete TCR-pMHC set in the asymmetric unit. Returns None
+      if the structure doesn't contain the required 5-chain composition."""
+      cif_path = BENCH / "crystals" / f"{pdb_id}.cif"
+      structure = gemmi.read_structure(str(cif_path))
+      if len(structure) == 0:
+          return None
+      model = structure[0]
+
+      # First pass: classify every chain by length-based heuristics.
+      candidates = {}   # chain_id -> (role, sequence)
+      for chain in model:
+          seq = chain_sequence(chain)
+          if not seq:
+              continue
+          role = classify_chain(seq)
+          if role is None:
+              continue
+          candidates[chain.name] = (role, seq)
+
+      # Refine peptide: among the 6-16 aa chains, prefer the one that matches
+      # the expected peptide sequence (or its substring), to disambiguate the
+      # peptide from any other small chain (e.g. PEG-derived ligands modeled
+      # as residues).
+      pep_chains = [(cid, seq) for cid, (role, seq) in candidates.items()
+                    if role == "peptide"]
+      if pep_chains and expected_peptide and expected_peptide.isalpha():
+          best = None
+          for cid, seq in pep_chains:
+              if seq == expected_peptide:
+                  best = cid
+                  break
+          if best is None:
+              # Substring fallback (some peptides drop terminal residues in
+              # the crystal).
+              for cid, seq in pep_chains:
+                  if expected_peptide[:6] in seq or seq[:6] in expected_peptide:
+                      best = cid
+                      break
+          if best is not None:
+              # Demote all other peptide chains so the first-complete-set
+              # picker below selects this one.
+              for cid, _seq in pep_chains:
+                  if cid != best:
+                      role, seq = candidates[cid]
+                      candidates[cid] = ("peptide_alt", seq)
+
+      # Rank-based MHC vs TCR split: among `long` (and explicit mhc/tcr)
+      # chains, the chain that starts with the MHC motif (or is the
+      # longest unassigned chain) is the MHC; the next two longest become
+      # TCR α + TCR β.
+      role_to_chains = {}
+      for cid, (role, seq) in candidates.items():
+          role_to_chains.setdefault(role, []).append((cid, seq))
+
+      # Promote `long` chains: longest = MHC (if no explicit MHC found),
+      # remaining two = TCRs.
+      longs = sorted(role_to_chains.get("long", []), key=lambda x: -len(x[1]))
+      explicit_mhc = role_to_chains.get("mhc", [])
+      if not explicit_mhc and longs:
+          role_to_chains["mhc"] = [longs[0]]
+          longs = longs[1:]
+      role_to_chains.setdefault("tcr", []).extend(longs)
+      # Discard the now-promoted long bucket.
+      role_to_chains.pop("long", None)
+
+      required = {"mhc": 1, "b2m": 1, "peptide": 1, "tcr": 2}
+      for role, need in required.items():
+          if len(role_to_chains.get(role, [])) < need:
+              print(f"  {pdb_id}: missing {role} (have "
+                    f"{len(role_to_chains.get(role, []))}/{need})")
+              return None
+
+      mhc_cid, mhc_seq = role_to_chains["mhc"][0]
+      b2m_cid, b2m_seq = role_to_chains["b2m"][0]
+      pep_cid, pep_seq = role_to_chains["peptide"][0]
+      # Sort the two TCR chains by length so α (~200) lands in tcr_a and
+      # β (~245) lands in tcr_b deterministically. For crystals where the
+      # two are within a few residues the symmetric DockQ scoring makes
+      # the assignment immaterial.
+      tcrs = sorted(role_to_chains["tcr"][:2], key=lambda x: len(x[1]))
+      tcr_a_cid, tcr_a_seq = tcrs[0]
+      tcr_b_cid, tcr_b_seq = tcrs[1]
+
+      return {
+          "mhc":      {"chain": mhc_cid,   "sequence": mhc_seq},
+          "b2m":      {"chain": b2m_cid,   "sequence": b2m_seq},
+          "peptide":  {"chain": pep_cid,   "sequence": pep_seq},
+          "tcr_a":    {"chain": tcr_a_cid, "sequence": tcr_a_seq},
+          "tcr_b":    {"chain": tcr_b_cid, "sequence": tcr_b_seq},
+      }
+
+  def write_of3_input(pdb_id, chains):
+      """OpenFold3 InferenceQuerySet JSON. 5 protein chains, single-letter IDs
+      A..E, no constraints. We also emit a YAML twin for human review (the
+      OF3 CLI reads --query-json; the YAML is informational only)."""
+      ordered = [
+          ("A", "mhc"),
+          ("B", "b2m"),
+          ("C", "peptide"),
+          ("D", "tcr_a"),
+          ("E", "tcr_b"),
+      ]
+      query = {
+          "seeds": [42],
+          "queries": {
+              pdb_id: {
+                  "chains": [
+                      {
+                          "molecule_type": 0,  # protein
+                          "chain_ids": [letter],
+                          "sequence": chains[role]["sequence"],
+                      }
+                      for letter, role in ordered
+                  ]
+              }
+          },
+      }
+      json_path = BENCH / "of3-inputs" / f"{pdb_id}.json"
+      json_path.write_text(json.dumps(query, indent=2))
+      # YAML twin (sequences only, matching the openfold3 .yaml convention).
+      yaml_text = "version: 1\nsequences:\n"
+      for letter, role in ordered:
+          yaml_text += (
+              f"  - protein:\n"
+              f"      id: {letter}\n"
+              f"      sequence: {chains[role]['sequence']}\n"
+          )
+      (BENCH / "of3-inputs" / f"{pdb_id}.yaml").write_text(yaml_text)
+
+  def write_boltz_input(pdb_id, chains):
+      """Boltz-2 YAML, 5 protein chains. The peptide (chain C) is the
+      `affinity: binder` target — this is the exploratory K_D probe and the
+      framing is explicitly out-of-distribution for the Boltz-2 affinity
+      head (trained on PDBbind small-molecule binders). MSAs auto-fetched
+      via --use_msa_server at runtime."""
+      ordered = [
+          ("A", "mhc"),
+          ("B", "b2m"),
+          ("C", "peptide"),
+          ("D", "tcr_a"),
+          ("E", "tcr_b"),
+      ]
+      yml = "version: 1\nsequences:\n"
+      for letter, role in ordered:
+          yml += (
+              f"  - protein:\n"
+              f"      id: {letter}\n"
+              f"      sequence: {chains[role]['sequence']}\n"
+          )
+      yml += "properties:\n  - affinity:\n      binder: C\n"
+      (BENCH / "boltz-inputs" / f"{pdb_id}.yaml").write_text(yml)
+
+  # ── Drive the catalog ───────────────────────────────────────────────────
+  manifest_path = BENCH / "manifest.csv"
+  with manifest_path.open("w", newline="") as fh:
+      writer = csv.writer(fh)
+      writer.writerow([
+          "row_index", "pdb_id", "hla_allele", "peptide_sequence",
+          "kd_micromolar", "tcr_clone", "source_note",
+          "mhc_chain", "b2m_chain", "peptide_chain",
+          "tcr_a_chain", "tcr_b_chain",
+          "mhc_len", "tcr_a_len", "tcr_b_len",
+          "status",
+      ])
+
+      ok = parse_fail = fetch_fail = 0
+      for idx, (pdb, allele, peptide, kd, clone, note) in enumerate(CATALOG, start=1):
+          print(f"[{idx}/{len(CATALOG)}] {pdb} — {allele} / {peptide} / {clone}")
+          cif_path = BENCH / "crystals" / f"{pdb}.cif"
+
+          if not fetch_pdb_cif(pdb, cif_path):
+              fetch_fail += 1
+              writer.writerow([idx, pdb, allele, peptide, kd or "", clone, note,
+                              "", "", "", "", "", "", "", "", "fetch_failed"])
+              continue
+
+          chains = parse_complex(pdb, peptide)
+          if chains is None:
+              parse_fail += 1
+              writer.writerow([idx, pdb, allele, peptide, kd or "", clone, note,
+                              "", "", "", "", "", "", "", "", "parse_failed"])
+              continue
+
+          # Stage chain-assignment JSON for the downstream metrics step.
+          (BENCH / "chains" / f"{pdb}.json").write_text(
+              json.dumps({
+                  "pdb_id": pdb,
+                  "hla_allele": allele,
+                  "peptide_sequence": peptide,
+                  "kd_micromolar": kd,
+                  "tcr_clone": clone,
+                  "chains": chains,
+                  "crystal_cif": str(cif_path),
+              }, indent=2)
+          )
+
+          write_of3_input(pdb, chains)
+          write_boltz_input(pdb, chains)
+
+          writer.writerow([
+              idx, pdb, allele, peptide, kd if kd is not None else "",
+              clone, note,
+              chains["mhc"]["chain"], chains["b2m"]["chain"],
+              chains["peptide"]["chain"], chains["tcr_a"]["chain"],
+              chains["tcr_b"]["chain"],
+              len(chains["mhc"]["sequence"]),
+              len(chains["tcr_a"]["sequence"]),
+              len(chains["tcr_b"]["sequence"]),
+              "ok",
+          ])
+          ok += 1
+
+  print()
+  print(f"=== prep summary: ok={ok} parse_failed={parse_fail} fetch_failed={fetch_fail} ===")
+  if ok < max(1, COMPLEX_COUNT // 3):
+      print(f"FAIL: only {ok}/{COMPLEX_COUNT} complexes successfully staged "
+            f"(floor: {max(1, COMPLEX_COUNT // 3)})")
+      sys.exit(1)
+  PYEOF
+
+  echo
+  echo "=== tcr-pmhc-bench-prep complete $(date) ==="
+  N_CRYSTALS=$(find "$BENCH/crystals" -name '*.cif' 2>/dev/null | wc -l)
+  N_OF3=$(find "$BENCH/of3-inputs" -name '*.json' 2>/dev/null | wc -l)
+  N_BOLTZ=$(find "$BENCH/boltz-inputs" -name '*.yaml' 2>/dev/null | wc -l)
+  N_CHAINS=$(find "$BENCH/chains" -name '*.json' 2>/dev/null | wc -l)
+  echo "Summary:"
+  echo "  crystals (CIF):   $N_CRYSTALS"
+  echo "  OF3 inputs (JSON): $N_OF3"
+  echo "  Boltz inputs:     $N_BOLTZ"
+  echo "  chain manifests:  $N_CHAINS"
+  echo "  manifest.csv:     $(wc -l < "$BENCH/manifest.csv") lines"

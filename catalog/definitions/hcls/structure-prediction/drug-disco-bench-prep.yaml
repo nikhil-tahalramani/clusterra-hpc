@@ -1,0 +1,666 @@
+id: drug-disco-bench-prep
+name: Drug discovery — fixture prep
+description: |
+  One-time fixture staging job for drug-disco-bench. Idempotent — safe to
+  rerun; skips steps where outputs already exist on EFS.
+
+  Stages under /mnt/efs/bench/drug-disco/:
+    egfr-kinase-input.yaml   — OpenFold3 input for EGFR kinase domain (~327 aa)
+    egfr-receptor.pdbqt      — EGFR receptor PDBQT for Uni-Dock (PDB 1M17,
+                                EGFR + erlotinib, 2.6 Å)
+    zinc-1k/ligands/         — 1000 PDBQT ligands from ChEMBL CHEMBL203
+                                (EGFR/ErbB1) Kd-actives, top 1000 by potency
+    boltz2-batch/            — 100 per-complex Boltz-2 YAML inputs (EGFR + top
+                                100 most-potent ChEMBL203 ligands) with the
+                                affinity head enabled
+    gromacs/candidate_{1,2,3}.tpr  — 3 protein-only .tpr files configured for
+                                      1ns NPT production MD (AMBER99SB-ILDN +
+                                      TIP3P, 1M17 chain A). The downstream
+                                      `gromacs` workflow step runs the actual
+                                      `gmx mdrun`; the prep step's job ends at
+                                      the .tpr.
+
+  Wall-clock: ~60-90 min total (GROMACS EM + NVT + NPT dominates).
+  Run once per cluster before submitting drug-disco-bench.
+vertical: hcls
+category: structure-prediction
+workload_group: structure-prediction
+modality: form
+tools: [GROMACS, Python]
+ready: true
+kind: batch
+
+runtime:
+  kind: docker_image
+  image: nvcr.io/hpc/gromacs:2023.2
+
+sbatch: |
+  #SBATCH --partition=gpu
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=64G
+  #SBATCH --time=4:00:00
+  #SBATCH --nodes=1
+  #SBATCH --gres=gpu:l40s:1
+inputs: []
+parameters: []
+
+outputs:
+  dir: "/mnt/efs/bench/drug-disco"
+  artifacts:
+    - key: prep_log
+      path: "/mnt/efs/bench/drug-disco/prep.log"
+      role: log
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+  BENCH=/mnt/efs/bench/drug-disco
+  mkdir -p "$BENCH"
+  LOG="$BENCH/prep.log"
+  exec > >(tee -a "$LOG") 2>&1
+  echo "=== drug-disco-bench-prep started $(date) ==="
+
+  # NOTE: `runtime.kind: docker_image` is informational — the cluster-api does
+  # NOT wrap this script in apptainer exec. Every container invocation below is
+  # explicit. The runtime.image declaration drives shape/partition selection
+  # only.
+  PYTHON_IMAGE="docker://python:3.11"
+  GROMACS_IMAGE="docker://nvcr.io/hpc/gromacs:2023.2"
+
+  # Apptainer's CACHEDIR must be slurmd-local (NVMe via $TMPDIR), not EFS:
+  # apptainer enforces 0700 on its cache dir, and EFS NFSv4 propagation
+  # rejects cross-UID chmod with EPERM (verified job 2138). Pre-pulled SIFs
+  # live on EFS via $SIF_DIR so we still skip re-extracts across jobs;
+  # CACHEDIR is just the intermediate scratch for the pull/extract step.
+  export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/apt-cache"
+  mkdir -p "$APPTAINER_CACHEDIR"
+  SIF_DIR=/mnt/efs/_apt-sifs
+  mkdir -p "$SIF_DIR"
+
+  # ── 1. OF3 input YAML — EGFR kinase domain (UniProt P00533 aa 696-1022) ──
+  if [ ! -f "$BENCH/egfr-kinase-input.yaml" ] || [ ! -f "$BENCH/egfr-kinase-input.json" ]; then
+    echo "--- staging OF3 input YAML + JSON ---"
+    apptainer exec "$PYTHON_IMAGE" python3 - <<'PYEOF'
+  import json, pathlib, textwrap
+  seq = (
+    "KVLGSGAFGTVYKGLWIPEGEKVKIPVAIKELREATSPKANKEILDEAYVMASVDNPHVCRLLGICLTSTVQLIT"
+    "QLMPFGCLLDYVREHKDNIGSQYLLNWCVQIAKGMNYLEDRRLVHRDLAARNVLVKTPQHVKITDFGLAKLLGA"
+    "EKEYHAEGGKVPIKWMALESILHRIYTHQSDVWSYGVTVWELMTFGSKPYDGIPASEISSILEKGERLPQPPICT"
+    "IDVYMIMVKCWMIDADSRPKFRELIIEFSKMARDPQRYLVIQGDERMHLPSPTDSNFYRALMDEEDMDDVVDADE"
+    "YLIPQQGFFSSPSTSRTPLLSSLSATSNNSTVACIDRNGLQSCPIKEDSFLQRYSSDPTGALTEDSIDDTFLPVP"
+  )
+  base = pathlib.Path("/mnt/efs/bench/drug-disco/egfr-kinase-input")
+  base.with_suffix(".yaml").write_text(textwrap.dedent(f"""\
+    version: 1
+    sequences:
+      - protein:
+          id: EGFR_KD
+          sequence: {seq}
+  """))
+  # OF3 0.4.0's `run_openfold predict` takes --query-json with this exact
+  # InferenceQuerySet schema (verified via job 2094 schema dump): top-level
+  # `queries` is a dict keyed by query_name; each Query has `chains[]` with
+  # required {molecule_type, chain_ids} (sequence is optional). MoleculeType
+  # 0=protein. slurmd host has stdlib-only python — write JSON directly here.
+  base.with_suffix(".json").write_text(json.dumps({
+    "seeds": [42],
+    "queries": {
+      "EGFR_KD": {
+        "chains": [
+          {"molecule_type": 0, "chain_ids": ["A"], "sequence": seq}
+        ]
+      }
+    },
+  }))
+  print(f"OF3 input YAML + JSON written ({len(seq)} aa)")
+  PYEOF
+  else
+    echo "OF3 input YAML+JSON already present, skipping"
+  fi
+
+  # ── 2a. EGFR receptor PDBQT from PDB 1M17 (EGFR + erlotinib, 2.6 Å) ────────
+  # 1M17 is the EGFR kinase domain (UniProt P00533 residues 695-1022) co-
+  # crystallised with erlotinib — matches the EGFR FASTA used everywhere else
+  # in this prep. Single protein chain (chain A only), so the chain-A awk
+  # filter below is still correct (vestigial for 1M17, load-bearing earlier
+  # for 1IEP which was a homodimer).
+  RECEPTOR_PDBQT="$BENCH/egfr-receptor.pdbqt"
+  if [ ! -f "$RECEPTOR_PDBQT" ]; then
+    echo "--- generating EGFR receptor PDBQT from PDB 1M17 (EGFR + erlotinib, 2.6 Å) ---"
+    TMP_REC=$(mktemp -d)
+    curl -sSfL "https://files.rcsb.org/download/1M17.pdb" -o "$TMP_REC/1m17.pdb"
+    grep "^ATOM" "$TMP_REC/1m17.pdb" > "$TMP_REC/protein.pdb" || true
+    echo "END" >> "$TMP_REC/protein.pdb"
+    APPTAINERENV_TMP_REC="$TMP_REC" APPTAINERENV_RECEPTOR_PDBQT="$RECEPTOR_PDBQT" \
+    apptainer exec --bind "$TMP_REC:$TMP_REC" --bind "$BENCH:$BENCH" "$PYTHON_IMAGE" python3 - <<'PYEOF'
+  import os, pathlib, re
+  pdb = pathlib.Path(os.environ['TMP_REC'] + '/protein.pdb').read_text()
+  ad4 = {'C': 'C', 'N': 'NA', 'O': 'OA', 'S': 'SA', 'H': 'HD', 'P': 'P'}
+  out = []
+  for ln in pdb.splitlines():
+      if not ln.startswith('ATOM'): continue
+      elem = ln[76:78].strip() if len(ln) >= 78 else re.sub(r'\d', '', ln[12:16].strip())[:1].upper()
+      typ = ad4.get(elem.upper(), 'C')
+      out.append('{:<66}     0.000 {:>2s}'.format(ln[:66], typ))
+  pathlib.Path(os.environ['RECEPTOR_PDBQT']).write_text('\n'.join(out) + '\n')
+  print('receptor PDBQT: {} atoms'.format(len(out)))
+  PYEOF
+    rm -rf "$TMP_REC"
+    NREC=$(wc -l "$RECEPTOR_PDBQT" 2>/dev/null | cut -d' ' -f1) || NREC=0
+    [ "$NREC" -gt 0 ] && echo "receptor PDBQT staged ($NREC lines)" \
+      || echo "WARNING: receptor PDBQT empty or failed"
+  else
+    echo "receptor PDBQT already present, skipping"
+  fi
+
+  # ── 2b. 1000 ligand PDBQTs — ChEMBL CHEMBL203 (EGFR/ErbB1) Kd-actives ──────
+  # The ligand library is sourced from ChEMBL target CHEMBL203 (EGFR / ErbB1)
+  # via the public REST API, filtered to standard_type=Kd, deduplicated by
+  # RDKit canonical SMILES, and ranked by ascending Kd (most potent first).
+  # We take the top 1000 distinct canonical SMILES. Manifest CSV is written
+  # alongside the PDBQTs so the docking step can join scores back to
+  # source_id / Kd / source_db. Raw API response is cached on EFS so reruns
+  # don't re-hit ChEMBL.
+  ZINC_DIR="$BENCH/zinc-1k/ligands"
+  ZINC_MANIFEST="$BENCH/zinc-1k/manifest.csv"
+  CHEMBL_CACHE_DIR=/mnt/efs/_chembl-cache
+  CHEMBL_CACHE_JSON="$CHEMBL_CACHE_DIR/chembl203-kd.json"
+  PREP_VENV=/mnt/efs/_bench-prep-venv
+  NLIG=$(find "$ZINC_DIR" -name '*.pdbqt' 2>/dev/null | wc -l) || NLIG=0
+  # Regenerate if either the ligand files OR the manifest are missing.
+  # The Boltz-2 step downstream reads from manifest.csv; without it, a half-
+  # staged state (PDBQTs present, manifest deleted) would break step 3.
+  if [ "$NLIG" -lt 1000 ] || [ ! -f "$ZINC_MANIFEST" ]; then
+    echo "--- generating ligand PDBQTs from ChEMBL CHEMBL203 (EGFR) Kd-actives ---"
+    mkdir -p "$ZINC_DIR"
+    mkdir -p "$CHEMBL_CACHE_DIR"
+
+    # Provision the rdkit+requests venv on EFS (shared with Fix 3's compound
+    # selection downstream). requests is needed for the ChEMBL REST pagination
+    # loop; rdkit for canonicalisation, embedding, MMFF, PDBQT generation.
+    (
+      flock -x 9
+      if ! apptainer exec --bind /mnt/efs:/mnt/efs "$PYTHON_IMAGE" \
+            "$PREP_VENV/bin/python3" -c "import rdkit, requests" 2>/dev/null; then
+        echo "  provisioning rdkit+requests venv on EFS (one-time, ~2 min)"
+        apptainer exec --bind /mnt/efs:/mnt/efs "$PYTHON_IMAGE" bash -c "
+          set -euo pipefail
+          [ -x '$PREP_VENV/bin/python3' ] || python3 -m venv '$PREP_VENV'
+          '$PREP_VENV/bin/pip' install --quiet rdkit requests 2>&1 | tail -3
+        "
+      fi
+    # Lock file lives on local NVMe ($TMPDIR), not EFS — EFS NFSv4 perm
+  # propagation breaks the cross-UID flock acquisition (verified job 2139).
+  # Cross-node concurrency is theoretically possible (idempotent pip install
+  # tolerates it), so this is safe.
+  ) 9>"${TMPDIR:-/tmp}/_bench-prep-venv.lock"
+
+    # Step 1 — fetch + dedup + rank ChEMBL203 Kd actives, write manifest.
+    APPTAINERENV_CHEMBL_CACHE_JSON="$CHEMBL_CACHE_JSON" \
+    APPTAINERENV_ZINC_MANIFEST="$ZINC_MANIFEST" \
+    apptainer exec --bind /mnt/efs:/mnt/efs "$PYTHON_IMAGE" \
+      "$PREP_VENV/bin/python3" - <<'PYEOF'
+  import csv, json, os, pathlib, sys
+  import requests
+  from rdkit import Chem
+  from rdkit import RDLogger
+  RDLogger.DisableLog('rdApp.*')
+
+  cache = pathlib.Path(os.environ['CHEMBL_CACHE_JSON'])
+  manifest = pathlib.Path(os.environ['ZINC_MANIFEST'])
+  manifest.parent.mkdir(parents=True, exist_ok=True)
+
+  if cache.exists() and cache.stat().st_size > 0:
+      print(f'  using cached ChEMBL response: {cache}')
+      activities = json.loads(cache.read_text())
+  else:
+      # CHEMBL203 has only ~hundreds of Kd-typed activities in practice; widen
+      # to Kd + Ki + IC50 to comfortably clear 1000 distinct canonical SMILES.
+      # Activities are ranked by pchembl_value (negative log of standard_value
+      # in molar), which is dimensionless and comparable across assay types.
+      print('  fetching ChEMBL CHEMBL203 binding-affinity activities (Kd/Ki/IC50, paginated)...')
+      url = ('https://www.ebi.ac.uk/chembl/api/data/activity.json'
+             '?target_chembl_id=CHEMBL203'
+             '&standard_type__in=Kd,Ki,IC50'
+             '&pchembl_value__isnull=false'
+             '&limit=1000&format=json')
+      activities = []
+      while url:
+          r = requests.get(url, timeout=60)
+          r.raise_for_status()
+          body = r.json()
+          activities.extend(body.get('activities', []))
+          nxt = body.get('page_meta', {}).get('next')
+          url = ('https://www.ebi.ac.uk' + nxt) if nxt else None
+          print(f'  fetched {len(activities)} activities so far')
+      cache.write_text(json.dumps(activities))
+      print(f'  cached {len(activities)} activities to {cache}')
+
+  # Dedup by canonical SMILES, keep most-potent (highest pchembl_value) record
+  # per canon. pchembl_value is comparable across Kd/Ki/IC50 since all are -log
+  # of a concentration in molar.
+  best = {}
+  for a in activities:
+      smi = a.get('canonical_smiles')
+      pchembl = a.get('pchembl_value')
+      stype = a.get('standard_type') or ''
+      sval = a.get('standard_value')
+      sunit = a.get('standard_units')
+      if not smi or pchembl is None:
+          continue
+      try:
+          pchembl = float(pchembl)
+      except (TypeError, ValueError):
+          continue
+      mol = Chem.MolFromSmiles(smi)
+      if mol is None:
+          continue
+      canon = Chem.MolToSmiles(mol)
+      prev = best.get(canon)
+      if prev is None or pchembl > prev['pchembl']:
+          best[canon] = {
+              'canon': canon,
+              'pchembl': pchembl,
+              'standard_type': stype,
+              'standard_value': sval,
+              'standard_units': sunit,
+              'source_id': a.get('molecule_chembl_id') or '',
+          }
+
+  # Highest pchembl_value first (most potent).
+  ranked = sorted(best.values(), key=lambda r: -r['pchembl'])[:1000]
+  with manifest.open('w', newline='') as fh:
+      w = csv.writer(fh)
+      w.writerow(['compound_id', 'source_db', 'source_id',
+                  'canonical_smiles', 'pchembl_value',
+                  'standard_type', 'standard_value', 'standard_units'])
+      for i, rec in enumerate(ranked, start=1):
+          cid = f'chembl203_{i:04d}'
+          w.writerow([cid, 'ChEMBL', rec['source_id'], rec['canon'],
+                      f'{rec["pchembl"]:.3f}', rec['standard_type'],
+                      rec['standard_value'] or '', rec['standard_units'] or ''])
+  print(f'manifest: {len(ranked)} compounds → {manifest}')
+  PYEOF
+
+    # Step 2 — embed + MMFF-optimise + write per-compound PDBQT from manifest.
+    APPTAINERENV_ZINC_MANIFEST="$ZINC_MANIFEST" APPTAINERENV_ZINC_DIR="$ZINC_DIR" \
+    apptainer exec --bind /mnt/efs:/mnt/efs "$PYTHON_IMAGE" \
+      "$PREP_VENV/bin/python3" - <<'PYEOF'
+  import csv, os, pathlib, sys
+  from rdkit import Chem
+  from rdkit.Chem import AllChem
+  from rdkit import RDLogger
+  RDLogger.DisableLog('rdApp.*')
+
+  manifest = pathlib.Path(os.environ['ZINC_MANIFEST'])
+  zinc_dir = pathlib.Path(os.environ['ZINC_DIR'])
+  zinc_dir.mkdir(parents=True, exist_ok=True)
+  ad4 = {'C':'C','N':'N','O':'OA','S':'SA','H':'H','P':'P','F':'F','Cl':'Cl','Br':'Br','I':'I'}
+
+  def to_pdbqt(mol):
+      AllChem.ComputeGasteigerCharges(mol)
+      conf = mol.GetConformer()
+      lines = ['ROOT']
+      for i, a in enumerate(mol.GetAtoms()):
+          pos = conf.GetAtomPosition(i)
+          e = a.GetSymbol()
+          q = a.GetDoubleProp('_GasteigerCharge') if a.HasProp('_GasteigerCharge') else 0.0
+          if q != q: q = 0.0
+          lines.append('ATOM  {:5d} {:4s} LIG A   1    {:8.3f}{:8.3f}{:8.3f}  1.00  0.00    {:6.3f} {:>2s}'.format(
+              i+1, e+str(i+1), pos.x, pos.y, pos.z, q, ad4.get(e, 'C')))
+      lines += ['ENDROOT', 'TORSDOF 0']
+      return '\n'.join(lines) + '\n'
+
+  ok = fail = skip = 0
+  with manifest.open() as fh:
+      reader = csv.DictReader(fh)
+      for row in reader:
+          name = row['compound_id']
+          smi = row['canonical_smiles']
+          out = zinc_dir / (name + '.pdbqt')
+          if out.exists():
+              skip += 1; continue
+          try:
+              mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+              ps = AllChem.ETKDGv3()
+              ps.randomSeed = hash(name) & 0xFFFF
+              if AllChem.EmbedMolecule(mol, ps) < 0:
+                  AllChem.EmbedMolecule(mol)
+              AllChem.MMFFOptimizeMolecule(mol)
+              out.write_text(to_pdbqt(mol))
+              ok += 1
+          except Exception as ex:
+              print(f'  {name}: {ex}', file=sys.stderr)
+              fail += 1
+  print(f'rdkit: {ok} new, {skip} pre-existing, {fail} failed')
+  PYEOF
+    NLIG=$(find "$ZINC_DIR" -name '*.pdbqt' 2>/dev/null | wc -l) || NLIG=0
+    echo "staged $NLIG PDBQT ligands"
+  else
+    echo "ZINC ligand library already present ($NLIG files), skipping"
+  fi
+
+
+  # ── 3. Boltz-2 batch input — EGFR + top 100 ChEMBL203 ligands ──────────────
+  # Reuses the ChEMBL manifest staged above (Fix 2) and picks the top 100 most-
+  # potent compounds (highest pchembl_value, i.e. lowest binding-affinity Kd/Ki/
+  # IC50 equivalent). Each YAML includes a `properties:` block
+  # with `affinity: {binder: <ligand_id>}` so Boltz-2 runs its affinity head
+  # (regression on binding-affinity log-K) alongside the structure head. The
+  # affinity head requires this block — without it Boltz-2 silently skips the
+  # affinity prediction and the downstream benchmark has no value to compare
+  # against the experimental Kd.
+  BOLTZ_DIR="$BENCH/boltz2-batch"
+  NBOLTZ=$(find "$BOLTZ_DIR" -name '*.yaml' 2>/dev/null | wc -l) || NBOLTZ=0
+  if [ "$NBOLTZ" -lt 100 ]; then
+    echo "--- generating 100 Boltz-2 complex inputs (with affinity head) ---"
+    mkdir -p "$BOLTZ_DIR"
+    APPTAINERENV_ZINC_MANIFEST="$ZINC_MANIFEST" APPTAINERENV_BOLTZ_DIR="$BOLTZ_DIR" \
+    apptainer exec --bind /mnt/efs:/mnt/efs "$PYTHON_IMAGE" python3 - <<'PYEOF'
+  import csv, os, pathlib
+
+  seq = (
+    "KVLGSGAFGTVYKGLWIPEGEKVKIPVAIKELREATSPKANKEILDEAYVMASVDNPHVCRLLGICLTSTVQLIT"
+    "QLMPFGCLLDYVREHKDNIGSQYLLNWCVQIAKGMNYLEDRRLVHRDLAARNVLVKTPQHVKITDFGLAKLLGA"
+    "EKEYHAEGGKVPIKWMALESILHRIYTHQSDVWSYGVTVWELMTFGSKPYDGIPASEISSILEKGERLPQPPICT"
+    "IDVYMIMVKCWMIDADSRPKFRELIIEFSKMARDPQRYLVIQGDERMHLPSPTDSNFYRALMDEEDMDDVVDADE"
+    "YLIPQQGFFSSPSTSRTPLLSSLSATSNNSTVACIDRNGLQSCPIKEDSFLQRYSSDPTGALTEDSIDDTFLPVP"
+  )
+
+  # Top 100 most-potent ChEMBL203 ligands from the manifest (already sorted
+  # by descending pchembl_value in Fix 2's staging step).
+  manifest = pathlib.Path(os.environ['ZINC_MANIFEST'])
+  COMPOUNDS = []
+  with manifest.open() as fh:
+    reader = csv.DictReader(fh)
+    for row in reader:
+      COMPOUNDS.append((row['compound_id'], row['canonical_smiles']))
+      if len(COMPOUNDS) >= 100:
+        break
+
+
+  out_dir = pathlib.Path(os.environ['BOLTZ_DIR'])
+  out_dir.mkdir(parents=True, exist_ok=True)
+
+  # Chain IDs must be single letters per Boltz-2 spec (verified May 12 2026
+  # via job 2143 — multi-char IDs like "EGFR_KD" raised "Error: 'EGFR_'" and
+  # every input was skipped). Use A=protein, B=ligand; binder points at B.
+  # SMILES go in *single-quoted* YAML scalars so backslashes inside the
+  # SMILES (e.g. "C(=N\C...") aren't interpreted as YAML escape sequences
+  # (verified job 2147: chembl203_0085 failed with "while scanning a
+  # double-quoted scalar" because the SMILES had \C). Single-quoted scalars
+  # do NOT process backslash escapes; doubling any literal ' is the only
+  # required escape.
+
+  written = 0
+  for name, smiles in COMPOUNDS:
+    p = out_dir / f"{name}.yaml"
+    if not p.exists():
+      smi_yaml = smiles.replace("'", "''")
+      yml = (
+        f"version: 1\n"
+        f"sequences:\n"
+        f"  - protein:\n"
+        f"      id: A\n"
+        f"      sequence: {seq}\n"
+        f"  - ligand:\n"
+        f"      id: B\n"
+        f"      smiles: '{smi_yaml}'\n"
+        f"properties:\n"
+        f"  - affinity:\n"
+        f"      binder: B\n"
+      )
+      p.write_text(yml)
+      written += 1
+
+  total = len(list(out_dir.glob("*.yaml")))
+  print(f"Boltz-2 batch: {written} new + {total-written} existing = {total} total")
+  PYEOF
+  else
+    echo "Boltz-2 batch already present ($NBOLTZ files), skipping"
+  fi
+
+  # ── 4. EGFR MSA via local MMseqs2-GPU (ColabFold envdb on /mnt/s3-refs) ────
+  # Pre-generates one EGFR.a3m used by all 100 Boltz-2 inputs.
+  # Then rewrites the boltz2-batch/ YAMLs to reference the .a3m so Boltz-2
+  # doesn't need --use_msa_server and avoids 100 remote ColabFold API calls.
+  EGFR_A3M="$BENCH/egfr-kinase.a3m"
+  MMSEQS_IMAGE="docker://soedinglab/mmseqs2@sha256:f6ef1538cd81120e9ac6217ff65a07d5ead05d6514a4d94490af723be0a294d5"
+  COLABFOLD_DB="/mnt/s3-refs/colabfold/colabfold_envdb_202108"
+  if [ ! -s "$EGFR_A3M" ]; then
+    if [ -d "$COLABFOLD_DB" ]; then
+      echo "--- generating EGFR MSA via MMseqs2-GPU (ColabFold envdb) ---"
+      QUERY_FASTA="$BENCH/egfr-kinase-query.fasta"
+      # Boltz FASTA format: >CHAIN|entity|msa_path
+      cat > "$QUERY_FASTA" <<'EGFR_FASTA'
+  >EGFR_KD|protein|empty
+  KVLGSGAFGTVYKGLWIPEGEKVKIPVAIKELREATSPKANKEILDEAYVMASVDNPHVCRLLGICLTSTVQLITQLMPFGCLLDYVREHKDNIGSQYLLNWCVQIAKGMNYLEDRRLVHRDLAARNVLVKTPQHVKITDFGLAKLLGAEKEYHAEGGKVPIKWMALESILHRIYTHQSDVWSYGVTVWELMTFGSKPYDGIPASEISSILEKGERLPQPPICTIDVYMIMVKCWMIDADSRPKFRELIIEFSKMARDPQRYLVIQGDERMHLPSPTDSNFYRALMDEEDMDDVVDADEYLIPQQGFFSSPSTSRTPLLSSLSATSNNSTVACIDRNGLQSCPIKEDSFLQRYSSDPTGALTEDSIDDTFLPVP
+  EGFR_FASTA
+
+      TMPMSQ=$(mktemp -d)
+      PADDED_DB="$TMPMSQ/envdb_pad"
+      apptainer exec --nv --bind /mnt/s3-refs --bind "$TMPMSQ:$TMPMSQ" --bind "$BENCH:$BENCH" \
+        "$MMSEQS_IMAGE" bash -c "
+          set -euo pipefail
+          mmseqs makepaddedseqdb '$COLABFOLD_DB' '$PADDED_DB' --threads 8 2>&1 | tail -5 || true
+          mmseqs createdb '$QUERY_FASTA' '$TMPMSQ/queryDB'
+          mmseqs search '$TMPMSQ/queryDB' '$PADDED_DB' '$TMPMSQ/resultDB' '$TMPMSQ/tmp' \
+            --gpu 1 -s 6.0 --num-iterations 3 -e 0.001 --threads 8 2>&1 | tail -5
+          mmseqs convertalis '$TMPMSQ/queryDB' '$PADDED_DB' '$TMPMSQ/resultDB' \
+            '$TMPMSQ/hits.a3m' --format-mode 5 2>&1 | tail -3
+          cp '$TMPMSQ/hits.a3m' '$EGFR_A3M'
+          echo 'EGFR MSA generated'
+        " 2>&1 | tail -10
+      rm -rf "$TMPMSQ"
+      echo "EGFR MSA staged at $EGFR_A3M ($(wc -l < "$EGFR_A3M") lines)"
+    else
+      echo "ColabFold envdb not found at $COLABFOLD_DB — skipping MSA pre-generation"
+      echo "Boltz-2 will run in single-sequence mode (no --use_msa_server)"
+    fi
+  else
+    echo "EGFR MSA already present ($EGFR_A3M), skipping"
+  fi
+
+  # Rewrite Boltz-2 batch YAMLs to include MSA path.
+  # Priority:
+  #   1. Per-complex CSVs at $BENCH/boltz2-msas/<cpd_id>_0.csv (preferred; validated
+  #      end-to-end on job 2183 — 100/100 affinity_*.json produced)
+  #   2. Single shared $EGFR_A3M (from local MMseqs2-GPU above)
+  #   3. Leave YAMLs untouched and warn — Boltz-2 will need --use_msa_server at
+  #      run-time, which rate-limits to ~1.5 h for a 100-protein batch
+  MSA_CACHE_DIR="$BENCH/boltz2-msas"
+  if ls "$MSA_CACHE_DIR"/*_0.csv >/dev/null 2>&1; then
+    NCSV=$(ls "$MSA_CACHE_DIR"/*_0.csv 2>/dev/null | wc -l)
+    echo "--- injecting per-complex MSAs ($NCSV CSVs at $MSA_CACHE_DIR) into Boltz-2 inputs ---"
+    apptainer exec --bind "$BENCH:$BENCH" "$PYTHON_IMAGE" python3 -c "
+  import pathlib, re
+  boltz_dir = pathlib.Path('$BOLTZ_DIR')
+  msa_dir = pathlib.Path('$MSA_CACHE_DIR')
+  updated = matched = missing = 0
+  for f in sorted(boltz_dir.glob('*.yaml')):
+      cpd = f.stem
+      msa = msa_dir / f'{cpd}_0.csv'
+      if not msa.exists():
+          missing += 1
+          continue
+      matched += 1
+      txt = f.read_text()
+      if 'msa:' in txt:
+          continue
+      txt = re.sub(r'(      sequence: )(\\S+)', r'\\1\\2\\n      msa: ' + str(msa), txt)
+      f.write_text(txt)
+      updated += 1
+  print(f'Boltz-2 MSA injection: matched={matched}, newly_updated={updated}, missing_msa={missing}')
+  "
+  elif [ -s "$EGFR_A3M" ]; then
+    echo "--- updating Boltz-2 batch inputs to reference shared EGFR MSA ($EGFR_A3M) ---"
+    apptainer exec --bind "$BENCH:$BENCH" "$PYTHON_IMAGE" python3 -c "
+  import pathlib, re
+  boltz_dir = pathlib.Path('$BOLTZ_DIR')
+  msa_path = '$EGFR_A3M'
+  updated = 0
+  for f in boltz_dir.glob('*.yaml'):
+      txt = f.read_text()
+      if 'msa:' not in txt:
+          txt = re.sub(r'(      sequence: )(\\S+)', r'\1\2\n      msa: ' + msa_path, txt)
+          f.write_text(txt)
+          updated += 1
+  print(f'Updated {updated} Boltz-2 input YAMLs with shared MSA path')
+  "
+  else
+    echo "WARNING: no MSAs available (neither per-complex CSVs at $MSA_CACHE_DIR nor shared $EGFR_A3M)."
+    echo "         Boltz-2 will require --use_msa_server: true at runtime; ColabFold rate-limits"
+    echo "         to ~1.5h for a 100-protein batch. Stage MMseqs2-GPU envdb at $COLABFOLD_DB"
+    echo "         or pre-stage per-complex CSVs at $MSA_CACHE_DIR to avoid this."
+  fi
+
+  # ── 6. GROMACS .tpr — EGFR kinase domain protein, 3 replicate seeds ────────
+  # Scope: this prep step produces the three `candidate_<i>.tpr` files (~3 MB
+  # each) configured for 1 ns of NPT production MD (nsteps=500000 × dt=0.002 ps
+  # → 1 ns). The actual `gmx mdrun` of the production trajectory is run by the
+  # downstream `gromacs` template (step 4 of the drug-disco-bench workflow);
+  # the prep step's responsibility ends at the .tpr. EM + NVT + NPT
+  # equilibration mdruns happen here (short, ~100 ps each) only to produce the
+  # equilibrated checkpoint that feeds into the production grompp.
+  #
+  # Protein-only .tpr using AMBER99SB-ILDN + TIP3P, 3 replicate initial
+  # velocities. Represents 3 candidate MD runs; protein-ligand .tpr can be
+  # substituted post-prep by providing ACPYPE-parameterised ligand topologies.
+  #
+  # Forcefield choice: amber99sb-ildn ships bundled with GROMACS 2023.2 (no
+  # external download needed) and is the de-facto standard for protein MD
+  # benchmarks. CHARMM36-jul2022 was tried first but has a known broken `.tdb`
+  # for the N-terminal methionine (atom C1 missing) under gmx pdb2gmx 2023.2.
+  GMX_DIR="$BENCH/gromacs"
+  mkdir -p "$GMX_DIR"
+  NTPR=$(find "$GMX_DIR" -name "candidate_*.tpr" 2>/dev/null | wc -l) || NTPR=0
+  if [ "$NTPR" -lt 3 ]; then
+    echo "--- preparing GROMACS .tpr files (EGFR kinase domain + CHARMM36m) ---"
+    TMP_GMX=$(mktemp -d)
+
+    # Write protein FASTA, then convert to PDB via a minimal Python script.
+    # We use an existing RCSB PDB structure rather than building from FASTA.
+    curl -sSfL "https://files.rcsb.org/download/1M17.pdb" -o "$TMP_GMX/1m17.pdb"
+    # 1M17 has a single protein chain (chain A) — the chain-A filter below is
+    # therefore a no-op for 1M17 but kept defensively in case the PDB is ever
+    # swapped back to a multi-chain structure. Strips HETATM (erlotinib +
+    # waters) so pdb2gmx sees protein atoms only.
+    awk 'substr($0,1,4)=="ATOM" && substr($0,22,1)=="A"' \
+      "$TMP_GMX/1m17.pdb" > "$TMP_GMX/protein.pdb"
+    echo "END" >> "$TMP_GMX/protein.pdb"
+
+    MDP_DIR="$TMP_GMX/mdps"
+    apptainer exec --bind "$TMP_GMX:$TMP_GMX" "$PYTHON_IMAGE" \
+      python3 -c "
+  import pathlib, sys
+  tgt = pathlib.Path('$MDP_DIR')
+  tgt.mkdir(parents=True, exist_ok=True)
+  em_txt = 'integrator = steep\nnsteps = 5000\nemtol = 1000.0\ncutoff-scheme = Verlet\nrlist = 1.2\ncoulombtype = PME\nrcoulomb = 1.2\nrvdw = 1.2\n'
+  nvt_txt = 'integrator = md\nnsteps = 50000\ndt = 0.002\ntcoupl = V-rescale\ntc-grps = Protein Non-Protein\ntau-t = 0.1 0.1\nref-t = 300 300\nconstraints = h-bonds\ngen-vel = yes\ngen-temp = 300\ncoulombtype = PME\nrcoulomb = 1.0\nrvdw = 1.0\n'
+  npt_txt = 'integrator = md\nnsteps = 50000\ndt = 0.002\ntcoupl = V-rescale\ntc-grps = Protein Non-Protein\ntau-t = 0.1 0.1\nref-t = 300 300\npcoupl = Parrinello-Rahman\ntau-p = 2.0\nref-p = 1.0\ncompressibility = 4.5e-5\nconstraints = h-bonds\ncoulombtype = PME\nrcoulomb = 1.0\nrvdw = 1.0\n'
+  prod_base = 'integrator = md\nnsteps = 500000\ndt = 0.002\nnstxout = 5000\nnstvout = 5000\nnstxtcout = 5000\nnstenergy = 5000\nnstlog = 5000\ntcoupl = V-rescale\ntc-grps = Protein Non-Protein\ntau-t = 0.1 0.1\nref-t = 300 300\npcoupl = Parrinello-Rahman\ntau-p = 2.0\nref-p = 1.0\ncompressibility = 4.5e-5\nconstraints = h-bonds\ncoulombtype = PME\nrcoulomb = 1.0\nrvdw = 1.0\n'
+  (tgt / 'em.mdp').write_text(em_txt)
+  (tgt / 'nvt.mdp').write_text(nvt_txt)
+  (tgt / 'npt.mdp').write_text(npt_txt)
+  for seed in [1234, 5678, 9012]:
+    (tgt / f'prod_{seed}.mdp').write_text(prod_base + f'gen-vel = yes\ngen-temp = 300\ngen-seed = {seed}\n')
+  print('MDP files written')
+  "
+
+    # Pull GROMACS SIF once and reuse — the host slurmd has no GROMACS, so
+    # every gmx invocation must go through this container. A single persistent
+    # apptainer exec preserves the GMXRC environment across all gmx calls.
+    GROMACS_SIF="$SIF_DIR/gromacs-2023.2.sif"
+    if [ ! -f "$GROMACS_SIF" ]; then
+      echo "--- pulling GROMACS SIF (one-time, ~2 GB) ---"
+      apptainer pull "$GROMACS_SIF" "$GROMACS_IMAGE" 2>&1 | tail -5
+    fi
+
+    # amber99sb-ildn is bundled in /usr/local/gromacs/share/gromacs/top inside
+    # the SIF — no external forcefield staging needed.
+
+    SEEDS=(1234 5678 9012)
+    SUCCESS=0
+    for i in 1 2 3; do
+      SEED="${SEEDS[$((i-1))]}"
+      TPR_OUT="$GMX_DIR/candidate_${i}.tpr"
+      if [ -f "$TPR_OUT" ]; then
+        echo "candidate_$i .tpr already present, skipping"
+        SUCCESS=$((SUCCESS+1))
+        continue
+      fi
+      echo "--- GROMACS .tpr for candidate_$i (seed=$SEED) ---"
+      # WDIR on EFS so per-step gmx-*.log files survive after the job
+      # ends (TMP_GMX is rm -rf'd at the bottom of this section).
+      WDIR="$GMX_DIR/wdir_cand${i}"
+      rm -rf "$WDIR" && mkdir -p "$WDIR"
+      cp "$TMP_GMX/protein.pdb" "$WDIR/"
+      cp "$MDP_DIR/"*.mdp "$WDIR/"
+      if APPTAINERENV_TPR_OUT="$TPR_OUT" \
+         APPTAINERENV_WDIR="$WDIR" \
+         APPTAINERENV_SEED="$SEED" \
+         apptainer exec --nv \
+           --bind "$TMP_GMX:$TMP_GMX" \
+           --bind "$GMX_DIR:$GMX_DIR" \
+           "$GROMACS_SIF" bash -c '
+             set -eo pipefail
+             # GMXRC references $shell and $GMXLDLIB without defaults, which
+             # trips `set -u`. Source it with nounset off, then re-enable.
+             source /usr/local/gromacs/avx2_256/bin/GMXRC
+             set -u
+             cd "$WDIR"
+             # Full step output goes to gmx-{step}.log next to the .tpr; the
+             # `| tail -5` was eating the real error (only success lines fit
+             # in 5 lines, the real failure was further back in the buffer).
+             # Drop the `-quiet` so warnings are visible, and pipefail makes
+             # the wrapping `bash -c` fail-fast on the first broken step.
+             run() { local name=$1; shift; "$@" > "gmx-$name.log" 2>&1 || { tail -40 "gmx-$name.log"; return 1; }; }
+             run pdb2gmx  gmx pdb2gmx -f protein.pdb -o protein.gro -p topol.top \
+                            -ff amber99sb-ildn -water tip3p -ignh
+             run editconf gmx editconf -f protein.gro -o box.gro -c -d 1.2 -bt cubic
+             run solvate  gmx solvate -cp box.gro -cs spc216.gro -o solv.gro -p topol.top
+             run grompp1  gmx grompp -f em.mdp -c solv.gro -p topol.top -o ions.tpr -maxwarn 5
+             printf "SOL\n" | gmx genion -s ions.tpr -o ionized.gro -p topol.top \
+               -pname NA -nname CL -neutral > gmx-genion.log 2>&1 || cp solv.gro ionized.gro
+             run grompp_em gmx grompp -f em.mdp -c ionized.gro -p topol.top -o em.tpr -maxwarn 5
+             run mdrun_em  gmx mdrun -v -deffnm em -ntmpi 1 -ntomp 4 -nb gpu
+             run grompp_nvt gmx grompp -f nvt.mdp -c em.gro -r em.gro -p topol.top -o nvt.tpr -maxwarn 5
+             run mdrun_nvt  gmx mdrun -v -deffnm nvt -ntmpi 1 -ntomp 4 -nb gpu
+             run grompp_npt gmx grompp -f npt.mdp -c nvt.gro -r nvt.gro -t nvt.cpt -p topol.top -o npt.tpr -maxwarn 5
+             run mdrun_npt  gmx mdrun -v -deffnm npt -ntmpi 1 -ntomp 4 -nb gpu
+             run grompp_prod gmx grompp -f "prod_${SEED}.mdp" -c npt.gro -t npt.cpt -p topol.top -o "$TPR_OUT" -maxwarn 5
+           '
+      then
+        [ -f "$TPR_OUT" ] && {
+          echo "candidate_$i .tpr staged ($(du -h "$TPR_OUT" | cut -f1))"
+          SUCCESS=$((SUCCESS+1))
+        }
+      else
+        echo "WARNING: GROMACS .tpr for candidate_$i failed — check $WDIR"
+      fi
+    done
+    rm -rf "$TMP_GMX"
+  else
+    echo "GROMACS .tpr files already present ($NTPR/3), skipping"
+  fi
+
+  echo "=== drug-disco-bench-prep complete $(date) ==="
+  OF3_OK=$([ -f "$BENCH/egfr-kinase-input.yaml" ] && echo 1 || echo 0)
+  NLIG_FINAL=$(find "$BENCH/zinc-1k/ligands" -name '*.pdbqt' 2>/dev/null | wc -l)
+  NBOLTZ_FINAL=$(find "$BENCH/boltz2-batch" -name '*.yaml' 2>/dev/null | wc -l)
+  NTPR_FINAL=$(find "$BENCH/gromacs" -name 'candidate_*.tpr' 2>/dev/null | wc -l)
+  echo "Summary:"
+  echo "  OF3 input:      $([ "$OF3_OK" = 1 ] && echo 'OK' || echo 'MISSING')"
+  echo "  ZINC ligands:   $NLIG_FINAL/1000"
+  echo "  Boltz-2 batch:  $NBOLTZ_FINAL/100"
+  echo "  GROMACS .tpr:   $NTPR_FINAL/3"
+
+  FAIL=0
+  [ "$OF3_OK" = 1 ]            || { echo "FAIL: OF3 input YAML missing"; FAIL=1; }
+  # RDKit's EmbedMolecule fails on ~0.1% of real-world SMILES (bad geometry,
+  # macrocycles, very flexible chains). Floor at 990/1000 = 1% loss tolerance
+  # since downstream Uni-Dock just docks whatever's present.
+  [ "$NLIG_FINAL"  -ge 990 ]   || { echo "FAIL: only $NLIG_FINAL/1000 ZINC ligands (floor 990)"; FAIL=1; }
+  [ "$NBOLTZ_FINAL" -ge 100 ]  || { echo "FAIL: only $NBOLTZ_FINAL/100 Boltz-2 inputs"; FAIL=1; }
+  [ "$NTPR_FINAL"  -ge 3 ]     || { echo "FAIL: only $NTPR_FINAL/3 GROMACS .tpr files"; FAIL=1; }
+  exit "$FAIL"

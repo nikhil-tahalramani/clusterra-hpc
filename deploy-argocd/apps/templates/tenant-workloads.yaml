@@ -1,0 +1,69 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: tenant-workloads
+  namespace: argocd
+  annotations:
+    # After cluster-api (wave 2) and tenant-cluster-secrets (wave 3 → wave-4
+    # ExternalSecret). Workloads land at wave 5 so the named cluster Secret
+    # exists when ArgoCD resolves `destination.name: tenant-{cluster_id}`.
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - plugin:
+        configMapRef:
+          name: argocd-tenants-plugin
+        requeueAfterSeconds: 30
+  template:
+    metadata:
+      name: 'tenant-{{`{{.cluster_id}}`}}-workloads'
+      namespace: argocd
+      labels:
+        clusterra.io/cluster: '{{`{{.cluster_id}}`}}'
+    spec:
+      project: default
+      # Multi-source: customer-workloads chart + envs/{env}/{regionShort}/
+      # images.yaml via $values overlay (same pattern as cluster-api.yaml).
+      sources:
+        - repoURL: {{ .Values.repoURL | squote }}
+          targetRevision: {{ .Values.targetRevision }}
+          ref: values
+        - repoURL: {{ .Values.repoURL | squote }}
+          targetRevision: {{ .Values.targetRevision }}
+          path: core/fleet/charts/customer-workloads
+          helm:
+            valueFiles:
+              - values.yaml
+              - $values/envs/{{ .Values.env }}/{{ .Values.regionShort }}/images.yaml
+            parameters:
+              - name: clusterId
+                value: '{{`{{.cluster_id}}`}}'
+              - name: slurmctldHost
+                # Per-tenant NodePort from the plugin generator. The previous
+                # `:6817` default was wrong — that's the in-cluster slurmctld
+                # port, not the externally reachable NodePort. Customer slurmd
+                # and login both dial central via NodePort. Central IP matches
+                # the centralApiUrl default immediately below.
+                value: '10.100.1.100:{{`{{.node_port}}`}}'
+              - name: edgeAgent.centralApiUrl
+                value: {{ .Values.centralApiUrl | default "http://10.100.1.100:30080" | squote }}
+              - name: efs.enabled
+                value: 'true'
+              - name: efs.mountTargetIp
+                value: '{{`{{.efs_mount_target_ip}}`}}'
+      destination:
+        # Resolves via the cluster Secret labeled argocd.argoproj.io/secret-type=cluster
+        # materialized by the tenant-cluster-secrets ApplicationSet (wave 4).
+        name: 'tenant-{{`{{.cluster_id}}`}}'
+        namespace: slurm
+      syncPolicy:
+        # Validated end-to-end on dev/cluse154 (Apr 24 2026). Existing tenants
+        # had `helm_release.clusterra_customer` removed from TF state before
+        # this flipped on, so ArgoCD adopts the running resources cleanly.
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true

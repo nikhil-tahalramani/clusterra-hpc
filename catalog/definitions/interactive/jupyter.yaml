@@ -1,0 +1,107 @@
+id: jupyter
+name: Jupyter Notebook
+description: Interactive JupyterLab on a compute node with RDKit, MDAnalysis, and Biopython pre-installed.
+vertical: hcls
+category: interactive
+workload_group: interactive
+modality: notebook
+tools: [jupyter, rdkit, mdanalysis, biopython, dask-jobqueue]
+ready: true
+kind: interactive
+
+runtime:
+  kind: interactive_image
+  image: ghcr.io/nikhil-tahalramani/clusterra/notebook@sha256:472a220d261e80e9ec0d49a0fb36d2351f2603d9cbd9ea32d5f9a1c47dfad691
+  registry_auth: ghcr
+  notes: |
+    Image moves on every main build; prod central rewrites to :prod via
+    values overlay (same pattern as other cluster images).
+
+sbatch: |
+  #SBATCH --partition=interactive
+  #SBATCH --cpus-per-task=2
+  #SBATCH --mem=8G
+  #SBATCH --time=8:00:00
+  #SBATCH --nodes=1
+inputs: []
+
+parameters:
+  - key: profile
+    widget: enum
+    options: [cpu-small, cpu-medium, cpu-large, gpu-a10]
+    default: cpu-small
+    description: |
+      Resource profile. Sizing matrix is rendered at submit time —
+      cpu-small=2cpu/8GB, cpu-medium=4/16, cpu-large=8/32, gpu-a10=4/24+gpu.
+  - key: port
+    widget: number
+    default: 0
+    advanced: true
+    description: Hidden — port chosen by the script before ready callback.
+
+routing:
+  path_prefix: /jupyter
+  port_param: port
+  ready_callback: true
+
+script: |
+  #!/bin/bash
+  set -euo pipefail
+
+  PORT=$(shuf -i 10000-60000 -n 1)
+  NODE_IP=$(hostname -I | awk '{print $1}')
+
+  AUTH=""
+  if [ -n "${CLUSTERRA_INTERNAL_TOKEN:-}" ]; then
+    AUTH="-H Authorization: Bearer ${CLUSTERRA_INTERNAL_TOKEN}"
+  fi
+  curl -sf -X POST ${AUTH} \
+    -H "Content-Type: application/json" \
+    -d "{\"node_ip\":\"${NODE_IP}\",\"port\":${PORT},\"cluster_id\":\"{{.ctx.cluster_id}}\",\"user_email\":\"{{.ctx.user_email}}\",\"template_id\":\"jupyter\"}" \
+    "${CLUSTERRA_API}/v1/internal/sessions/${SLURM_JOB_ID}/ready" \
+    || echo "ready callback failed (continuing; proxy will 502 until retry)" >&2
+
+  GPU_FLAGS=""
+  if [ "{{.params.profile}}" = "gpu-a10" ]; then GPU_FLAGS="--nv"; fi
+
+  mkdir -p /mnt/efs/{{.ctx.user_email}}
+
+  if [ -r /etc/clusterra/ghcr/config.json ]; then
+    AUTH_B64=$(sed -n 's/.*"auth"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/clusterra/ghcr/config.json | head -n1)
+    if [ -n "${AUTH_B64:-}" ]; then
+      GHCR_AUTH=$(printf '%s' "$AUTH_B64" | base64 -d 2>/dev/null || true)
+      if [ -n "${GHCR_AUTH:-}" ]; then
+        export APPTAINER_DOCKER_USERNAME="${GHCR_AUTH%%:*}"
+        export APPTAINER_DOCKER_PASSWORD="${GHCR_AUTH#*:}"
+      fi
+    fi
+  fi
+
+  CACHE_DIR=/var/lib/apptainer/sif-cache
+  mkdir -p "$CACHE_DIR"
+  TAG_HASH=$(printf '%s' "{{.runtime.image}}" | sha256sum | cut -c1-12)
+  SIF="$CACHE_DIR/notebook-$TAG_HASH.sif"
+  (
+    flock -x 200
+    if [ ! -f "$SIF" ]; then
+      apptainer pull --force "$SIF" docker://{{.runtime.image}}
+    fi
+  ) 200>"$CACHE_DIR/.lock-$TAG_HASH"
+
+  exec apptainer exec \
+    --bind /mnt/efs:/mnt/efs \
+    ${GPU_FLAGS} \
+    "$SIF" \
+    jupyter lab \
+      --ip=0.0.0.0 --port=${PORT} \
+      --ServerApp.base_url=/jupyter/{{.ctx.cluster_id}}/${SLURM_JOB_ID}/ \
+      --ServerApp.token='' \
+      --ServerApp.password='' \
+      --ServerApp.password_required=False \
+      --ServerApp.allow_origin='*' \
+      --ServerApp.allow_origin_pat='.*' \
+      --ServerApp.allow_remote_access=True \
+      --ServerApp.trust_xheaders=True \
+      --ServerApp.disable_check_xsrf=True \
+      --IdentityProvider.token='' \
+      --no-browser
