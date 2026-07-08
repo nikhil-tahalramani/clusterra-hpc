@@ -93,6 +93,19 @@ inputs/outputs, and a runnable smoke test against the
 
 Tear the quickstart down with [`./quickstart/uninstall.sh`](quickstart/uninstall.sh).
 
+## Getting in touch
+
+- **Questions, bugs, feature requests:** open a
+  [GitHub issue](https://github.com/nikhil-tahalramani/clusterra-hpc/issues).
+- **Ideas, show-and-tell, general discussion:**
+  [GitHub Discussions](https://github.com/nikhil-tahalramani/clusterra-hpc/discussions).
+- **Want to talk it through / running this in production?** Grab time on my
+  calendar: [cal.com/nikhiltahalramani](https://cal.com/nikhiltahalramani).
+- **Email:** [hello@clusterra.cloud](mailto:hello@clusterra.cloud).
+
+Maintained by Nikhil Tahalramani. Contributions welcome — PRs and new catalog
+templates especially.
+
 ## License
 
 [Apache License 2.0](LICENSE). Copyright the Clusterra authors.
